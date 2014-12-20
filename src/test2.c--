@@ -1,0 +1,32 @@
+target byteorder little;
+import bits32 f;
+
+section "data" {
+hello:      bits8[] "hello\n\0" ;
+}
+
+section "text" {
+        p () {
+                bits32 i, j, k, ntotal;
+                i = 1;
+	        j = 2;
+        	k = 3;
+
+		if (i < j) {
+			bits32[i] = j;
+			k = j;
+			j = 7;
+		}
+		bits8[i] = %lobits8(j);
+		bits32[i] = %sx32(bits8[i]);
+		bits32[j] = %zx32(bits8[j]);
+                ntotal = i + j + k;
+		i = f();
+		if (j > 0) {
+		        // cut to i (333); // bug in compiler
+		        return (333);
+		} else {
+			return (ntotal);
+		}
+        }
+}

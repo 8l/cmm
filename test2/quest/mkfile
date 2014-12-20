@@ -1,0 +1,80 @@
+# vim:ts=8 sw=8 noet:
+#
+# targets
+# 
+# all		run all tests
+# generate	create tests, generate C-- and C files
+#
+
+TOP = 		../..
+#PATH = 		$PATH:/scratch/lindig/lcc	
+
+<$TOP/config/config.mk
+<$TOP/config/c.mk
+
+
+LCC	=	lcc
+LCCFLAGS=	-target=c-- -Wf-c--=x86/linux -Wf-c--segLIT=data -DQUEST_FAILED
+
+QCMM	=	`if [ -x $TOP/bin/qc--.opt ]; then echo $TOP/bin/qc--.opt; else echo $TOP/bin/qc--; fi`
+QCMMFLAGS =	Ld.path=\"$CC\" 
+
+LDFLAGS = 	-L$TOP/runtime -lqc-- $TOP/runtime/pcmap.ld	
+
+QUEST =		quest
+
+# -- generating
+
+TESTBASIS=0 1 2
+
+TESTS=${TESTBASIS:%=test-%-main} ${TESTBASIS:%=test-%-callee}
+TESTS_C =	${TESTS:%=%.c}
+TESTS_CMM =	${TESTS:%=%.c--}
+
+
+
+HALFEXECS=${TESTBASIS:%=test-%-cmm} ${TESTBASIS:%=test-%-lcc} ${TESTBASIS:%=test-%-gcc}
+EXECS=${HALFEXECS:%=%-cmm} ${HALFEXECS:%=%-lcc} ${HALFEXECS:%=%-gcc}
+
+# -- high-level targets		
+
+all:VQ:		$EXECS
+		for f in $EXECS; do
+			./$f || echo "==== $f failed ===="
+		done	2> /dev/null
+		echo "Completed `echo $EXECS | wc -w` tests"
+
+bin:V:		$EXECS
+generate:V:	$TESTS_C $TESTS_CMM
+
+clean:V:
+		rm -f *.o *-[glc][cm][cm]-[glc][cm][cm]
+clobber:V:	clean
+		rm -f test*.c-- test*.c
+
+globals.o:	globals.c--
+		$QCMM -c -globals $prereq
+
+# -- rules
+
+
+%.c--: 		%.c /usr/local/lcc/rcc
+		$LCC $LCCFLAGS -o $target -S $stem.c
+
+%-gcc.o:	%.c
+		$CC -DQUEST_FAILED -g -c -o $target $prereq
+
+%-lcc.o:	%.c /usr/local/lcc/rcc
+		$LCC -DQUEST_FAILED -g -c -o $target $stem.c
+
+%-cmm.o:	%.c-- $QCMM
+		$QCMM -c -o $target $stem.c--
+
+^test-([0-9]*)-(gcc|lcc|cmm)-(gcc|lcc|cmm)'$':R: test-'\1'-main-'\2'.o test-'\1'-callee-'\3'.o globals.o
+		$QCMM $QCMMFLAGS $LDFLAGS -globals -o $target $prereq 
+
+$TESTS_C:	
+		$QUEST -seed 12345 cmm.lua -test cmm -n 5 -2 -s 0 -o test-0
+		$QUEST -seed 12345 cmm.lua -test cmm -n 5 -2 -s 1 -o test-1
+		$QUEST -seed 12345 cmm.lua -test cmm -n 5 -2 -s 2 -o test-2
+		

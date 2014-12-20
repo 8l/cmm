@@ -1,0 +1,579 @@
+
+% ------------------------------------------------------------------ 
+\section{Burg Code Generation}
+% ------------------------------------------------------------------ 
+
+This module implements the code generator that translates a Burg
+specification to {\ocaml}. The [[generate]] function writes the code to
+a provided channel and raises [[Error]] in the case of semantic errors
+in the specification. 
+
+<<burg.mli>>=
+exception Error of string
+val generate: Spec.t -> fd:out_channel -> unit  (* Error *)
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+<<burg.ml>>=
+module S         = Spec
+module C         = Code
+let rcsid = "$Id: burg.nw,v 1.23 2003-08-29 12:03:59 lindig Exp $"
+@
+
+We build sets of strings and maps from strings to lists. If we cannot
+find a key in a map this is equivalent to a key mapped to the empty
+list.
+
+<<burg.ml>>=
+module StringSet = Set.Make(struct type t = string let compare = compare end)
+module StringMap = Map.Make(struct type t = string let compare = compare end)
+let lookup map x = try StringMap.find x map with Not_found -> [] 
+@
+
+Semantic errors in a specification are reported with the [[Error]]
+exception.
+
+<<burg.ml>>=
+exception Error of string
+let error msg = raise (Error msg)
+@
+
+I have banned the dirty code generation into a sub-module but I'm not
+sure this really works.
+
+<<burg.ml>>=
+<<sorting rules by cost>>
+module CodeGen = struct
+    <<CodeGen>>
+end
+
+<<burg logic>>
+@
+
+
+% ------------------------------------------------------------------ 
+\subsection{Burg Logic}
+% ------------------------------------------------------------------ 
+
+We like to sort certain actions based on the cost associated with them.
+The cost associated with a rule is a [[Code.exp]] value. In pratice it
+is limited to be a non-negative integer or a raw code fragment. Our
+total order assigns the smallest cost to raw code fragments.
+
+<<sorting rules by cost>>=
+let cost_order x y = match x, y with
+    | C.Int x , C.Int y  -> compare x y     
+    | C.Raw x , C.Raw y  -> compare x y     
+    | C.Int _ , C.Raw _  -> 1               (* raw is smaller *)
+    | C.Raw _ , C.Int _  -> -1              (* raw is smaller *)
+    | _                  -> assert false    (* can't happen *)
+@    
+
+We extend the cost order to rules, i.e.~we define an order that sorts
+rules by cost:
+
+<<sorting rules by cost>>=
+let rule_order x y = cost_order x.S.cost y.S.cost
+@
+
+Normalized rules can be divded into two disjoint classes, depending on
+their right-hand side:
+
+\begin{itemize}
+\item A rule with a constructor at the top level matches constructors in
+      the subject tree.
+\item A rule with just a non-terminal variable as a pattern is a chain rule. 
+      Since the left and the right hand side of a chain rule is a
+      nonterminal, chain rules define a graph with nonterminals as
+      nodes.
+\end{itemize}
+
+A possible third class is a rule with just a literal value, or a
+terminal variable matching literals in the subject tree. This case is
+syntactically excluded by the parser because it makes little sense from
+a semantic point of view.  
+
+Each class of rules is treated differently for code generation. With
+[[split]] we make one pass over the list of rules in a specification and
+build simultaneously two data structures, one for each class:
+
+\begin{itemize}
+\item A map from constructors to the rules using them.
+\item A map from the right-hand nonterminal of a chain rule to the
+      chain rules that have this non-terminal on their right-hand side.
+      For example, the chain rules $x:y$, $x:z$, $a:b$, $a:y$ lead to
+      the map $y \mapsto [a:y, x:y]$, $b \mapsto [a:b]$, $z \mapsto
+      [x:z]$. 
+\end{itemize}
+
+<<burg logic>>=
+type maps =
+    { chains:   S.rule list StringMap.t (* rhs         :-> rules *)
+    ; cons:     S.rule list StringMap.t (* constructor :-> rules *)
+    }
+       
+let split = 
+    let add maps rule = 
+        match rule.S.pattern with
+        | S.Var(_, S.NonTerm(right)) ->     
+            { maps with chains = 
+                StringMap.add right (rule::lookup maps.chains right) maps.chains
+            } 
+        | S.Con(con,_) ->
+            { maps with cons =
+                StringMap.add con (rule::lookup maps.cons con) maps.cons
+            }
+        | S.Literal(l) ->           assert false (* syntactically impossible *)
+        | S.Var(_, S.Term(term)) -> assert false (* syntactically impossible *) 
+    and e = StringMap.empty 
+    in
+        List.fold_left add {chains = e; cons = e} 
+@
+
+At run time, a polymorphic value is represented by a record that has a
+field for every nonterminal in the specification. The [[nonterms]]
+function collects the set of all nonterminals from a list of
+\emph{normalized} rules and returns them in a list.
+
+<<burg logic>>=
+let nonterms rules =
+    let add set rule = StringSet.add rule.S.nonterm set in
+        StringSet.elements (List.fold_left add StringSet.empty rules)
+@
+
+[[Generate]] is the only function exported. It normalizes the rules,
+infers the type of every constructor, collects all nonterminals, and
+finally triggers code generation.
+
+We sort nonterminals such that names starting with an underscore come
+last. Otherwise names are sorted alphabetically. The hope is, that this
+makes debugging a little bit easier.
+
+<<burg logic>>=
+let cmp x y =
+    if x = "" || y = "" then compare x y else match x.[0], y.[0] with
+    | '_', '_' -> compare x y
+    | '_',  y' -> 1
+    | x' , '_' -> -1
+    | _        -> compare x y
+
+let generate spec ~fd:chan =
+    let spec      = CodeGen.mangle spec in
+    let linewidth = 77 in
+    let top def   = Pp.ppToFile chan linewidth (Code.Print.toplevel def) in
+    let exp def   = Pp.ppToFile chan linewidth (Code.Print.exp def) in
+    let tydecl d  = Pp.ppToFile chan linewidth (Code.Print.tydecl d) in
+    let rules     = Norm.rules spec.S.rules in
+    let types     = try S.con_types rules with S.Error msg -> error msg in
+    let nts       = List.sort cmp (nonterms rules) in
+    let maps      = split rules in
+    let nl n      = for i=1 to n do print_newline () done in     
+        if rules <> [] then     
+             ( List.iter exp spec.S.heads
+             ; nl 2
+             ; tydecl (CodeGen.tydecl nts spec.S.types) 
+             ; nl 2
+             ; top (CodeGen.infdef nts)
+             ; nl 2
+             ; top (CodeGen.nonterms nts maps.chains)
+             ; nl 2
+             ; top (CodeGen.constructors maps.cons types)
+             ; nl 2
+             ; List.iter exp spec.S.tails
+             )
+        else
+             ( List.iter exp spec.S.heads
+             ; nl 2
+             )
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Code Generating Functions}
+% ------------------------------------------------------------------ 
+
+The functions in this section generate code by building abstract syntax
+using the [[Code]] module.
+
+Some identifiers from a Burg specification are used as identifiers in
+the generated code. Because we cannot guarantee that all names are legal
+names in Objective Caml, we mangle them.
+
+<<CodeGen>>=
+let ocaml_syntax: Mangler.spec =
+    { Mangler.preprocess = String.uncapitalize 
+    ; Mangler.replace    = (fun c -> c) 
+    ; Mangler.avoid      = (fun str -> str ^ "_")
+    ; Mangler.reserved   = 
+        [ "and"; "as"; "assert"; "begin"; "class"; "constraint"; "do";
+          "done"; "downto"; "else"; "end"; "exception"; "external";
+          "false"; "for"; "fun"; "function"; "functor"; "if"; "in";
+          "include"; "inherit"; "initializer"; "lazy"; "let"; "match";
+          "method"; "module"; "mutable"; "new"; "object"; "of"; "open";
+          "or"; "parser"; "private"; "rec"; "sig"; "struct"; "then";
+          "to"; "true"; "try"; "type"; "val"; "virtual"; "when";
+          "while"; "with"; "mod"; "land"; "lor"; "lxor"; "lsl"; "lsr";
+          "asr"]
+    }          
+@
+
+The [[mangle]] function mangles certain names in a [[Spec.t]] value such
+that they become legal Objective Caml names; others we don't touch:
+
+\begin{itemize}
+\item Names denoting nonterminals, because they show up in the generated
+      code as function names and record labels.
+\item We don't mangle variable names because they must be legal names
+      anyway.
+\item We don't mangle a constructor name like [[Foo]] because the user
+      knows that we will generate a function [[conFoo]] that he must
+      call. He thus better uses good constructor names; if we mangled
+      them the result would be unpredictable for the user.
+\end{itemize}
+
+<<CodeGen>>=
+let mangle spec =
+    let mangle = Mangler.mk ocaml_syntax in
+    let ty = function
+        | S.NonTerm(s)      -> S.NonTerm (mangle s)
+        | S.Term(_) as x    -> x in
+    let rec pattern = function
+        | S.Var(x,t)        -> S.Var(x, ty t)
+        | S.Con(c,pats)     -> S.Con(c, List.map pattern pats)
+        | S.Literal(_) as x -> x in
+    let rule r =
+        { S.nonterm = mangle  r.S.nonterm
+        ; S.pattern = pattern r.S.pattern
+        ; S.cost    = r.S.cost
+        ; S.code    = r.S.code
+        } in
+    { spec with S.rules = List.map rule spec.S.rules }  
+@
+
+First, here are some special cases of constructor functions for
+Objective Caml syntax.
+
+<<CodeGen>>=
+let action exp      = C.fun' [C.none] exp
+let geq x y         = C.apply (C.apply (C.id ">=") x) y
+let let' x e body   = C.let' [C.var' x, e] body
+let apply2 f x y    = C.apply (C.apply f x) y
+@
+
+The cost of a rule is a sum of integers and user-provided code. We
+optimize away the zeroes.
+
+<<CodeGen>>=
+let add x y = match x, y with
+    | (C.Int 0), y -> y
+    | x, (C.Int 0) -> x
+    | x, y         -> C.apply (C.apply (C.id "+")  x) y
+
+let sum exps = List.fold_left add (C.Int 0) exps
+@
+
+[[Compose]] takes a list of function expressions $f_1, \ldots, f_n$,
+an argument expression $a$, and creates an application: $f_1 (f_2
+(\cdots(f_n~a))\cdots)$. The argument is passed to $f_n$ first and the
+result of that application to $f_{n-1}$ and so forth.  
+
+<<CodeGen>>=
+let compose fs arg = List.fold_left (fun x f -> C.apply f x) arg fs
+@
+
+<<CodeGen>>=
+let nt         = "nt"
+let x          = "x"
+let cost       = "cost"
+let upd x      = "update_" ^ x
+let arg n      = "arg" ^ (string_of_int n)
+let camlburg   = "Camlburg"
+let path xs    = String.concat "." xs  
+@
+
+[[Choice]] puts its arguments into a list and applies [[choice]] to it.
+The [[choice]] function is part of the run-time system.
+
+<<CodeGen>>=
+let choice = function
+    | []  -> assert false
+    | [x] -> x
+    | xs  -> C.apply (C.longid [camlburg;"choice"]) (C.list xs)
+
+(*
+    (fun x ->
+        (update_str
+           { cost = nt.cost + 1
+           ; action = fun () ->
+                   let number = x.number.action ()
+                   in string_of_int number 
+           }) x)
+*)
+@
+
+Every chain rule can use its own variable to refer to the value of the right
+hand side. We thus have to bind the value of the right hand side to this
+variable [[v]].
+
+<<CodeGen>>=
+let chain_fn src rule =
+    let v       = match rule.S.pattern with
+                  | S.Var(x, _) -> x
+                  | _           -> assert false (* not a chain rule *)
+    and dst     = rule.S.nonterm
+    and c       = rule.S.cost
+    and a       = rule.S.code
+    and f       = C.longid ["x";src;camlburg;"action"]
+    and ccost   = path [camlburg;"cost"]
+    and caction = path [camlburg;"action"]
+    in
+        C.fun' [C.var' x] 
+               (apply2 (C.id (upd dst))
+                       (C.record [ccost  , add (C.longid [nt;camlburg;cost]) c 
+                                 ;caction, action (let' v (C.apply f C.unit)
+                                                    a) 
+                                 ])
+                       (C.id x))
+@                       
+
+When a nonterminal is updated, the nonterminals connected to it by
+chain rules must be updated, too. We want to update these chained
+nonterminals in such an order, that the nonterminal with the smallest
+additional costs ist updated first. This requires to sort the cain rules
+by their cost. 
+
+<<CodeGen>>=
+(*
+    fun nt x ->
+        if nt.cost >= x.number.cost then
+            x
+        else
+            (* composed chain_fn *) { x with number = nt }
+*)
+<<CodeGen>>=
+let update_fn src chainrules =
+    let arg     = C.recordwith x [src, C.id nt]             
+    and chns    = List.map (chain_fn src) (List.sort rule_order chainrules)
+    in    
+        C.fun' [C.var' nt; C.var' x] 
+               (C.if' (geq (C.longid [nt;camlburg;cost]) 
+                           (C.longid [x;src;camlburg;cost]))
+                      (C.id x)
+                      (compose chns arg)) 
+<<CodeGen>>=
+(*  
+    let rec update_number = (* update_fn *) 
+    and update_str = (* udpdate_fn *)
+    and ...
+*)    
+let nonterms nts map =
+    C.def (List.map (fun nt -> upd nt, update_fn nt (lookup map nt)) nts)
+@
+
+Below is some monadic code to deal with the following problem: we have
+to refer to function arguments [[arg1]], [[arg2], and so on. Code that
+refers to these arguments is derived from an argument list of a pattern
+constructor. The number of an argument depends on the position in the
+argument list we are looking at. Thus, the actual position must be
+threaded through the code generator. To make things a little bit easier
+we define a state monad, where the [[state]] is the actual position.
+The monadic map function [[mmap]] in particular allows to apply a function
+to each argument in the argument list easily. 
+
+<<CodeGen>>=
+(* some monadic code to deal with argument positions *)
+type state = int
+type 'a m  = state -> ('a * state)
+
+let return a  = fun s -> (a, s)
+let (>>=) m f = fun s -> let (a, s') = m s in f a s'
+let rec sequence  = function
+    | []    -> return []
+    | c::cs -> c >>= fun c -> sequence cs >>= fun cs -> return (c::cs) 
+let mmap f xs = sequence (List.map f xs)
+let getpos = fun n -> (n, n+1)      (* obtain argument position *)
+@
+
+The monadic [[cost]] function creates an expression that computes the
+cost for a sub-tree that matches a constructor argument.
+
+<<CodeGen>>=
+let cost pat = getpos >>= fun n ->
+    match pat with
+    | S.Var(v, S.Term _)    -> return (C.int 0)
+    | S.Var(v, S.NonTerm t) -> return (C.longid [arg n; t; camlburg;"cost"])
+    | S.Con _               -> assert false (* not in normal form *)
+    | S.Literal(S.Int i)    -> return (apply2 (C.longid [camlburg;"matches"]) 
+                                              (C.int i)
+                                              (C.id (arg n)))
+    | S.Literal(S.String s) -> return (apply2 (C.longid [camlburg;"matches"]) 
+                                              (C.string s)
+                                              (C.id (arg n)))
+    | S.Literal(S.Char c)   -> return (apply2 (C.longid [camlburg;"matches"]) 
+                                              (C.char c)
+                                              (C.id (arg n)))
+@
+
+The monadic [[bind]] function creates a binding for a variable in a
+pattern. This function can be applied to any pattern; however, a literal
+pattern does not define a variable. Therefore, an optional binding is
+returned.
+
+<<CodeGen>>=
+let bind pat = getpos >>= fun n ->
+    match pat with
+    | S.Var(v, S.Term _)    -> 
+        return (Some(C.var' v, C.id (arg n)))
+    | S.Var(v, S.NonTerm t) -> 
+        return (Some(C.var' v
+                    , C.apply (C.longid [arg n; t; camlburg;"action"]) C.unit))
+    | S.Con _ -> 
+        assert false (* not in normal form *)
+    | S.Literal(_) ->
+        return None
+@
+
+The [[some]] function filters all values from a list of optional
+values that are different from [[None]] and return them. This is used to
+generate bindings for only those pattern arguments that define variables
+and skip the others.
+
+<<CodeGen>>=
+let rec some = function
+    | [] -> []
+    | Some x :: xs -> x :: some xs
+    | None   :: xs -> some xs
+@
+ 
+The specification for the cost of a rule is either a fixed number or a
+user-provided Objective Caml expression. Such an expression can refer to
+the values of terminal variables, which bind the actual value in the
+subject tree. The [[bindcost]] function creates a binding for a pattern.
+
+<<CodeGen>>=
+let codebind pat = getpos >>= fun n ->
+    match pat with
+    | S.Var(v, S.Term _) -> return (Some(C.var' v, C.id (arg n)))
+    | _                  -> return None
+@
+
+
+[[Con_record]] constructs a cost/action record for a rule with a
+constructor pattern. The action let-binds all variables defined by the
+constructor arguments and puts the user-supplied code into the let body.
+
+<<CodeGen>>=
+let con_record (r:S.rule) =
+    let args = match r.S.pattern with
+        | S.Con(_,args) -> args
+        | _             -> assert false (* not a constructor rule *) in
+    let rulecost = match r.S.cost with
+        | C.Int _ as fixed   -> fixed
+        | C.Raw _ as dynamic -> C.let' (some (fst (mmap codebind args 1)))
+                                       dynamic     
+        | _                  -> assert false (* impossible *)
+    in
+        C.record 
+            [ path [camlburg;"cost"]  
+                , sum (rulecost :: fst (mmap cost args 1))  
+            ; path [camlburg;"action"]
+                , action (C.let' (some (fst (mmap bind args 1))) r.S.code)
+            ]                         
+@
+
+[[Partition]] splits a list of rules (with the same constructor as
+pattern) by the nonterminals they define. The result is a map that
+associates a non-terminal with a list of rules that defines it.
+
+<<CodeGen>>=
+let partition rules =
+    let add map rule = StringMap.add 
+                        rule.S.nonterm (rule :: lookup map rule.S.nonterm) map
+    in
+        List.fold_left add StringMap.empty rules
+@
+
+<<CodeGen>>=
+(* 
+    (update_number (choice [ (* cost/action records *) ] 
+*)
+
+let update_call nt rules =
+    C.apply (C.id (upd nt))
+            (choice (List.map con_record rules))
+
+(* 
+    (update_x (choice [ ..]) (update_y (choice [..]) ... inf)
+*)
+
+let con_fn con rules types =
+    let t       = S.StringMap.find con types                    in
+    let argv    = fst (mmap (fun _ n -> C.var' (arg n), n+1) t 1) in
+    let updates = StringMap.fold 
+                    (fun nt rules l -> update_call nt rules :: l)
+                    (partition rules)
+                    []
+    in
+        C.fun' argv (compose updates (C.id "inf"))
+@
+
+The [[constructors]] function creates one function per pattern
+constructor that is used in a specification. The [[maps]] argument
+associates a constructor with a list of rules that use this constructor.
+Such a list is further split with [[partition]] during code generation.
+
+<<CodeGen>>=
+let constructors map types =
+    let cons = StringMap.fold (fun con _ l -> con :: l) map [] in
+        C.def (List.map 
+                (fun con -> ("con"^con
+                            , con_fn con (lookup map con) types
+                            )) 
+                cons) 
+@
+
+
+Define the record value [[inf]], the most undefined action/cost record.
+
+<<CodeGen>>=
+let inf nts = 
+    C.record (List.map (fun nt -> (nt, C.longid [camlburg;"infinity"])) nts)
+
+let infdef nts =
+    C.def ["inf", inf nts]
+@
+
+Declare the record type [[nonterm]]. Each nonterminal corresponds to a
+field in the record. If the type for the nonterminal was declared using
+[[%type]], the declared type is used for the record, otherwise a type
+variable is invented that becomes also a parameter of the record. The
+[[nonterm_types]] function computes the type for all nonterminals
+(either the declared type, or a type parameter) and return them in an
+association list, plus the list of type parameters.
+
+<<CodeGen>>=
+let nonterm_types nts types =
+    let rec loop i (tyvars, pairs as result) = function
+        | []      -> result
+        | nt::nts -> 
+            if Spec.StringMap.mem nt types then
+                let t = Spec.StringMap.find nt types in
+                    loop i     (tyvars, (nt,(C.tyraw t))::pairs) nts
+            else
+                let t = "t" ^ string_of_int i in
+                    loop (i+1) (t::tyvars, (nt, C.tyvar t)::pairs) nts
+    in
+        loop 0 ([],[]) nts
+
+
+let tydecl nts types =
+    let tyvars, pairs = nonterm_types nts types in
+    let nt t = C.ty [t] "Camlburg.nt" in 
+    { C.params = tyvars 
+    ; C.name   = "nonterm"
+    ; C.rep    = Some (C.typrod (List.map (fun (x,t)->(false, x, nt t)) pairs))
+    }
+@
+

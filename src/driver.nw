@@ -1,0 +1,182 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 sts=4 sw=4 et
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+% ------------------------------------------------------------------ 
+\section{Driver}
+% ------------------------------------------------------------------ 
+
+This module presents the compiler as a compositional collection of
+abstract values and functions. These functions and values are exported
+as primitives to a Lua interpreter, giving the user a way to customize
+the compiler.
+
+In case of an error, all functions raise [[Error.ErrorExn]]. An error
+message is typically printed to [[stderr]] before the exception is
+raised.
+
+\begin{itemize}
+\item [[version]]: print a version information to [[stdout]]. This is
+      intentionally not a string such it is harder to abuse.
+\item [[scan]]: scans a file and prints all tokens together with their
+      source code position. Only useful to debug the scanner.
+\item [[parse]]: returns the abstract syntax of a {\PAL} file.
+\item [[emit_asdl]]: writes the {\AST} in {\small ASDL} syntax to
+      [[stdout]].
+\item [[check]]: checks the static semantics of a file and returns 
+      an environment [[env]] value upon success. 
+\item [[compile]]: compiles an {\AST} to assembly code. The function
+      calls the Lua function [[optimize]] for every function and passed
+      the functions control-flow graph [[cfg]] and its [[stack]] to it.
+\item [[assemble]]: emits an assembler program.
+\item [[print]]: prints a [[doc]] value to [[stdout]], formatting the
+      output for a line width of [[width]] characters.       
+\item [[reinit]]: re-initializes any mutable state.
+\end{itemize}
+
+The compiler is controlled by a Lua interpreter that is build in the
+\module{main2} module. It takes several user-defined types to extend it.
+This module provides new Lua types like [[asm]] and [[ast]] for the
+interpreter, and a library that uses them. 
+<<driver.mli>>=
+val emit_asdl : 'a * Ast.program -> unit
+val parse     : string -> Srcmap.map * Ast.program
+val print     : Pp.doc -> int -> out_channel -> unit
+val pretty    : 'a * Ast.toplevel list -> Pp.doc
+val scan      : string -> unit
+val version   : unit -> unit
+val elab : 
+  swap:bool -> (Rtl.rtl -> string option) -> Srcmap.map * Ast.program
+  -> 'proc Asm.assembler
+  -> ('proc Fenv.Dirty.env' * 'proc Nelab.compunit) Error.error
+val compile :
+  Ast2ir.tgt -> (Ast2ir.proc -> unit) -> bool(*emitglobals*) -> (Srcmap.map * Ast.program)
+  -> Ast2ir.proc Asm.assembler -> bool(*validate*) -> bool(*swap*) -> unit
+   (* raises Error.ErrorExn *)
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Caml Implementation}
+% ------------------------------------------------------------------ 
+<<driver.ml>>=
+module E  = Error
+module M  = Metrics
+module PA = Preast2ir
+module T  = Target
+<<driver.ml>>=
+let version () =
+    ( This.name     stdout 
+    ; output_string stdout " "
+    ; This.version  stdout 
+    ; output_string stdout 
+        " (see also http://www.cminusminus.org)\n"
+    )
+<<driver.ml>>=
+let scan file =
+    let fd          = try open_in file
+                      with Sys_error(msg) -> E.error msg    in
+    let finally ()  = close_in fd                           in
+    let lexbuf      = Lexing.from_channel fd                in
+    let map         = Srcmap.mk ()                          in
+    let scanner     = Scan.scan map                         in
+    let location lb = Srcmap.location map (Lexing.lexeme_start lb) in
+    let rec loop lb =
+        match scanner lb with
+            | Parse.EOF -> ()
+            | tok       ->
+                let (file,line,col) = location lb           in
+                let tok             = Scan.tok2str tok      in
+                    ( Printf.printf "%-16s %3d %2d %s\n" file line col tok
+                    ; loop lb
+                    )
+    in
+        ( Srcmap.sync map 0 (file,1,1)
+        ; loop lexbuf
+        ; finally ()
+        )
+<<driver.ml>>=
+let parse (file:string) = 
+    let fd          = try open_in file
+                      with Sys_error(msg) -> E.error msg    in
+    let finally ()  = close_in fd                           in
+    let lexbuf      = Lexing.from_channel fd                in
+    let map         = Srcmap.mk ()                          in
+    let scanner     = Scan.scan map                         in
+        try
+            ( Srcmap.sync map 0 (file,1,1)
+            ; (map, Parse.program scanner lexbuf) 
+            )
+        with
+            | Parsing.Parse_error ->
+              ( finally()
+              ; E.errorPointPrt (map, Lexing.lexeme_start lexbuf) "parse error"
+              ; E.error "parse error - compilation aborted"
+              )
+            | E.ErrorExn msg ->
+              ( finally()
+              ; E.errorPointPrt (map, Lexing.lexeme_start lexbuf) msg
+              ; E.error "parse error - compilation aborted"
+              )
+            | e ->
+              ( finally()
+              ; raise e
+              )
+<<driver.ml>>=
+let emit_asdl (map,ast) =
+        AstUtil.sexp_wr_program ast stdout
+@
+<<driver.ml>>=
+let pretty (map,ast) = Astpp.program ast
+let print doc width channel = Pp.ppToFile channel width doc
+@ 
+\subsection{Driver support for the new front end}
+
+Metrics check.  Perhaps the [[Target.t]] should have a [[Metrics.t]] inside.
+PERHAPS THIS CHECK SHOULD BE MOVED INTO ELAB, WHICH SHOULD ALSO CHECK FOR
+THINGS LIKE CORRECT CALLING CONVENTIONS AND HARDWARE REGISTERS.
+<<driver.ml>>=
+let metrics_ok src tgt =
+  let int i = string_of_int i in
+  let string s = s in
+  let outcome = ref true in
+  let unequal property to_string source target = 
+    outcome := false;
+    Printf.eprintf "source code specifies %s %s, but target %s specifies %s %s\n"
+      property (to_string source) tgt.T.name property (to_string target) in
+  let (<>) = Pervasives.(<>) in
+  if src.M.byteorder <> tgt.T.byteorder then
+    unequal "byteorder" Rtlutil.ToUnreadableString.agg src.M.byteorder tgt.T.byteorder;
+  if src.M.wordsize <> tgt.T.wordsize then
+    unequal "wordsize" int src.M.wordsize tgt.T.wordsize;
+  if src.M.pointersize <> tgt.T.pointersize then
+    unequal "pointersize" int src.M.pointersize tgt.T.pointersize;
+  if src.M.memsize <> tgt.T.memsize then
+    unequal "memsize" int src.M.memsize tgt.T.memsize;
+  if src.M.float <> Float.name tgt.T.float then
+    unequal "float" string src.M.float (Float.name tgt.T.float);
+  if src.M.charset <> tgt.T.charset then
+    unequal "charset" string src.M.charset tgt.T.charset;
+  !outcome
+@ 
+<<driver.ml>>=
+let elab ~swap validate (map,ast) asm =
+  Nelab.program ~swap validate map asm (Nast.program ast)
+
+let compile (PA.T target) opt exportglobals src asm validate swap =
+  let validate = if validate then Mvalidate.rtl target else (fun _ -> None) in
+  let abort () = Error.error "compilation aborted because of errors" in
+  let as_ok = function Error.Ok x -> x | Error.Error -> abort () in
+  as_ok (Error.ematch (elab swap validate src asm) (fun (env,compunit) ->
+    if metrics_ok (Fenv.Dirty.metrics env) target then
+      if Fenv.Dirty.errorFlag env then
+        abort ()
+      else
+        Ast2ir.translate (PA.T target) (Fenv.clean env) opt exportglobals compunit
+    else
+      Error.error "metrics of source code don't match the target"))
+@

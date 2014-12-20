@@ -1,0 +1,19 @@
+
+// execute the commands below to use this file as a test case
+//
+
+target byteorder little;
+
+bits8 c;
+
+section "data" 
+{
+    x:
+    bits32[4]; 
+}
+
+foo () {
+    return (bits32[x aligned 5]);
+
+}
+

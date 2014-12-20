@@ -1,0 +1,184 @@
+.TH QC--INTERNALS 1 "$ Date: $"
+.\" For nroff, turn off justification.  Always turn off hyphenation; it makes
+.\" way too many mistakes in technical documents.
+.hy 0
+.if n .na
+.\"
+.SH NAME
+qc--internals \- customizing the Quick C-- compiler
+.SH SYNOPSIS
+\fBqc--\fP [\fIoption\fP | \fIfile\fP] ... 
+.SH DESCRIPTION
+\fBqc--\fP is a compiler for the C-- language. It takes
+.I files
+as
+arguments and compiles, assembles, and links the
+.I files
+into an
+executable file.  The compiler is controlled by a built-in Lua
+interpreter, running a Lua program. A user can manipulate the state of
+the running interpreter or supply a new Lua program to customize
+\fBqc--\fP.
+.PP
+A command-line option of the form \fIname\fP\fB=\fP\fIvalue\fP assigns \fIvalue\fP
+to a variable
+.I name
+in the running interpreter. Both
+.I name
+and
+.I value
+must follow the Lua syntax for variables and values. If not
+noted otherwise, the Lua type of a
+.I value
+is \fIstring\fP. As a
+convention, capitalized names denote Lua tables. 
+.PP
+Caveat: the Lua code controlling
+.B qc--
+is in constant flux.  Anybody
+dealing with options described here is assumed to know what he or she is
+doing.
+.SH OPTIONS
+See the user's manual qc--(1) for more options.
+.TP
+\fBbackend=\fP\fIbackend\fP
+\fBqc--\fP is a cross compiler; this option causes it to generate code for
+\fIbackend\fP, where a
+.I backend
+identifies an architecture/operating
+system platform. By default, code for the actual platform is generated.
+The following targets of type 
+\fIbackend\fP are supported:
+.B Backend.x86 
+(x86 running Linux),
+.B Backend.sparc
+(Sparc running Solaris),
+and
+.B Backend.ppc
+(Power PC running Mac OSX).
+.TP 
+\fBDebug.stack=1\fP
+Print diagnostic information about the composition of the stack frame.
+.TP
+\fBAs.path=\fP\fIpath\fP
+Define an alternate path the assembler as(1). 
+.TP 
+\fBAs.options\fP=\fIoptions\fP
+Define options passed to the assembler. 
+.TP 
+\fBLd.path=\fP\fIpath\fP
+Define an alternate path for the linker ld(1).
+.TP 
+\fBLd.options\fP=\fIoptions\fP
+Define options passed to the linker ld(1). Note that some other options
+like
+.B "-L"
+and
+.B "-l"
+are also passed to the linker.
+.TP 
+\fBInterp.hashbang=\fP\fIstring\fP
+An executable for the qc--interp(1) interpreter calls the interpreter
+using the Unix #! mechanism. This option defines, what goes into the
+first line of an executable. The default is 
+.B #! /usr/bin/env qc--interp\fR.\fP
+.TP 
+\fBOptions.swap=1\fP
+Treat each input program as if it has the opposite byte 
+order from what is written in the source code.
+.TP 
+\fBOptions.validate=1\fP
+Turn on validation that gives source-locations for C-- constructs that
+may not be translatable for the target machine.
+.TP
+\fIname\fP\fB=\fP\fIvalue\fP
+Assign Lua value
+.I value
+to the Lua variable \fIname\fP.
+.TP 
+\fB-e\fP \fIstatement\fP
+The Lua
+.I statement
+is passed to the Lua interpreter and executed. This
+allows to alter default settings in the interpreter or to inspect the
+interpreter. 
+.TP 
+\fB-i\fP
+Start an interactive session with the Lua interpreter that reads from
+stdin. The session allows to inspect the Lua interpreter; most useful
+for debugging Lua code. 
+.TP 
+\fB-vv\fP
+Don't execute calls to external tools, just print them. Useful to test
+the driver and new command line options.
+.TP 
+\fB-pp\fP
+Pretty print: do not compile, assemble, or link. Each
+.B file.c--
+source
+file is pretty printed into \fBfile.pp\fP. The
+.B -o
+option is honored.
+.SH LUA STARTUP
+The Lua interpreter built into
+.B qc--
+controls the compiler. At startup
+it tries to find the file 
+.B qc--.lua
+using a search path taken from the
+environment variable 
+.BR QCMMLUAPATH .
+If the environment variable is
+undefined, the default is 
+.BR ":.:*" .  
+A search path contains a list of
+colon separated directories. Two directory names are special: the empty
+directory refers to an implementation-dependent system-wide directory,
+like 
+.BR /usr/local/lib/qc-- . 
+The star 
+.B "*"
+refers to a ``directory''
+that is actually compiled into the
+.B qc--
+executable.  With the default
+search path (empty, dot, star),
+.B qc--
+therefore looks first in the
+system-wide directory for \fBqc--.lua\fP, then in the current directory,
+and then takes the built-in \fBqc--.lua\fP. 
+.PP
+To obtain a copy of the Lua startup script \fBqc--.lua\fP, use the
+following option: \fB-e 'write(Boot["qc--.lua"])'\fP. When the default
+search path is used, a (modified) copy of \fBqc--.lua\fP in the local
+directory takes precedence over other built-in \fBqc--.lua\fP and thus can
+be used for experiments.
+.SH ENVIRONMENT
+.TP 
+QCMMLUAPATH
+Search path for Lua code. If undefined, the default search path is
+\fB:.:*\fP.
+.TP 
+QCDEBUG
+Strings that can be set to debug the compiler.
+For a list, run \fBqc-- -e 'Debug.explain()'\fP.
+.SH SEE ALSO
+http://www.cminusminus.org/,
+http://www.lua.org/.
+.br
+qc--(1), qc--interp(1), lua(1), ld(1), as(1).
+.SH BUGS
+Report bugs to 
+.BR bugs@cminusminus.org . 
+Include a
+.I small
+example that
+allows us to reproduce the bug. The bug-tracking system can be found at
+.BR http://www.cminusminus.org/qc--bugs .
+.SH AUTHORS
+The good people at
+.BR http://www.cminusminus.org .
+.SH VERSION
+ $Id: qc--internals.1,v 1.3 2006-03-08 22:33:10 nr Exp $
+
+

@@ -1,0 +1,16 @@
+// execute the commands below to use this file as a test case
+//
+
+target byteorder little;
+
+section "data" {
+    str: bits8;
+}
+
+f ()
+{
+    stackdata {
+        str: bits8[64];
+    }
+    return;
+}

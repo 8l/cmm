@@ -1,0 +1,564 @@
+% -*- mode: Noweb; noweb-code-mode: sml-mode -*-
+\documentclass[letterpaper]{article}
+\usepackage{noweb}
+\usepackage{amsmath,tabularx,geometry}
+
+\geometry{letterpaper,tmargin=2.5cm,bmargin=2.5cm,lmargin=2.5cm,rmargin=2.5cm}
+
+\newcommand\cmm{\mbox{C{\texttt{-{}-}}}{} }
+
+\title{{\cmm}Interpreter Internals}
+\author{Reuben Olinsky}
+\date{June 11, 2002}
+
+\pagestyle{empty}
+
+%% beginning of macros
+
+% render a state
+\newcommand\dash{\texttt{-}}
+\newcommand\state[9]{\langle #1, #2, #3, #4, #5, #6, #7, #8, #9 \rangle}
+\newcommand\act[5]{\langle #1, #2, #3, #4, #5 \rangle}
+
+\newcommand\pc{{\mathit{PC}}}   % program counter
+\newcommand\ls{{\mathit{ls}}}   % location stack
+\newcommand\uid{{\mathit{uid}}} % unique identifier
+\newcommand\spt{{\mathit{sp}}}  % stack pointer
+\newcommand\emptystack{{\mathit{nil}}}
+
+\newcommand\newpc{\widehat{\pc}}
+
+% default state and activation record
+\newcommand\dstate{\state \pc V \rho \spt g \sigma A u s}
+\newcommand\dact{\act \pc \rho \spt \kappa u}
+
+% continuation bundle
+\newcommand\bundle{\langle \kappa_{c}, \kappa_{u}, \kappa_{r}, abort \rangle}
+
+% for building inference rules
+\newcommand{\xfrac}[3][c]{{\displaystyle\genfrac{}{}{0pt}{}{%
+  \strut\ifx r#1\hfill\fi#2\ifx l#1\hfill\fi}{#3}}%
+  \kern-\nulldelimiterspace}
+\def\twoline#1#2{\xfrac{#1}{#2}}
+\def\threeline#1#2#3{\xfrac{\xfrac{#1}{#2}}{#3}}
+\def\fourline#1#2#3#4{\xfrac{\xfrac{\xfrac{#1}{#2}}{#3}}{#4}}
+\def\fiveline#1#2#3#4#5{\xfrac{\xfrac{\xfrac{\xfrac{#1}{#2}}{#3}}{#4}}{#5}}
+\def\sixline#1#2#3#4#5#6{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{#1}{#2}}{#3}}{#4}}{#5}}{#6}}
+\def\sevenline#1#2#3#4#5#6#7{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{#1}{#2}}{#3}}{#4}}{#5}}{#6}}{#7}}
+\def\eightline#1#2#3#4#5#6#7#8{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{#1}{#2}}{#3}}{#4}}{#5}}{#6}}{#7}}{#8}}
+\def\nineline#1#2#3#4#5#6#7#8#9{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{\xfrac{#1}{#2}}{#3}}{#4}}{#5}}{#6}}{#7}}{#8}}{#9}}
+\newcommand\twoquad  [2]{{#1}\qquad{#2}}
+\newcommand\threequad[1]{{#1}\qquad\twoquad}
+\newcommand\fourquad [1]{{#1}\qquad\threequad}
+\newcommand\fivequad [1]{{#1}\qquad\fourquad}
+\newcommand\sixquad  [1]{{#1}\qquad\fivequad}
+
+\newcommand\cons{\mathbin{::}}
+
+\def\andalso{\qquad}
+\def\YIELDS{\Downarrow}
+\def\yields{\rightarrow}
+
+% evaluation judgment \step{s1}{s2}
+\newcommand\step[2]{#1 \yields #2}
+
+%%% newmacros
+
+\makeatletter
+\def\doops[#1]#2#3#4{%
+  \global\@namedef{ops-#1}{\showops{#2}{#3}{#4}}\@nameuse{ops-#1}}
+\newcommand\ops{\@ifnextchar[{\doops}{\dblops}}
+\newcommand\dblops[1]{\doops[#1]{#1}}
+\newcommand\useops[1]{%
+   \@ifundefined{ops-#1}%
+     {\@latex@error{No rule `#1' defined in operational
+     semantics}\@opshelp}
+     {\@nameuse{ops-#1}}}
+\gdef\@opshelp{I never saw a rule by that name.\@ehc}
+
+\makeatother
+\newcommand\rulename{\textsc}
+
+\newcommand\showrule[2]{%
+    \renewcommand{\theequation}{\mbox{{\rulename{#1}}}}%
+                         % dubious \llap hoped to make rules centered...
+    \begin{equation}
+    #2
+    \end{equation}
+}
+\newcommand\showops[3]{\showrule{#1}{\frac{#2}{#3}}}
+
+%%% end_newmacros
+
+%% end of macros
+
+\begin{document}
+
+\maketitle
+
+\subsection*{Representing State}
+
+\subsubsection*{Type Definitions}
+
+First, some type definitions:
+
+<<type definitions>>=
+type uid             = { thread : int, frame : int }
+type address         = bit vector      (* width of vector = PTRSIZE *)
+type PC              = address
+
+type space           = unsigned character
+type contAnnotations = { kappa_cut    : PC array , 
+                         kappa_unwind : PC array ,
+                         kappa_return : PC array ,
+                         aborts       : boolean  }
+
+type register        = word            (* width of word defined in WORDSIZE *)
+
+type memoryCell      = bit vector      (* width of vector = MEMSIZE *)
+type memory          = ???
+type register_set    = register array
+
+type var_env         = value array
+datatype value       = BOOLEAN      of boolean
+                     | BITS         of bit vector
+
+type activation      = address * var_env * stack_pointer * contAnnotations *
+                       uid
+
+<<type definitions for assembly code>>
+
+type machine = PC * value stack * var_env * stack_pointer * var_env
+               (memory * register_set) * value stack * uid * 
+               activation stack
+@ 
+
+\subsubsection*{State Representation}
+
+State will be represented by a tuple of the form: $\dstate$, where: \\
+\\
+\begin{tabularx}{\linewidth}{@{\hskip2em}rlX@{}}
+$\pc$&:    \texttt{address}& program counter\\
+$V$&:      \texttt{value stack}& value data stack\\
+$\rho$&:   \texttt{var\_env}& the current local environment (stores local variables)\\
+$\spt$&:   \texttt{stack\_pointer}& pointer to stack used to store local stack-data\\
+$g$&:      \texttt{var\_env}& the global environment (holds global variables)\\
+$\sigma$&: \texttt{memory * register\_set}& the store (\cmm memory and \cmm hardware registers)\\
+$A$&:      \texttt{value stack}& argument-passing area\\
+$u$&:      \texttt{uid}& a unique identifier\\
+$s$&:      \texttt{activation stack}& the activation stack\\
+\end{tabularx}\\
+\\
+The unique identifiers present in our representation of state will let the \cmm interpreter prevent cuts to dead continuations.  To prepare the \cmm abstract machine for the future possibility of multi-threaded computation we may consider the option of including within our machine multiple activation stacks, each of which represents a separate thread.  Cuts, for example, may occur from an activation on one stack to a continuation on another stack.  To properly ensure cuts may not be taken to dead continuations in a multi-threaded environment, our unique identifier could be implemented with two words: one word to uniquely identify the stack (thread) in which the activation sits, and a second word to uniquely identify where it sits on this stack.
+
+Also note that there is an instruction array present in our state (the program space), but we will not explicitly include it in our tuple because no rules require its modification.  
+
+The activation stack represents all live activations, but does \emph{not} include the currently active one.  The current activation is represented by elements in the top-level of the tuple ($\pc$, $\rho$, $\spt$, and $u$); all previous activations that are on the stack $s$ are instead represented by a tuple of the form: $\dact$, where: \\
+\\
+\begin{tabularx}{\linewidth}{@{\hskip2em}rlX@{}}
+$\pc$&:    \texttt{address}& program counter for this activation\\
+$\rho$&:   \texttt{var\_env}& local environment for this activation (local variables)\\
+$\spt$&:    \texttt{stack\_pointer}& pointer to stack used to store local stack-data for this activation\\
+$\kappa$&: \texttt{contAnnotations}& continuation bundle that indicates to which continuations the object of this activation's pending call may cut, unwind, or return; also indicates if same object may be aborted\\
+$u$&:   \texttt{uid}& unique identifier for this activation\\
+\end{tabularx}\\
+\\
+A continuation bundle $\kappa$ will be represented by a tuple of the form $\kappa = \bundle$, where:\\
+\\
+\begin{tabularx}{\linewidth}{@{\hskip2em}llX@{}}
+$\kappa_{c}$&: \texttt{address array}& array of continuations available through a cut\\
+$\kappa_{u}$&: \texttt{address array}& array of continuations available through run-time activation unwinding\\
+$\kappa_{r}$&: \texttt{address array}& array of continuations available through alternate returns\\
+$abort$&:      \texttt{boolean}& whether or not this activation may be aborted\\
+\end{tabularx}\\
+\\
+Elements of the \cmm abstract machine's internal state that are not included in the above tuples: \\
+\\
+\begin{tabularx}{\linewidth}{@{\hskip2em}lX@{}}
+bytecode instructions to interpret ($i$)& \texttt{byte array}\\
+$\uid$ liveness table& \texttt{(uid * boolean) table}\\
+one symbol table per assembly file to manage labels& \texttt{NJ Machine-Code Toolkit}\\
+one overall symbol table to manage external symbols& \texttt{NJ Machine-Code Toolkit}\\
+\end{tabularx}\\
+
+\subsubsection*{Starting Configuration}
+The initial configuration of the \cmm abstract machine is given by the tuple ${\state {\pc_i} \emptystack {\{\}} {\spt_i} {\{\}} {\sigma_i} {\{\}} u \emptystack}$, where: $\pc_i$ is the initial program counter; $\spt_i$ is a pointer to a fresh memory stack; $\sigma_i$ is the initial state of the store after having loaded a \cmm program and initial data blocks into memory; and $u$ is a fresh \texttt{uid}.
+
+\subsection*{Instructions}
+
+The following ML datatypes sketch out the structure of assembly code that the \cmm abstract machine is equipped to handle:
+
+<<type definitions for assembly code>>=
+datatype instruction = (* RTL instructions *)
+                     | LITERAL       of value
+                     | PUSH_SYMBOL   of symbol
+
+                     | FETCH         of space * size
+                     | FETCH_LOCAL   of index
+                     | FETCH_GLOBAL  of index
+
+                     | STORE         of space * size
+                     | STORE_LOCAL   of index
+                     | STORE_GLOBAL  of index
+
+                     | GUARDED_STORE        of space * size
+					 | GUARDED_STORE_LOCAL  of space * size
+					 | GUARDED_STORE_GLOBAL of space * size
+
+                     | PUSH_ARG
+                     | POP_ARG
+                     | OPERATOR      of operator * size list
+
+                       (* CFG instructions *)
+                     | GOTO          (* pops target PC off stack *)
+                     | CBRANCHT      of PC
+                     | CBRANCHF      of PC
+                     | BRANCH2       of PC * PC
+
+                     | CMM_CALL      of contAnnotations
+                     | CMM_TAIL_CALL (* pops target PC off stack *)
+                     | C_CALL        of C_function_signature
+                     | RETURN        of index * count
+                     | CUT           (* pops target PC off stack *)
+
+withtype count       = int
+     and label       = string
+     and symbol      = string
+     and size        = int
+     and index       = int
+     and operator    = int
+
+datatype byte_order  = LITTLE_ENDIAN
+                     | BIG_ENDIAN
+
+type assembly_unit   = { imports       : (string * address) list,
+                         exports       : (string * address) list,
+                         memsize       : int,
+                         ptrsize       : int,
+                         wordsize      : int,
+                         byte-order    : byte_order,
+                         globals       : int,
+                         code          : instruction list           }
+
+type procedure       = { label         : string,
+                         numLocals     : int,
+                         stackDataSize : int,
+                         numConts      : int,
+                         code          : instruction pointer        }
+
+type continuation    = { addr          : PC,
+                         ptr           : (activation stack) pointer }
+@
+
+
+The following architecture-related information is required to be present exactly once per assembly unit:\\
+\\
+\begin{tabularx}{\linewidth}{@{\hskip2em}lX@{}}
+\texttt{memsize-}\emph{size}& inform \cmm of the target architecture's smallest addressable memory unit (MEMSIZE)\\
+\texttt{ptrsize-}\emph{size}& inform \cmm of the target architecture's pointer size (PTRSIZE)\\
+\texttt{wordsize-}\emph{size}& inform \cmm of the target architecture's word size (WORDSIZE)\\
+\texttt{byte-order-}\emph{option}& inform \cmm of the target machine's byte order (BYTE-ORDER)\\
+\texttt{import-}\emph{table}& import the external symbols in \emph{table}\\
+\texttt{export-}\emph{table}& export the symbols in \emph{table} to other \cmm assembly units in memory\\
+\end{tabularx}\\
+\\
+Optional data directives include the following:\\
+\\
+\begin{tabularx}{\linewidth}{@{\hskip2em}lX@{}}
+\texttt{memcell-}\emph{data}& store initialized \emph{data} (of size MEMSIZE) in \cmm memory\\
+\texttt{data-}\emph{data}& store uninterpreted \emph{data} (of variable size) in \cmm memory\\
+\texttt{align-}\emph{k}& pad memory as necessary so that the following data is aligned to an \emph{k} MEMSIZE boundary\\
+\end{tabularx}\\
+\\
+Optional code structuring mechanisms include the following:\\
+\\
+\begin{tabularx}{\linewidth}{@{\hskip2em}lX@{}}
+\texttt{define-label-}\emph{label}& bind \emph{label} to current location\\
+\texttt{section-}\emph{label}& begin section denoted by \emph{label}\\
+\texttt{span ...               }&\\
+\texttt{define-procedure ...   }&\\
+\texttt{define-continuation ...}&\\
+\end{tabularx}\\
+
+\subsection*{Operational Semantics}
+
+Below is a sketch of the operational semantics of the legal instructions in the \cmm interpreter \emph{(NOTE: it is far from complete!)}, but first we must wave our hands about some helper functions:\\*
+\\*
+\begin{tabularx}{\linewidth}{@{\hskip2em}lX@{}}
+\texttt{lookup\_symbol}(\emph{name})& lookup the value of symbol \emph{symbol}\\
+\texttt{aggregate}(\emph{store, location, size, byte-order})& fetch the (\emph{size} div MEMSIZE) bytes found at \emph{location} in \emph{store} and aggregate them into one value, according to the given byte-order \\
+\texttt{store}(\emph{store, location, value, size, byte-order})& split \emph{value} up into multiple pieces of size MEMSIZE and store pieces according to the given byte-order at \emph{location} in \emph{store}\\
+\texttt{arity}(\emph{operator-name})& return the arity of operator \emph{operator-name}\\
+\texttt{popn}(\emph{stack, n})& pops \emph{n} values off \emph{stack} and returns (list of popped values, stack of remaining values)\\
+\texttt{lookup\_label}(\emph{name})& lookup the value (address) of label \emph{label}\\
+\texttt{new\_env}(\emph{n})& creates a fresh, empty environment with space for \emph{n} values\\
+\texttt{c\_call}(\emph{address, args-stack, store, signature})& calls native C function at \emph{address} and with type signature \emph{signature} with access to arguments and the store; returns modified argument stack and store\\
+\texttt{is\_live}(\emph{uid})& returns \emph{true} if and only if the activation uniquely identified by \emph{uid} is still live
+\end{tabularx}\\
+\\
+Also, one notational comment: if $\pc$ is the index into the instruction array representing the current instruction, then we write $\newpc$ to mean the index of the immediately next instruction (following along the array linearly).  And now onward to the operational semantics: \\
+
+\ops{Literal}
+{i[\pc] = (literal)\textrm{ }x}
+{\step
+  {\dstate}
+  {\state \newpc {x\cons{}V} \rho \spt g \sigma A u s}
+}
+\\
+\ops{PushSymbol}
+{i[\pc] = .name \andalso a = \texttt{lookup\_symbol(}name\texttt{)}}
+{\step
+  {\dstate}
+  {\state \newpc {a\cons{}V} \rho \spt g \sigma A u s}
+}
+\\
+\ops{Fetch}
+{i[\pc] = \mathtt{fetch}\dash{}space\dash{}size \andalso v = \texttt{aggregate(}\sigma,\$space[a],size,\mathtt{byte}\dash\mathtt{order)}}
+{\step
+  {\state \pc {a\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc {v\cons{}V} \rho \spt g \sigma A u s}
+}
+\\
+\ops{Store}
+{i[\pc] = \mathtt{store}\dash{}space\dash{}size \andalso {\sigma'} = \texttt{store(}\sigma,\$space[a],v,size,\mathtt{byte}\dash\mathtt{order)}}
+{\step
+  {\state \pc {v\cons{}a\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt g {\sigma'} A u s}
+}
+\\
+\ops{Fetch-Local}
+{i[\pc] = \mathtt{fetch}\dash\mathtt{local}\dash{}x}
+{\step
+  {\dstate}
+  {\state \newpc {\rho[x]\cons{}V} \rho \spt g \sigma A u s}
+}
+\\
+\ops{Store-Local}
+{i[\pc] = \mathtt{store}\dash\mathtt{local}\dash{}x \andalso {\rho'} = \rho\{x\mapsto{}v\}}
+{\step
+  {\state \pc {v\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V {\rho'} \spt g \sigma A u s}
+}
+\\
+\ops{Fetch-Global}
+{i[\pc] = \mathtt{fetch}\dash\mathtt{global}\dash{}x}
+{\step
+  {\dstate}
+  {\state \newpc {g[x]\cons{}V} \rho \spt g \sigma A u s}
+}
+\\
+\ops{Store-Global}
+{i[\pc] = \mathtt{store}\dash\mathtt{global}\dash{}x \andalso g' = g\{x\mapsto{}v\}}
+{\step
+  {\state \pc {v\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt {g'} \sigma A u s}
+}
+\\
+\ops{Guarded-Store-True}
+{\twoline
+{i[\pc] = \mathtt{guarded}\dash\mathtt{store}\dash{}space\dash{}size}
+{{\sigma'} = \texttt{store(}\sigma,\$space[a],v,size,\mathtt{byte}\dash\mathtt{order)}}
+}
+{\step
+  {\state \pc {v\cons{}a\cons{}\mathtt{\#t}\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt g {\sigma'} A u s}
+}
+\\
+\ops{Guarded-Store-False}
+{i[\pc] = \mathtt{guarded}\dash\mathtt{store}\dash{}space\dash{}size}
+{\step
+  {\state \pc {v\cons{}a\cons{}\mathtt{\#f}\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt g \sigma A u s}
+}
+\\
+\ops{Guarded-Store-Local-True}
+{\twoline
+{i[\pc] = \mathtt{guarded}\dash\mathtt{store}\dash\mathtt{local}\dash{}x}
+{\rho' = \rho\{x\mapsto{}v\}}
+}
+{\step
+  {\state \pc {v\cons\mathtt{\#t}\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V {\rho'} \spt g \sigma A u s}
+}
+\\
+\ops{Guarded-Store-Local-False}
+{i[\pc] = \mathtt{guarded}\dash\mathtt{store}\dash\mathtt{local}\dash{}x}
+{\step
+  {\state \pc {v\cons\mathtt{\#f}\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt g \sigma A u s}
+}
+\\
+\ops{Guarded-Store-Global-True}
+{\twoline
+{i[\pc] = \mathtt{guarded}\dash\mathtt{store}\dash\mathtt{global}\dash{}x}
+{g' = g\{x\mapsto{}v\}}
+}
+{\step
+  {\state \pc {v\cons\mathtt{\#t}\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt {g'} \sigma A u s}
+}
+\\
+\ops{Guarded-Store-Global-False}
+{i[\pc] = \mathtt{guarded}\dash\mathtt{store}\dash\mathtt{global}\dash{}x}
+{\step
+  {\state \pc {v\cons\mathtt{\#f}\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt g \sigma A u s}
+}
+\\
+\ops{Push-Arg}
+{i[\pc] = \mathtt{push}\dash\mathtt{arg}}
+{\step
+  {\state \pc {v\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt g \sigma {v\cons{}A} u s}
+}
+\\
+\ops{Pop-Arg}
+{i[\pc] = \mathtt{pop}\dash\mathtt{arg}}
+{\step
+  {\state \pc V \rho \spt g \sigma {v\cons{}A} u s}
+  {\state \newpc {v\cons{}V} \rho \spt g \sigma A u s}
+}
+\\
+\ops{ApplyOp}
+{\threeline{i[\pc] = operator{-size} \andalso n = \texttt{arity(}operator\texttt{)}}{(v,V') = \texttt{popn(}V,n\texttt{)}}{v' = operator(v)}}
+{\step
+  {\dstate}
+  {\state \newpc {v\cons{}V'} \rho \spt g \sigma A u s}
+}
+\\
+And now for the operational semantics of control-flow related instructions: \\
+
+\ops{Goto}
+{i[\pc] = \mathtt{goto}}
+{\step
+  {\state \pc {\pc'\cons{}V} \rho \spt g \sigma A u s}
+  {\state {\pc'} V \rho \spt g \sigma A u s}
+}
+\\
+\ops{CBranchT-True}
+{i[\pc] = \mathtt{cbrancht}\dash\pc'}
+{\step
+  {\state \pc {\mathtt{\#t}\cons{}V} \rho \spt g \sigma A u s}
+  {\state {\pc'} V \rho \spt g \sigma A u s}
+}
+\\
+\ops{CBranchT-False}
+{i[\pc] = \mathtt{cbrancht}\dash\pc'}
+{\step
+  {\state \pc {\mathtt{\#f}\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt g \sigma A u s}
+}
+\\
+\ops{CBranchF-True}
+{i[\pc] = \mathtt{cbranchf}\dash\pc'}
+{\step
+  {\state \pc {\mathtt{\#t}\cons{}V} \rho \spt g \sigma A u s}
+  {\state \newpc V \rho \spt g \sigma A u s}
+}
+\\
+\ops{CBranchF-False}
+{i[\pc] = \mathtt{cbranchf}\dash\pc'}
+{\step
+  {\state \pc {\mathtt{\#f}\cons{}V} \rho \spt g \sigma A u s}
+  {\state {\pc'} V \rho \spt g \sigma A u s}
+}
+\\
+\ops{Branch2True}
+{i[\pc] = \mathtt{branch2}\dash\pc_{t}\dash\pc_{f}}
+{\step
+  {\state \pc {\mathtt{\#t}\cons{}V} \rho \spt g \sigma A u s}
+  {\state {\pc_{t}} V \rho \spt g \sigma A u s}
+}
+\\
+\ops{Branch2False}
+{i[\pc] = \mathtt{branch2}\dash\pc_{t}\dash\pc_{f}}
+{\step
+  {\state \pc {\mathtt{\#f}\cons{}V} \rho \spt g \sigma A u s}
+  {\state {\pc_{f}} V \rho \spt g \sigma A u s}
+}
+\\
+\ops{CMMCall}
+{\fiveline
+{i[\pc] = \mathtt{cmm}\dash\mathtt{call}\dash\kappa}
+{V \textrm{ is empty}}
+{P \rightarrow procPC = \pc' \andalso P \rightarrow numLocals = n \andalso P \rightarrow stackDataSize = m}
+{\rho' = \texttt{new\_env(}n\texttt{)} \andalso u' \textrm{ is a fresh, unique identifier}}
+{s' = {\act \newpc \rho \spt \kappa u}}
+}
+{\step
+  {\state \pc {P\cons{}V} \rho \spt g \sigma A u s}
+  {\state {\pc'} V {\rho'} {\spt-m} g \sigma A {u'} {s'\cons{}s}}
+}
+\\
+\ops{CMMTailCall}
+{\fourline
+{i[\pc] = \mathtt{cmm}\dash\mathtt{tail}\dash\mathtt{call}}
+{V \textrm{ is empty}}
+{P \rightarrow procPC = \pc' \andalso P \rightarrow numLocals = n \andalso P \rightarrow stackDataSize = m}
+{\rho' = \texttt{new\_env(}n\texttt{)} \andalso u' \textrm{ is a fresh, unique identifier}}
+}
+{\step
+  {\state \pc {P\cons{}V} \rho \spt g \sigma A u s}
+  {\state {\pc'} V {\rho'} {\spt-m} g \sigma A {u'} s}
+}
+\\
+\ops{CCall}
+{\threeline
+{i[\pc] = \mathtt{c}\dash\mathtt{call}\dash{}signature}
+{V \textrm{ is empty}}
+{(A',\sigma') = \texttt{c\_call(}a,A,\sigma,signature\texttt{)}}
+}
+{\step
+  {\dstate}
+  {\state \newpc {a\cons{}V} \rho \spt g {\sigma'} {A'} u s}
+}
+\\
+\ops{ReturnDefault}
+{\threeline
+{i[\pc] = \mathtt{return}\dash{}<m/m>}
+{V \textrm{ is empty}}
+{s = {\act {\pc'} {\rho'} {\spt'} \kappa {u'}}}
+}
+{\twoline
+{\step
+  {\state \pc V \rho \spt g \sigma A u {s\cons{}S}}
+  {\state {\pc'} V {\rho'} {\spt'} g \sigma A {u'} S}
+}
+{\textrm{and } u \textrm{ becomes dead}}
+}
+\\
+\ops{ReturnAlt}
+{\sixline
+{i[\pc] = \mathtt{return}\dash{}<n/m>}
+{V \textrm{ is empty} \andalso n < m}
+{s = {\act {\pc'} {\rho'} {\spt'} \kappa {u'}}}
+{\kappa = \bundle}
+{m = |\kappa_{r}|}
+{\pc'' = \kappa_{r}[x]}
+}
+{\twoline
+{\step
+  {\state \pc V \rho \spt g \sigma A u {s\cons{}S}}
+  {\state {\pc''} V {\rho'} {\spt'} g \sigma A {u'} S}
+}
+{\textrm{and } u \textrm{ becomes dead}}
+}
+\\
+\ops{Cut}
+{\nineline
+{i[\pc] = \mathtt{cut}}
+{V \textrm{ is empty}}
+{s = {\act {\pc'} {\rho'} {\spt'} \kappa {u'}}}
+{\kappa = \bundle}
+{k = \langle \pc_k, s'\cons{}s'' \rangle}
+{\pc_k \in \kappa_c}
+{s' = {\act {\pc_k} {\rho_k} {\spt_k} {\kappa_k} {u_k}}}
+{\texttt{is\_live(}u_k\texttt{)} = true}
+{\kappa_i.aborts = true \textrm{ for all activations above } s' \textrm{ in thread identified by } u_k.thread}
+}
+{\step
+  {\state \pc {k\cons{}V} \rho \spt g \sigma A u {s\cons{}S}}
+  {\state {\pc_k} V {\rho_k} {\spt_k} g \sigma A {u_k} {s''}}
+}
+
+\end{document}

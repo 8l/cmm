@@ -1,0 +1,700 @@
+\documentclass{article}
+\usepackage[hypertex]{hyperref}
+\usepackage{noweb,tabularx} 
+\def\PAL{\mbox{C{\texttt{-{}-}}}}
+% l2h substitution PAL C--
+\title{Release notes for the Quick~{\PAL} compiler\\
+Release 20050331}
+\author{The Quick~{\PAL} Team}
+
+\begin{document}
+@
+\maketitle
+
+\tableofcontents
+
+\clearpage
+
+\section{Introduction}
+
+This document contains information you need to use the Quick~{\PAL}
+compiler.
+It is divided into several sections, which do different things.
+\begin{itemize}
+\item
+We provide the target-specific information that is
+required by the {\PAL} specification.
+\item
+We explain how to integrate your front end into the
+Quick~{\PAL} driver. 
+(If you prefer just to use Quick~{\PAL} to translate {\PAL} files into
+assembly language, that's done by \texttt{qc--.opt~-S} as explained on
+the man page.)
+\item
+Quick~{\PAL} is a research prototype;
+we list some unpleasant ways that it may surprise you.
+\item
+We explain how to identify the mysterious error messages that
+Quick~{\PAL} issues when something goes badly wrong, and when and how
+to send in a bug report.
+\item 
+We discuss experimental support for multithreading.
+\item
+We provide other notes for the latest release of the compiler, as well
+as old notes for previous releases.
+The old notes are useful only if you are upgrading from an earlier release.
+Each release of Quick~{\PAL} is numbered with the day of release in
+YYYYMMDD format.
+\end{itemize}
+This document is not complete by itself;
+you also need to read the man page for \texttt{qc--}.
+
+
+\section{Portability (target-specific features)}
+
+\label{sec:portability}
+
+Since release 20041004, Quick~{\PAL} has provided some target-specific
+information at run time; to get this information try
+\begin{verbatim}
+  qc-- -e 'Target.explain()'
+\end{verbatim}
+It is also possible to pass a particular back end, e.g.,
+\begin{verbatim}
+  qc-- -e 'Target.explain(Backend.ppc)'
+\end{verbatim}
+If you want to process this information in a program, you can get it
+in different form by using Lua~2.5, which is the scripting language of the
+Quick~{\PAL} compiler.
+
+In addition to the information emitted by the compiler, we provide the
+further information below.
+
+\subsection {Intel x86}
+As of release 20050331, Quick~{\PAL} supports only one back end, for
+Intel x86 running Linux.
+(Other back ends are in the late experimental stages.)
+
+The x86 back end has these known bugs:
+\begin{itemize}
+\item
+The [[%NaN]] operator may produce a quiet NaN even when signalling NaN
+is called for.
+\end{itemize}
+
+
+The x86 back end has the following properties:
+\begin{description}
+\item[Supported data types:] 
+Quick~{\PAL} supports these types:
+\begin{itemize}
+\item 
+Type [[bits32]] is supported for register variables and for all
+computation. 
+\item
+Types [[bits16]] and [[bits8]] are supported for memory references,
+and they work with operators [[%sx]], [[%zx]], and [[%lobits]].
+In particular, 
+here's what you can do with a narrow variable or memory location:
+\begin{itemize}
+\item
+Assign it a compile-time constant expression
+\item
+Assign it the contents of another variable or memory location of the
+same width
+\item
+Assign it \texttt{\char`\%lobits} of an expression of type [[bits32]].
+\end{itemize}
+\item
+Type [[bits64]] can be stored in memory and registers, passed as
+parameters, and returned as results.
+This includes passing to and from gcc-compiled C~functions, e.g., as 
+[[long long int]].
+But operators [[%sx]], [[%zx]], and [[%lobits]] are not supported for
+64-bit values, 
+and actual operations on 64-bit values have to be done by
+calling out to a C~routine.
+\item
+Larger bit vectors whose widths are a multiple of~8 can be supported
+for memory references, variables, 
+and parameters, but the only computation available is assignment,
+which translates to block copy.
+\item
+The type [[bits2]] is supported for a reference to the floating-point
+rounding mode. 
+\item
+Variables of type [[bits1]] are supported for addition and subtraction
+with carry and borrow
+operations.
+They can also be sign- or zero-extended out to 32~bits,
+and similarly, one can use [[%lobits1]] to extract a bit to feed into
+carry, if desired.
+\end{itemize}
+\item[Target metrics:]
+The native word and pointer types are [[bits32]].
+The addressing unit is the 8-bit byte,
+and the byte order is little-endian:
+\begin{verbatim}
+target byteorder little
+       memsize 8
+       wordsize 32 pointersize 32;
+\end{verbatim}
+All but byte order can be defaulted.
+\item[Primitive operators:]
+Release 20050331 supports all the primitives in the {\PAL}
+specification.
+For details, run \verb+qc-- -e 'Target.explain()'+.
+
+Integer primitives are supported at 32~bits.
+Floating-point primitives are nominally supported at 32, 64, and
+80~bits, but in fact all floating-point operations are widened to
+80~bits, which is the natural width of the x86 floating-point unit.
+Results from ``narrow floating-point arithmetic'' therefore may be other than
+expected. 
+
+None of the primitives are implemented in alternate-return form;
+therefore, it is not possible to use the hardware to recover from such
+errors as division by zero.
+\item[Back-end capabilities:]
+Integer literals are supported in any width up to 64~bits.
+Floating-point literals are availabe in types [[bits32]] and
+[[bits64]] only.
+
+There should be no difficulty generating code for expressions
+involving the supported primitives at width~32, plus sign-extended
+and zero-extended narrow \emph{values} (e.g., references to memory).
+Assignments of any number of bytes are also supported.
+\item[Foreign interface:]  
+Quick~{\PAL} supports two foreign calling conventions:
+[[foreign "C"]] and [[foreign "paranoid C"]].
+Because the C~calling convention does not specify where callee-saves
+registers are saved, it is necessary to use 
+ [[foreign "paranoid C"]] 
+when calling a C~function that might be on the stack when the run-time
+system is active.
+
+It is relatively easy to add new conventions to Quick~{\PAL} at need;
+if you want a custom calling convention,  ask.
+\item[Hints in calling conventions:]
+Quick~{\PAL} supports these three hints:\\
+\begin{tabularx}{\linewidth}{@{\quad}lX@{}}
+[["float"]]& A floating-point number\\
+[["address"]]& A memory address or pointer\\
+[[""]]& Any non-float, non-pointer data, including signed and unsigned
+integers, bit vectors, records passed by value, and so on\\
+\end{tabularx}\\
+ The x86 platform has no address registers, so the x86 back end should
+ treat [["address"]] the same as [[""]].
+\item[Hints in register declarations:]
+Quick~{\PAL} supports the same three hints in global register
+declarations. 
+\item[Names of hardware registers:]
+The only hardware register currently supported (as of 20050331) is a
+2-bit register named
+[["IEEE 754 rounding mode"]], which may be used as follows, for
+example: 
+\begin{verbatim}
+  bits2 rm = "IEEE 754 rounding mode";
+\end{verbatim}
+\end{description}
+
+
+\section{Integrating your front end into the Quick~{\PAL} driver}
+
+Quick~{\PAL} is scripted using version~2.5 of the programming language
+Lua (see \url{lua.org}).
+Most of the benefits of scripting are realized by the developers of
+the compiler, not by end users, but there is one advantage for end
+users: you can easily teach the driver about your source files and
+front end.
+To do so, you need to tell the driver several things:
+how to find your front end, when to use it, and what sort of run-time
+system to link with your code.
+You can do all this by creating a small Lua file.
+
+Here is an example from the Tiger front end.
+We begin by creating a Lua table to hold Tiger-related functions and
+private data:
+<<tiger.lua>>=
+Frontends.Tiger = Frontends.Tiger or { }  -- initialize table
+@ 
+For our next step, here is a convenience function that makes it easier
+to find tiger-related files in \url{/usr/local/lib/tiger}.
+<<tiger.lua>>=
+Frontends.Tiger.dir = "/usr/local/lib/tiger" --- where the front end lives
+
+function Frontends.Tiger.file(name)
+  return Frontends.Tiger.dir .. '/' .. name -- not portable
+end
+@ The [[..]] symbol means string concatentation.
+@
+Our next step is to make sure that the libraries passed to the linker
+include the Tiger run-time system and standard library.
+<<tiger.lua>>=
+Ld.libs = Ld.libs .. " " .. Frontends.Tiger.file("runtime.o") 
+                  .. " " .. Frontends.Tiger.file("stdlib.a")
+@ 
+Finally, we need to teach the driver that a file with extension
+\texttt{.tig} means a Tiger file, and that it should be translated
+into a \texttt{.c--} file using the Tiger front end.
+We do this by defining a function [[CMD.compilertab[".tig"]]],
+which is where the driver will look when compiling a file with
+extension [[".tig"]].
+<<tiger.lua>>=
+function CMD.compilertab[".tig"](file)
+  local out     = CMD.outfilename(file, ".c--")
+  local tigerc  = Frontends.Tiger.file("tigerc")
+  local options = ""
+  if Frontends.Tiger.unwind then options = "-unwind" end
+  CMD.exec(tigerc .. " " .. options .. " " .. file .. " > " .. out)
+  return out
+end
+@ Function [[CMD.exec]] executes a string as a shell command,
+where the call to [[CMD.outfilename]] gives the local variable [[out]]
+a file name with extension~[[.c--]]. 
+\emph{Returning} [[out]] is key, because it is by returning the
+     [[.c--]] file that we tell the driver to continue translating:
+it will translate the {\PAL} code into assembly language, then object
+code. 
+
+The [[options]] variable helps deal with options to be passed to the
+Tiger compiler.  Here, if variable [[Frontends.Tiger.unwind]] is set,
+we pass [[-unwind]], which tells [[tigerc]] to compile exceptions
+using stack unwinding.
+We can then say on the command line something like
+\begin{verbatim}
+  qc--.opt tiger.lua Frontends.Tiger.unwind=1 ...
+\end{verbatim}
+@
+Finally, so that we can not only compile Tiger code but also
+interpret it or prettyprint it, we assign the same function to two
+more table entries.
+<<tiger.lua>>=
+CMD.interptab[".tig"] = CMD.compilertab[".tig"]
+CMD.prettytab[".tig"] = CMD.compilertab[".tig"]
+@ 
+
+
+\section{Unpleasant surprises}
+
+Quick~{\PAL} is not yet as complete as we would like.
+Many of the limitations of the code generator are mentioned in 
+Section~\ref{sec:portability} (Portability), but we highlight some
+here. 
+
+\subsection{Floating-point computation}
+
+\begin{itemize}
+\item
+For the semantics of floating-point literals, we trust the Objective
+Caml compiler implicitly.
+This means we don't know exactly what guarantees are provided.
+If you must get exactly the floating-point literal you want, it is
+best to emit a hexadecimal literal that produces the right bit-pattern.
+\item
+The only rounding modes that are supported are the hardware rounding
+modes of the target machine.
+These need to be declared as a special global register variable, e.g.,
+\begin{verbatim}
+  bits2 System.rounding_mode "IEEE 754 rounding mode";
+\end{verbatim}
+The name ``\texttt{System.rounding\_mode}'' is not special; it's the
+string literal that makes this name refer to the hardware.
+\item
+You can't usefully assign to the rounding modes or read them---all you
+can usefully do is use them in floating-point operations that require
+rounding modes.
+(This one might not be too hard to fix.)
+\end{itemize}
+
+\subsection{Widths of computation}
+
+\begin{itemize}
+\item
+The back ends support computation at widths that are at most the
+natural width of the target
+machine.
+\end{itemize}
+
+
+\subsection{Poor performance}
+
+The compiler generates very bad code.
+The implementation of the \texttt{switch} statement is especially
+na\"\i ve.
+Code can be improved somewhat by using our peephole optimizer.
+You can try it out by naming the script \texttt{peephole.lua} on the
+command line, e.g.,
+\begin{verbatim}
+  qc--.opt peephole.lua -globals hello.c--
+\end{verbatim}
+On October 4, 2004, Jo\~ao Dias fixed the last known bug in the
+peephole optimizer---but it is still not turned on by default.
+
+
+
+\section{Mysterious errors messages, bugs, and bug reports}
+
+Any compile-time error message that begins with the phrase 
+``\texttt{This can't happen}'' indicates an internal error in the
+Quick~{\PAL} compiler.
+In case of such a message, please send a bug report to
+\texttt{bugs@cminusminus.org}.
+
+To view the status of a bug you have sent, you can visit
+\url{http://www.cminusminus.org/qc--bugs}.
+
+
+Any compile-time error message that begins with the phrase 
+``\texttt{Not implemented in qc--}'' indicates a feature of {\PAL}
+that the 
+Quick~{\PAL} compiler does not yet support.
+If you want such a feature supported, please send a bug report.
+
+A link-time error that looks something like
+\begin{verbatim} 
+  undefined reference to `Cmm.global_area'
+\end{verbatim}
+means that you have not used the \texttt{-globals} flag on any
+of your compilations.
+If you get
+a~link-time error which indicates that \texttt{Cmm.global\_area} is
+multiply defined, it 
+that you have used the \texttt{-globals} flag on more than one compilation.
+
+A link-time error that looks something like
+\begin{verbatim} 
+  undefined reference to `Cmm.globalsig.RMRFFdVEETFHHBeVALWMMEBYUE'
+\end{verbatim}
+means either that you have not used the \texttt{-globals} flag on any
+of your compilations (in which case you should also get the error
+above), or else you have different global-variable 
+declarations in different compilation units.
+
+
+
+\section{Experimental features}
+
+Thread support is not yet working, but it should be in place by the
+end of June.
+
+\subsection{Thread support}
+
+The front-end runtime can create a {\PAL} thread using
+[[Cmm_CreateStack]], 
+then get {\PAL} to transfer control to it using [[cut to]].  
+
+This interface will certainly change once we have support for a
+stack-limit check.
+
+\mbox{[[Cmm_Cont *Cmm_CreateStack(Cmm_CodePtr f, Cmm_DataPtr x, void *stack, unsigned n)]]}
+\hfil\penalty-5000
+returns a {\PAL} continuation that, when [[cut to]], will execute
+the {\PAL} call [[f(x)]] on the stack [[stack]].
+\begin{itemize} 
+\item 
+The parameter [[f]] must be the address of a {\PAL} procedure that
+ takes exactly one argument, which is a value of the native pointer
+ type.
+To pass any other [[f]] to [[Cmm_CreateStack]] is an \emph{unchecked}
+ run-time error.
+
+\emph{It is a \emph{checked} run-time error for
+the procedure addressed by~[[f]] to return}---this procedure should
+instead finish execution with a [[cut to]].
+\item
+When queried using the {\PAL} run-time interface, a continuation
+returned by [[Cmm_CreateStack]] looks like a stack with one
+activation.
+That activation makes the two parameters [[f]]~and~[[x]] visible
+through [[Cmm_FindLocalVar]]; these parameters can be changed using
+the run-time interface (for example, if a garbage collection
+intervenes between the time the continuation is created and it is
+used).
+\item
+When a continuation returned by [[Cmm_CreateStack]] is [[cut to]], it
+is as if the stack makes a tail call [[jump f(x)]].
+In particular, the activation of~[[f]] now appears as the oldest
+activation on the stack.
+As noted, it is a checked run-time error for this activation to
+return. 
+\item
+The parameter [[stack]] is the address of the stack, which is
+[[n]]~bytes in size.
+After calling [[Cmm_CreateStack]], the stack belongs to~{\PAL}, so it
+is an \emph{unchecked} run-time error for the front end to read or
+write any part of this stack except through [[stackdata]] areas in
+active procedures (or through pointers provided by the {\PAL} run-time
+interface). 
+
+Although this experimental thread support does no checking for stack
+overflow, we nevertheless need the size of the stack as well as its
+address, because it is a machine-dependent property whether the oldest
+activation goes at the high end or the low end of the stack.
+\end{itemize}
+%%%% 
+%%%% The result [[limit]] is assigned a ``cookie'' that encodes the stack limit.
+%%%% It is the responsibility of the {\PAL} client to arrange that this limit
+%%%% cookie is passed to each call to [[limitcheck]] in that thread.
+
+To implement threads, a front end will typically allocate a large
+thread-control block
+to represent a thread, and the {\PAL} stack will be just a part of
+this block.
+The rest of the block may contain a {\PAL}
+continuation for the thread, 
+thread-local data,
+the priority of the
+thread, links to other threads, and so on.
+All of this information is outside the purview of
+{\PAL}, however.
+
+\section{Notes for release 20050331}
+
+Release 20050331 incorporates a major change in Quick~{\PAL}'s
+representation of a control-flow graph.
+We hope that the new representation, unlike its five predecessors,
+will not be a bug factory.
+With the new release, the automated facility for isolating
+optimization bugs is not yet available.
+This facility will be restored in a future release.
+
+
+Here are some other helpful notes carried forward from previous releases:
+\begin{itemize} 
+\item 
+Don't overlook the \texttt{-globals} option (described in the man
+page), which is used to guarantee consistency of {\PAL}
+global-variable declarations across separately compiled units.
+\item 
+Quick~{\PAL} has a very simple peephole optimizer.
+It can reduce the size of a program by~30\% or so, but it does not
+work on all programs.
+You can try it out by running
+\begin{verbatim}
+  qc--.opt Backend.x86.improve=Optimize.improve ...
+\end{verbatim}
+% If you find a program that breaks the optimizer, please send it to us.
+\item 
+Quick~{\PAL} has a graph-coloring register allocator, but because it
+is slow, it is turned off by default.  To turn it on, run
+\begin{verbatim}
+  qc--.opt Backend.x86.ralloc=Ralloc.color ...
+\end{verbatim}
+\item 
+There are a few inconsistencies between the run-time interface in the
+specification and the one implemented in the Quick~{\PAL}
+interpreter. 
+\item 
+Normally you want to run \texttt{qc--.opt}, but if Objective Caml
+cannot build a native-code binary on your system, you can use
+\texttt{qc--} instead.
+\end{itemize}
+
+
+\section{Old notes for older releases}
+
+These notes are
+in reverse chronological order.
+You need to read them only if you are upgrading from an older release
+and want to know what has changed.
+
+\subsection{Notes for release 20040522}
+
+We've added some support for floating-point literals.
+
+\subsection{Notes for release 20040514}
+
+We now have a very simple peephole optimizer.
+It can reduce the size of a program by~30\% or so.
+You can try it out by running
+\begin{verbatim}
+  qc--.opt Backend.x86.improve=Optimize.improve ...
+\end{verbatim}
+If you find a program that breaks the optimizer, please send it to us.
+
+
+\subsection{Notes for release 20040504}
+
+Here's what you can do with a narrow variable or memory location:
+\begin{itemize}
+\item
+Assign it a compile-time constant expression
+\item
+Assign it the contents of another variable or memory location of the
+same width
+\item
+Assign it \texttt{\char`\%lobits} of an expression whose width is the
+natural width of the target machine
+\end{itemize}
+
+
+\subsection{Notes for release 20040501}
+
+We've added limited support for 64-bit variables on 32-bit platforms.
+You can perform the following operations on a 64-bit {\PAL} variable:
+\begin{itemize}
+\item Assign it from a 64-bit literal
+\item   Load it from memory
+\item    Store it to memory
+\item   Pass it to a C function
+\item   Receive it from a C function
+\end{itemize}
+For the moment, actual operations on 64-bit values have to be done by
+calling out to a C~compiler.
+Here, for example, is a {\PAL}
+procedure that tests 64-bit add:
+\begin{verbatim} 
+  target byteorder little;
+  
+  import ladd, printf;
+  export main;
+  
+  foreign "C" main(bits32 argc, "address" bits32 argv) {
+    bits64 n, m;
+    n = 0x80000000::bits64;
+    m = 0x80000000::bits64;
+    bits64 sum;
+    sum = foreign "C" ladd(n, m);
+    foreign "C" printf(format, n, m, sum);
+    foreign "C" return(0);
+  }
+
+  section "data" {
+    format: bits8[] "sum of %016llx\nand    %016llx\nis     %016llx\n\0";
+  }
+\end{verbatim}
+Here the imported function \texttt{ladd} is defined in~C as follows:
+\begin{verbatim} 
+  long long ladd(long long x, long long y) {
+    return x + y;
+  }
+\end{verbatim}
+The 64-bit variables are not actually stored in 32-bit register pairs,
+but that optimization will probably come in a future release.
+
+
+\subsection{Notes for release 20040427}
+
+Quick~{\PAL} has a new front end.
+Error messages should be more informative, and the front end now
+detects some bugs that were undetected by the old front end.
+
+In case of unforeseen difficulty, it is possible to use the old front
+end by
+\begin{verbatim}
+  qc-- -e 'Compile.Old.use()' ...
+\end{verbatim}
+but this option is deprecated and will disappear in a future release.
+Any problems with the new front end should be reported to
+\texttt{bugs@cminusminus.org}. 
+
+
+\subsection{Notes for release 20040405}
+\begin{itemize}
+\item
+Unicode string literals are not implemented
+
+\item Integer widening has been added, but not enabled.
+In order to use widening, you must swap the order of the
+``widen'' and ``placevars'' phases.  Look for the following lines in
+``luacompile.nw'':
+\begin{verbatim}
+      Opt.verb(backend.placevars)  or Stages.null
+    , Opt.verb(backend.widen)      or Stages.null
+\end{verbatim}
+The backend ``x86w'' shows how to construct a backend that does
+integer widen properly for x86.
+
+\end{itemize}
+
+
+
+\subsection{Notes for release 20031021}
+\begin{itemize}
+\item
+The compiler now generates runtime data. The native runtime system now
+lives in the runtime directory.
+\item
+The interpreter interface has been changed slightly to be more
+consistent with the native runtime interface. However, there are still
+a few differences between the two interfaces. Interpreter functions
+take pointers to activation structures where the native runtime takes
+pointers to activation structures.
+\item
+The default register allocator has been changed to DLS. If you need
+the graph coloring allocator, you can change it on the command line,
+e.g.,
+\begin{verbatim}
+qc-- backend=Backend.x86 backend.ralloc=color ...
+\end{verbatim}
+
+
+\end{itemize}
+
+\subsection{Notes for more recent releases}
+
+\begin{itemize}
+\item
+If two different {\PAL} units have different global-variable
+declarations, the error manifests as a failure to link.
+\end{itemize}
+
+
+\subsection{Notes for release 20030711}
+
+
+This is the first major release that includes a native-code back end.
+The release is believed consistent with the pre-2.0 manual (CVS
+revision~1.75) with exceptions noted below.
+\begin{itemize}
+\item
+The front end does not implement the \texttt{switch} statement.
+\item
+The \texttt{import} statement requires a type, although this
+requirement is not documented in the manual.
+\item
+The native x86 back end successfully compiles the test suite
+for the \texttt{lcc} C~compiler.
+The back end has significant limitations:
+\begin{itemize}
+\item
+Integer variables should be 8, 16, or 32~bits.
+Integer and logical operations should be on 32-bit values only.
+The back end supports the operations you would find in a C~compiler,
+but we can try to add others on request.
+\item
+Floating-point operations may be at 32 or 64~bits.
+80-bit floating-point is possible but not tested.
+The back end supports the operations you would find in a C~compiler,
+but we can try to add others on request.
+\item 
+Mixed integer and floating-point operations have not been tested
+thoroughly. 
+\item
+The back end does not support multiprecision arithmetic or overflow
+detection. 
+\end{itemize}
+\item
+The release also includes back ends for Alpha and MIPS R3000, but these are
+incomplete and have been used only to test implementations of calling
+conventions. 
+\item
+There is as yet no run-time system to go with the native-code
+compiler.
+If you need a run-time system, you must use the interpreter.
+\item
+ Code quality is poor; as a matter of policy, we are postponing
+       work on optimization in order to bring you a run-time system.
+\item
+The default register allocator is the \texttt{dls} register allocator.
+This allocator is dramatically faster than our implementation of the
+graph-coloring register allocator (\texttt{color}).
+If you want, you may invoke the \texttt{color} allocator on the
+command line, as in the following example:
+\begin{verbatim} 
+  qc-- Backend.x86.ralloc=Ralloc.color hello.c--
+\end{verbatim}
+\end{itemize}
+@
+\end{document}

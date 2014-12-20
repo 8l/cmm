@@ -1,0 +1,365 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+% ------------------------------------------------------------------ 
+\section{Support for RTL operators}
+% ------------------------------------------------------------------ 
+
+This module provides miscellaneous support for RTL operators.
+The primary goals are
+\begin{itemize}
+\item
+To keep a central repository of type information about operators,
+including machine-dependent operators that are used only in back ends.
+\item
+To help the front end translate each {\PAL} operator into an RTL
+operator.
+Typically this means filling in the type parameters, which is done
+based on the knowledge of the operator's type scheme and of the types
+of its arguments.
+\end{itemize}
+
+\paragraph{Registering operators}
+
+The official {\PAL} operators are built into this module, but every
+back end may add new operators.
+New operators should be added at program startup time, regardless of
+whether the back end is actually run.
+To name machine-dependent operators, each back end should pick a
+unique prefix, e.g., [[x86_]].
+It is a checked run-time error to register an operator twice.
+<<rtlop.mli>>=
+val add_operator : name:string -> result_is_float:bool -> Types.tyscheme -> unit
+@
+\paragraph{Extracting type information}
+
+Here are some miscellaneous functions
+that have to do with operators' types.
+Given an instantiated operator, one can get its type with [[mono]].
+One can query whether an operator's result is a floating-point value,
+which is unfortunately necessary to support an evil hack in the
+widener.
+(It would be very good if Kevin could get floating-point widening on a
+principled basis so that this could go \emph{away}.)
+The [[fold]] function enables one to visit all the operators, and
+[[print_shapes]] was useful once as a guide to hand-writing a generic
+code expander (see module [[Opshape]] for more information on shapes).
+<<rtlop.mli>>=
+val mono : Rtl.opr -> Types.monotype      (* Not_found *)
+val has_floating_result : Rtl.opr -> bool
+val fold : (string -> Types.tyscheme -> 'a -> 'a) -> 'a -> 'a
+val print_shapes : unit -> unit
+@ 
+We also provide, outside of the [[Types]] submodule, the ability to
+enumerate the names of all the operators.
+<<rtlop.mli>>=
+val opnames : unit -> string list  (* names of all source-language operators *)
+@ 
+\paragraph{Translation from surface {\PAL} into RTL operators}
+
+Three different translations are provided: for the prefix named form
+[[%name(...)]], for the infix binary form, and for the symbolic unary
+form.
+Different translations are needed because the [[-]] symbol translates
+into [[%sub]] when binary but [[%neg]] when unary.
+Each translation returns the type of the operator's result and
+an {\rtl} operator that implements the {\PAL} operator.
+<<rtlop.mli>>=
+module Translate : sig
+  val prefix : string -> Types.ty list -> Types.ty * Rtl.opr (*ErrorExn*)
+  val binary : string -> Types.ty list -> Types.ty * Rtl.opr (*ErrorExn*)
+  val unary  : string -> Types.ty list -> Types.ty * Rtl.opr (*ErrorExn*)
+end
+@ 
+\paragraph {Program generation}
+
+Calling [[Emit.creators]] emits an implementation of the functions in
+[[Rewrite.Ops]].   Handy.
+<<rtlop.mli>>=
+module Emit : sig
+  val creators : unit -> unit
+end
+@ 
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+<<rtlop.ml>>=
+module T = Types        (* save external Types module here *)
+let (-->) = T.proc 
+let impossf fmt = Printf.kprintf Impossible.impossible fmt
+@
+
+
+% ------------------------------------------------------------------ 
+\subsection{RTL-Op Types}
+% ------------------------------------------------------------------ 
+
+The [[ops]] table associates {\rtl} operators with their types. A
+function type is constructed by [[T.proc]] that takes the list of
+arguments and the result type. Most functions are polymorphic; a
+[[T.bitsv]]~$n$ introduces a (bound) polymorphic [[bits]] type variable
+$n$. For example, the type for [[add]] demands that all arguments and
+the result have the same width. If the type variable of the result is
+not identical to one of the arguments, the operator is polymorphic in
+its return size. 
+<<rtlop.ml>>=
+let predefined = 
+  (* the four values below characterize the proper interpretation of a
+     result, but the only information we actually use is a Boolean
+     telling us if the result is a floating-point value *)
+  let float = true in
+  let int   = false in
+  let code2 = false in
+  let bool  = false in
+  [  "NaN"          , int,   [T.var 1] --> T.var 2
+  ;  "add"          , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "addc"         , int,   [T.var 1; T.var 1; T.fixbits 1] --> T.var 1
+  ;  "add_overflows", bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "and"          , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "bit"          , int,   [T.bool] --> T.fixbits 1
+  ;  "bool"         , bool,  [T.fixbits 1] --> T.bool
+  ;  "borrow"       , int,   [T.var 1; T.var 1; T.fixbits 1] --> T.fixbits 1
+  ;  "carry"        , int,   [T.var 1; T.var 1; T.fixbits 1] --> T.fixbits 1
+  ;  "com"          , int,   [T.var 1] --> T.var 1
+  ;  "conjoin"      , bool,  [T.bool; T.bool] --> T.bool
+  ;  "disjoin"      , bool,  [T.bool; T.bool] --> T.bool
+  ;  "div"          , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "div_overflows", bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "divu"         , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "eq"           , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "f2f"          , float, [T.var 1; T.fixbits 2] --> T.var 2
+  ;  "f2f_implicit_round", float, [T.var 1] --> T.var 2
+  ;  "f2i"          , int,   [T.var 1; T.fixbits 2] --> T.var 2
+  ;  "fabs"         , float, [T.var 1] --> T.var 1
+  ;  "fadd"         , float, [T.var 1; T.var 1; T.fixbits 2] --> T.var 1
+  ;  "false"        , bool,  [] --> T.bool
+  ;  "fcmp"         , code2, [T.var 1; T.var 1] --> T.fixbits 2
+  ;  "fdiv"         , float, [T.var 1; T.var 1; T.fixbits 2] --> T.var 1
+  ;  "feq"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "fge"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "fgt"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "fle"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "float_eq"     , code2, [] --> T.fixbits 2
+  ;  "float_gt"     , code2, [] --> T.fixbits 2
+  ;  "float_lt"     , code2, [] --> T.fixbits 2
+  ;  "flt"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "fmul"         , float, [T.var 1; T.var 1; T.fixbits 2] --> T.var 1
+  ;  "fmulx"        , float, [T.var 1; T.var 1] --> T.double 1
+  ;  "fne"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "fneg"         , float, [T.var 1] --> T.var 1
+  ;  "fordered"     , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "fsqrt"        , float, [T.var 1; T.fixbits 2] --> T.var 1
+  ;  "fsub"         , float, [T.var 1; T.var 1; T.fixbits 2] --> T.var 1
+  ;  "funordered"   , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "ge"           , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "geu"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "gt"           , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "gtu"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "i2f"          , float, [T.var 1; T.fixbits 2] --> T.var 2
+  ;  "le"           , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "leu"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "lobits"       , int,   [T.var 1] --> T.var 2
+  ;  "lt"           , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "ltu"          , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "minf"         , float, [] --> T.var 1
+  ;  "mod"          , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "modu"         , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "mul"          , int,   [T.var 1; T.var 1] --> T.var 1 
+  ;  "mulux"        , int,   [T.var 1; T.var 1] --> T.double 1 
+  ;  "mulx"         , int,   [T.var 1; T.var 1] --> T.double 1 
+  ;  "mul_overflows", bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "mulu_overflows", bool, [T.var 1; T.var 1] --> T.bool
+  ;  "mzero"        , float, [] --> T.var 1
+  ;  "ne"           , bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "neg"          , int,   [T.var 1] --> T.var 1
+  ;  "not"          , bool,  [T.bool] --> T.bool
+  ;  "or"           , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "pinf"         , float, [] --> T.var 1
+  ;  "popcnt"       , int,   [T.var 1] --> T.var 1
+  ;  "pzero"        , float, [] --> T.var 1
+  ;  "quot"         , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "quot_overflows", bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "rem"          , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "rotl"         , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "rotr"         , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "round_down"   , code2, [] --> T.fixbits 2
+  ;  "round_nearest", code2, [] --> T.fixbits 2
+  ;  "round_up"     , code2, [] --> T.fixbits 2
+  ;  "round_zero"   , code2, [] --> T.fixbits 2
+  ;  "shl"          , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "shra"         , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "shrl"         , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "sub"          , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "subb"         , int,   [T.var 1; T.var 1; T.fixbits 1] --> T.var 1
+  ;  "sub_overflows", bool,  [T.var 1; T.var 1] --> T.bool
+  ;  "sx"           , int,   [T.var 1] --> T.var 2
+  ;  "true"         , bool,  [] --> T.bool
+  ;  "unordered"    , code2, [] --> T.fixbits 2
+  ;  "xor"          , int,   [T.var 1; T.var 1] --> T.var 1
+  ;  "zx"           , int,   [T.var 1] --> T.var 2
+     (* not C-- operators, but might show up in RTLs *)    
+  ;  "bitExtract"   , int,   [T.var 1; T.var 1] --> T.var 2
+  ;  "bitInsert"    , int,   [T.var 1; T.var 1; T.var 2] --> T.var 1
+  ;  "bitTransfer"  , int,   [T.var 1; T.var 1; T.var 1; T.var 1; T.var 1] --> T.var 1 
+                    
+  ] 
+<<rtlop.ml>>=
+let optypes  = ref (Strutil.assoc2map (List.map (fun (o, _, t) -> (o, t)) predefined))
+let opfloats = ref (Strutil.assoc2map (List.map (fun (o, f, _) -> (o, f)) predefined))
+@ 
+<<rtlop.ml>>=
+let add_operator ~name:o ~result_is_float:f t =
+  if Strutil.Map.mem o (!optypes) then
+    impossf "registered a duplicate RTL operator %%%s" o;
+  optypes  := Strutil.Map.add o t (!optypes);
+  opfloats := Strutil.Map.add o f (!opfloats)
+@ 
+We once printed operators' signatures.
+<<rtlop.ml>>=
+let print_shapes () = 
+  Strutil.Map.iter (fun o t ->
+    Printf.printf "%16s : %s\n" o (Types.scheme_string t)) (!optypes)
+@ 
+Some operators are not visible.
+An operator is invisible if it is for internal use only or if it has
+been expunged from the {\PAL} specification.
+<<rtlop.ml>>=
+let visible = function
+  | "bitExtract" | "bitInsert" | "bitTransfer" | "f2f_implicit_round" -> false
+  | "fcmp" | "float_lt" | "float_eq" | "float_gt" | "unordered" -> false (*expunged*)
+  | _ -> true 
+
+let fold f z =
+  Strutil.Map.fold (fun o t z -> if visible o then f o t z else z) (!optypes) z
+
+let opnames () = fold (fun o _ os -> o :: os) []
+@ 
+<<rtlop.ml>>=
+let findopname name t =
+  try Strutil.Map.find name t
+  with Not_found ->
+    ( Printf.eprintf "unknown RTL operator '%%%s'" name
+    ; raise Not_found
+    )
+let findop op = findopname (fst (Rtl.Dn.opr op))
+let mono op = let _, ws = Rtl.Dn.opr op in Types.instantiate (findop op (!optypes)) ws
+let has_floating_result op = findop op (!opfloats)
+@
+% ------------------------------------------------------------------ 
+\subsection{Translation from {\PAL} operators to {\rtl} operators}
+% ------------------------------------------------------------------ 
+
+{\PAL} primitive operators and {\rtl} primitive operators are closely
+connected. To typecheck the application of a {\PAL} operator, we use the
+type of the corresponding {\RTL} operator.  For example, the {\PAL}
+operator [[add]] is translated to the {\rtl} operator [[add]], that has
+the exact same signature. 
+
+The exceptions are {\PAL} operators like [[zx32]] that encodes the size
+of their return value in the name. {\rtl} operators are more polymorphic
+than {\PAL} operators and thus there are no separate operators [[zx1]],
+\dots, [[zx32]], \dots, but a single polymorphic operator [[zx]]:
+%
+$$[[zx]]: \forall~\alpha,\beta.[[bits]]\alpha \to [[bits]]\beta$$
+%
+An application [[zx32 (1::bits10)]] is translated into the {\rtl}
+operator [[(zx,[10,32])]], where [[10]] is bound by $\alpha$, and [[32]]
+by $\beta$ in the above type scheme. Hence, the size of the result,
+which is inferred from the name, is always the \emph{last}
+value in the \emph{width list} of an {\rtl} operator.
+@
+If an operator name has a numerical component, it denotes the size of
+the result. Such a size always becomes the last element in the width
+list of an operator. 
+<<rtlop.ml>>=
+module Translate = struct
+  let prefix opname argtys =
+    try 
+      let op, retsize = T.split opname in
+      let opty        = findopname op (!optypes) in
+      let argwidths   = T.widthlist opname opty argtys in
+      ( match retsize with
+      | None   -> T.appl opname opty argtys, Rtl.opr op argwidths
+      | Some n -> T.bits n,                  Rtl.opr op (argwidths@[n])
+      )            
+    with
+    | Not_found  -> Error.errorf "unknown operator %%%s" opname
+@ 
+Infix and prefix symbols are stored in tables.
+Nothing should go wrong  in lookup because the only symbols that make
+it this far should have been blessed by the parser.
+<<rtlop.ml>>=
+  let binops = Strutil.assoc2map 
+      [  "+"      , "add"
+      ;  "-"      , "sub"
+      ;  "*"      , "mul"
+      ;  "/"      , "divu"
+      ;  "%"      , "modu"
+      ;  "<<"     , "shl"
+      ;  ">>"     , "shrl"
+      ;  "=="     , "eq"
+      ;  "<="     , "leu"
+      ;  ">="     , "geu"
+      ;  ">"      , "gtu"
+      ;  "<"      , "ltu"
+      ;  "!="     , "ne"
+      ;  "&"      , "and"
+      ;  "^"      , "xor"
+      ;  "|"      , "or"
+      ;  "!="     , "ne"
+      ] 
+
+  let unops = Strutil.assoc2map 
+      [  "-"      , "neg"
+      ;  "~"      , "com"
+      ]
+
+  let binary op =
+    try prefix (Strutil.Map.find op binops) 
+    with Not_found -> Impossible.impossible ("unknown binary infix operator "^op)
+
+  let unary op =
+    try prefix (Strutil.Map.find op unops) 
+    with Not_found -> Impossible.impossible ("unknown unary symbolic operator "^op)
+end
+@        
+<<rtlop.ml>>=
+let ws = ["w"; "w'"; "w3"; "w4"; "w5"]
+let args = ["x"; "y"; "z"; "u"; "v"]
+
+let width n = try List.nth ws   n with _ -> Impossible.impossible "too many widths"
+let arg   n = try List.nth args n with _ -> Impossible.impossible "too many args"
+
+
+module Emit = struct
+  let pf = Printf.printf
+  let mangle = function
+    | "and" -> "_and"
+    | "NaN" -> "_Nan"
+    | "mod" -> "_mod"
+    | "or" -> "_or"
+    | n -> n
+          
+  let emitop name (parms, _ as tyscheme) =
+    let nargs   = List.length parms in
+    let nwidths = T.largest_key tyscheme in
+    begin
+      pf "let %s" (mangle name);
+      for i = 0 to nwidths - 1 do pf " %s"  (width i) done;
+      for i = 0 to nargs   - 1 do pf " %s"  (arg   i) done;
+      pf " = Rtl.app (Rtl.opr \"%s\" [" name;
+      for i = 0 to nwidths - 1 do pf "%s;"  (width i) done;
+      pf "]) [";
+      for i = 0 to nargs   - 1 do pf "%s; " (arg   i) done;
+      pf "]\n";
+    end
+  let creators () =
+    pf "(* This code generated automatically by Rtlop.Emit.creators *)\n";
+    Strutil.Map.iter emitop (!optypes)
+end    

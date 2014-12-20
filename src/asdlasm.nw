@@ -1,0 +1,110 @@
+
+% ------------------------------------------------------------------ 
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+\section{Assembler Interface to ASDL}
+% ------------------------------------------------------------------ 
+
+This module implements an assembler that emits the {\rtl}s of a
+procedure in {\asdl} format. Other assembler instruction do not create
+output.
+
+<<asdlasm.mli>>=
+val asm: out_channel -> Proc.t Asm.assembler
+@                      
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+Most assembler directives do nothing. We are only interested in the
+{\rtl}s that are part of an instruction. 
+
+<<asdlasm.ml>>=
+module Asm = Asm
+module G   = Cfg4
+
+exception Unsupported of string
+let unsupported msg = raise (Unsupported msg)
+
+<<Make>>
+let asm fd = new asm fd
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Name Mangling}
+% ------------------------------------------------------------------ 
+
+We have to make sure that emitted names conform to {\small asdl}'s
+syntax. The [[spec]] below allows to create a name mangler that ensures
+this.
+
+<<Make>>=
+let spec =
+    let reserved = [] in
+    let id = function
+        | 'a'..'z'
+        | '0'..'9'
+        | 'A'..'Z'
+        | '_'      -> true
+        | _        -> false in
+    let replace = function
+        | x when id x -> x
+        | _           -> '_' 
+        in    
+            { Mangle.preprocess = (fun x -> x)  
+            ; Mangle.replace    = replace
+            ; Mangle.reserved   = reserved
+            ; Mangle.avoid      = (fun x -> x ^ "_")
+            }
+@
+
+
+% ------------------------------------------------------------------ 
+\subsubsection{The assembler class}
+% ------------------------------------------------------------------ 
+
+<<Make>>=
+class asm (fd:out_channel) : [Proc.t] Asm.assembler =
+object (this)
+    val mutable _section = "this can't happen"
+
+    (* declarations *)
+    method import s = Symbol.unmangled s
+    method export s = Symbol.unmangled s
+    method local  s = Symbol.unmangled s
+
+    (* sections *)
+    method section s = _section <- s
+    method current   = _section
+
+    (* definitions *)
+    method label s   = ()
+    method const s b = ()
+
+    (* locations *)
+
+    method org n    = ()
+    method align n  = ()
+    method addloc n = ()
+
+    (* instructions *)
+    method cfg_instr (proc:Proc.t) =
+        let cfg = proc.Proc.cfg 
+        and s   = proc.Proc.symbol in
+        let add node rtls = G.instr node :: rtls       in
+        let rtls          = Cfgutil.fold_bwd cfg add [] in
+            Rtlx.rtls rtls stdout
+
+    method zeroes n = ()
+    method value v = ()
+    method addr  a = ()
+    method comment s = ()
+    method emit = ()
+end
+
+

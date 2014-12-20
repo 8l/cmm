@@ -1,0 +1,153 @@
+##############################################################################
+#
+# Quick C-- Interpreter Clients
+#
+# This mkfile is used to build clients to the Quick C-- Interpreter.
+#
+# IMPORTANT BUILD TARGETS ::
+#
+#   exn         : builds experimental exn. dispatching interp client exn_client
+#   gc          : builds experimental garb. collecting interp client gc_client
+#   clean       : cleans object files (*.o)
+#   clobber     : cleans all binaries, object files, and source code that can
+#                 be regenerated from .NW files
+
+NAMES     = exn_client gc_client prs_client
+
+# ------------------------------------------------------------------
+# paths
+# ------------------------------------------------------------------
+
+TOP       = ../..
+BINDIR    = $TOP/bin
+LIBDIR    = $TOP/lib
+INCDIR    = $TOP/interp/libinclude
+
+# ------------------------------------------------------------------
+# main targets
+# ------------------------------------------------------------------
+
+all:V:      $NAMES
+all.opt:V:  all
+
+update:V:     ${NAMES:%=$BINDIR/%}
+update.opt:V: update
+
+clean:V:
+	rm -f *.o DEPEND
+
+clean.opt:V: clean
+
+clobber:V:  clean
+	rm -f *.blg *.log *.dvi *.inc *.toc *.aux 
+	rm -f $NWTEXFILES
+	rm -f prof.out core *~
+	rm -f $NAMES
+	rm -f *.i
+	rm -f $HEADERS $SOURCES
+	rm -f mkfile.bak
+
+# ------------------------------------------------------------------
+# rules and tools 
+# ------------------------------------------------------------------
+
+<$TOP/config/config.mk
+B=""
+<$TOP/config/c.mk
+<$TOP/config/lua.mk
+<$TOP/config/noweb.mk
+
+QCMMINTERPLIBS = -L$LIBDIR -lqc--interp
+QCMMINTERPINCS = -I$INCDIR -I$TOP/include
+
+LIBS           = -lm $QCMMINTERPLIBS $LUALIBS
+LIBDEP         = ../libqc--interp.a
+INCLUDES       = -I$BT $QCMMINTERPINCS $LUAINCLUDES 
+
+CFLAGS         = -g -ansi -pedantic -Wall $INCLUDES
+
+NOTANGLEOPTS   = -L
+
+# ------------------------------------------------------------------
+# important file sets
+# ------------------------------------------------------------------
+
+NWFILES = `echo *.nw`
+
+HEADERS = exn.h gc.h prs.h
+SOURCES = exn.c gc.c prs.c
+
+HEADERS = ${HEADERS:%.h=$B%.h}
+SOURCES = ${SOURCES:%.c=$B%.c}
+
+# exn.c
+
+OBJS    = ${SOURCES:%.c=%.o}
+
+code:V:   $SOURCES $HEADERS
+
+# ------------------------------------------------------------------
+# copy files to their official directories
+# ------------------------------------------------------------------
+
+$BINDIR/%: %
+	cp $prereq $target
+
+# ------------------------------------------------------------------
+# binaries
+# ------------------------------------------------------------------
+
+exn:V:    exn_client
+gc:V:     gc_client
+prs:V:    prs_client
+
+exn_client: ${B}exn.o $LIBDEP
+	$CC $CFLAGS -o $target $prereq $LIBS
+
+gc_client:  ${B}gc.o $LIBDEP
+	$CC $CFLAGS -o $target $prereq $LIBS
+
+prs_client:  ${B}prs.o $LIBDEP
+	$CC $CFLAGS -o $target $prereq $LIBS
+
+# ------------------------------------------------------------------
+# dependency recalculation
+# ------------------------------------------------------------------
+
+depend:V:   DEPEND
+
+DEPEND = -MM
+DEPEND:D: $SOURCES $HEADERS
+	$CC $DEPEND $INCLUDES $SOURCES > $target
+
+# ------------------------------------------------------------------
+# documentation-related files
+# ------------------------------------------------------------------
+
+NWTEXFILES = ${NWFILES:%.nw=%.tex}
+# NWINCFILES = ${NWFILES:%.nw=%.inc}
+
+# ------------------------------------------------------------------ 
+# source code targets
+# ------------------------------------------------------------------ 
+
+$B'(([^/]*/)*)(.*)\.h$':RD:       '\1\3.nw'
+	$NOTANGLE $NOTANGLEOPTS -R$stem3.h $prereq | $CPIF $target
+
+# ------------------------------------------------------------------ 
+# intermediate code targets
+# ------------------------------------------------------------------ 
+#
+# for development and debugging only
+
+'(([^/]*/)*)(.*)\.i$':RD:       '\1\3.c' $HEADERS
+	$CC -P -E $INCLUDES $stem3.c > $target
+
+#
+# -- end of mkfile --
+#
+
+#
+# [dependencies]
+
+<DEPEND

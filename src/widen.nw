@@ -1,0 +1,1768 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% inc: \usepackage[leqno,centertags]{amsmath}
+% inc: \usepackage{latexsym}
+% inc: \usepackage{mathpartir}
+% inc: \input{../config/widenmacros}
+
+\section{Widening}
+
+<<widen.ml>>=
+let () =
+  Debug.register "widen"      "show results of widener";
+  Debug.register "widen-pre"  "show RTL before widening";
+  Debug.register "widen-vars" "show when a variable is widened";
+  Debug.register "gamma"      "show how Gamma is constructed";
+  Debug.register "widen-op-solns" "show operator solutions during widening"
+let not_null = function [] -> false | _ :: _ -> true 
+@ 
+[[float]] is a simple widener for floating-point values.
+Parameter [[rm]] contains the hardware rounding modes.
+<<widen.mli>>=
+val float : rm:Rtl.exp -> int list -> Rtl.rtl -> Rtl.rtl
+  (* widen all floating-point operations *)
+@ 
+<<widen.mli>>=
+val store_const : int -> Rtl.rtl -> Rtl.rtl
+  (* l := k   =>   l := lobits(k') *)
+@ 
+A dynamic programming implementation of integer widening.
+<<widen.mli>>=
+val dpwiden : Ast2ir.proc -> Rtl.rtl -> Rtl.rtl
+@ Before running the integer widener, [[widenlocs]] should be called
+to make each store and fetch an acceptable width.
+<<widen.mli>>=
+val widenlocs : ('a, 'b, 'c) Target.t -> Rtl.rtl -> Rtl.rtl
+@ 
+Check if widths are less than the target width.  The [[lualink.nw]]
+file uses [[Doesn't_need_widening]] to avoid updating RTLs that don't
+need integer widening.  The [[needs_widening]] function is called to
+determine if an RTL needs integer widening.
+<<widen.mli>>=
+exception Doesn't_need_widening
+val needs_widening : ('a, 'b, 'c) Target.t -> Rtl.rtl -> bool
+@ 
+[[init_gamma_counts]] and [[update_gamma_counts]] are used by
+[[lualink.nw]] to count the context in which local variables are used
+in a procedure.  The function [[create_gamma]] is called after
+updating all the counts for the procedure and before doing integer
+widening.  The counts are used to suggest fill types for widening of
+variables.  The [[gamma]] environment is also used to get the original
+width of widened locations---unlike the fill type hints, this needs to
+be accurate.
+<<widen.mli>>=
+val init_gamma_counts : unit -> unit
+val update_gamma_counts : ('a, 'b, 'c) Target.t -> Rtl.rtl -> unit
+val create_gamma : unit -> unit
+@ 
+
+Finally, [[width_cost]] and [[app_count]] can be used to guage the
+effectiveness of the dynamic programming algorithm in keeping widened
+expressions small.
+<<widen.mli>>=
+val width_cost : Rtl.rtl -> (int * int * int)
+  (* count extension and truncation operations (#sign, #zero, #lobits) *)
+  (* we don't count these operations applied to locations or constants *)
+
+val app_count : Rtl.rtl -> int
+  (* this probably shouldn't be here...it just counts the number of
+     RP.App present in the rtl *)
+@ 
+
+\subsection{Floating-point widener}
+<<widen.ml>>=
+module PA = Preast2ir
+module R  = Rtl
+module RP = Rtl.Private
+module RU = Rtlutil
+
+module Dn = Rtl.Dn
+module Up = Rtl.Up
+
+(* THIS IS PRETTY CHEESY.  WE SHOULD BE FIXING THE BUG IN THE COMPILER
+   THAT CAUSES MACHINE-DEPENDENT RTL OPERATORS TO BE UNKNOWN. *)
+let safe_has_floating_result op =
+  try Rtlop.has_floating_result op with Not_found -> false
+
+let print_debug = false
+let impossf fmt = Printf.kprintf Impossible.impossible fmt
+let null = function [] -> true | _ :: _ -> false
+
+exception Abort_unknown
+exception Doesn't_need_widening
+@ 
+We're given [[goodwidths]], and our goal is to change all
+floating-point operations in an RTL to be using one of the widths in
+[[goodwidths]].
+(In practice we choose [[bestwidth w]], which is the smallest width in
+[[goodwidths]] that is at least as large as~[[w]].)
+<<widen.ml>>=
+let float ~rm goodwidths =
+  let rm = Dn.exp rm in
+  let goodwidths = List.sort compare goodwidths in
+  let isgood w = List.exists (fun w' -> w' = w) goodwidths in
+  let bestwidth w =
+    try List.find (fun w' -> w' >= w) goodwidths
+    with Not_found -> Unsupported.widen_float w in
+  <<floating-point widening>>
+  rtl
+@ 
+I'm a little shaky what is the postcondition regarding float-to-float
+conversions.
+It's embarrassing!!
+For example, suppose the source program tries to narrow a
+floating-point value to single precision.
+We owe it to ourselve to arrange to store and reload it at that
+precision, but I'm sure that doesn't happen.
+There may be other errors lurking as well.
+
+Anyway [[f2f']] implements a float-to-float conversion, which may or
+may not combine with a conversion underneath it.
+<<floating-point widening>>=
+let rec make_cvt cvt s d e rm =
+  if isgood s || isgood d then
+    RP.App((cvt, [s; d]), [e; rm])
+  else
+    let w = bestwidth (max s d) in
+    let cvtleft, cvtright =
+      match cvt with
+      | "f2f" -> "f2f", "f2f"
+      | "i2f" -> "f2f", "i2f"
+      | "f2i" -> "f2i", "f2f"
+      | _ -> Impossible.impossible "unknown conversion" in
+    make_cvt cvtleft w d (make_cvt cvtright s w e rm) rm in
+let f2f' combine srcw dstw e =
+  let make_f2f = make_cvt "f2f" in
+  if srcw = dstw then
+    e
+  else
+    match e with 
+    | RP.App(("f2f", [from; to']), [e; rm]) when combine ->
+if to' <> srcw then
+  Printf.eprintf "f2f[%d->%d] applied to f2f[%d->%d]\n" srcw dstw from to';
+        assert (to' = srcw);
+        make_f2f from dstw e rm
+    | RP.App(("f2f_implicit_round", [from; to']), [e]) when combine ->
+        assert (to' = srcw);
+        make_f2f from dstw e rm
+    | e -> 
+        make_f2f srcw dstw e rm in
+let f2f = f2f' true in
+let force_f2f = f2f' true in
+@ 
+Function [[convert]] takes an expression that is known to produce a
+floating-point value, and it changes the width of the expression,
+while rewriting all subexpressions.
+<<floating-point widening>>=
+let rec convert ~(from:int) ~(to':int) e =
+  let cvt = convert ~from ~to' in
+  match e with
+  | RP.Const _ ->
+      f2f from to' e
+  | RP.Fetch(l, w) ->
+      f2f from to' (RP.Fetch(loc l, w))
+  | RP.App (("f2f" , [f; t]), [x; rm]) ->
+      convert ~from:f ~to' x
+  | RP.App (("f2f_implicit_round" , [f; t]), [x]) ->
+      convert ~from:f ~to' x
+  | RP.App (("i2f", [f; t]), [x; rm]) ->
+      make_cvt "i2f" f to' (rewrite x) rm
+  | RP.App ((("pinf"|"minf"|"pzero"|"mzero") as op, [w]), []) -> 
+      assert (w=from);
+      f2f from to' (RP.App((op, [w]), []))
+  | RP.App (("NaN" as op, [n; w]), [x]) -> 
+      assert (w=from);
+      f2f from to' (RP.App((op, [n; w]), [x]))
+  | RP.App ((("fabs"|"fneg") as op, [w]), [x]) -> 
+      assert (w=from);
+      RP.App((op, [to']), [cvt x])
+  | RP.App ((("fadd"|"fsub"|"fmul"|"fdiv") as op, [w]), [x; y; rm]) -> 
+      RP.App((op, [to']), [cvt x; cvt y; rm])
+  | RP.App ((("fsqrt") as op, [w]), [x; rm]) -> 
+      assert (w=from);
+      RP.App((op, [to']), [cvt x; rm])
+  | RP.App ((op, _), _) ->
+      Impossible.impossible
+        ("float widener widening non-float value (applied " ^ op ^ ")")
+@ 
+Function [[rewrite]] rewrites all subexpressions to ensure the postcondition.
+Its major job is to call [[convert]] when it spots a floating-point subexpression.
+
+The third case (with the warning) might occur if we pass a
+widened floating-point variable to an integer comparison operation.
+<<floating-point widening>>=
+and rewrite e = match e with
+  | RP.Const _      -> e
+  | RP.Fetch (l, e) -> RP.Fetch(loc l, e)
+  | RP.App (op, args) when safe_has_floating_result (Up.opr op) ->
+      Debug.eprintf "widen"
+        "Warning -- rewriting (not converting) floating-point result";
+      let w = Rtlutil.Width.exp' e in
+      convert w w e
+  | RP.App (("f2i", [fw; iw]), [x; rm]) ->
+      let fw' = bestwidth fw in
+      make_cvt "f2i" fw' iw (convert ~from:fw ~to':fw' x) rm
+  | RP.App ((("fcmp"|"flt"|"fle"|"fgt"|"fge"|"feq"|"fne"|"fordered"|"funordered")
+               as opname, [w]), [x; y]) ->
+      let w' = bestwidth w in
+      RP.App ((opname, [w']), [convert ~from:w ~to':w' x; convert ~from:w ~to':w' y])
+  | RP.App(op, args) ->
+      RP.App (op, List.map rewrite args)
+@ 
+Function [[loc]] rewrites all subexpressions that appear in a location
+(i.e., in an addressing expression).
+<<floating-point widening>>=
+and loc l = match l with
+| RP.Mem(sp, w, addr, assn)  -> RP.Mem(sp, w, rewrite addr, assn)
+| RP.Slice(w, lsb, l)        -> RP.Slice(w, lsb, loc l)
+| RP.Reg(_, _, _) 
+| RP.Var(_, _, _)
+| RP.Global(_,_,_) -> l in
+@ 
+Assignment requires that we know whether the right-hand side is a
+floating-point expression.  If so, [[convert]], otherwise [[rewrite]].
+<<floating-point widening>>=
+let is_floating_exp = function
+  | RP.App(op, args) -> safe_has_floating_result (Up.opr op)
+  | _ -> false in
+let guarded (g, eff) =
+  let eff = match eff with
+  | RP.Store(l, r, w) ->
+      if is_floating_exp r then (* && bestwidth w <> w then *)
+        let r = convert ~from:w ~to':(bestwidth w) r in
+        RP.Store(loc l, force_f2f (bestwidth w) w r, bestwidth w)
+      else
+        RP.Store(loc l, rewrite r, w)
+  | RP.Kill l -> RP.Kill (loc l) in
+  (rewrite g, eff) in
+@ 
+In the common case where we have no operators that need conversion, we
+avoid rewriting the RTL, thereby reducing the load on the major heap.
+<<floating-point widening>>=
+let rtl r = 
+  let needs_conversion op =
+    safe_has_floating_result op ||
+    match fst (Dn.opr op) with
+    | "fcmp"|"flt"|"fle"|"fgt"|"fge"|"feq"|"fne"|"fordered"|"funordered"|"f2i" -> true
+    | _ -> false in
+  if Rtlutil.Exists.Opr.rtl needs_conversion r then
+    let rtl = Rtlutil.ToString.rtl in
+    let _ = if Debug.on "widen-pre" then Printf.eprintf "Widening %s...\r" (rtl r) in
+    let r' =
+      let RP.Rtl es = Dn.rtl r in Up.rtl (RP.Rtl (List.map guarded es)) in
+    if Debug.on "widen" then Printf.eprintf "Widened %s into\n  %s\n" (rtl r) (rtl r');
+    r'
+  else
+    r in
+<<widen.ml>>=
+let store_const goodwidth rtl = match Dn.rtl rtl with
+  | RP.Rtl [(g, RP.Store(l, (RP.Const (RP.Bits b) as k), w))] when w < goodwidth ->
+      let widek  = RP.App(("zx", [w; goodwidth]), [k]) in
+      let widek  = Dn.exp (Simplify.exp (Up.exp widek)) in
+      let lobits = RP.App(("lobits", [goodwidth; w]), [widek]) in
+      Up.rtl (RP.Rtl [(g, RP.Store(l, lobits, w))])
+  | _ -> rtl
+@ 
+
+\subsection{Integer widening by dynamic programming}
+
+Some basic types used in the integer widener:
+<<types>>=
+type fill = G | Z | S | H | F
+type index = int
+type width = int
+@ Type [[fill]] represents the kind of the high bits produced by a
+widened expression: garbage, zeros, sign bits, and ``high-bits contain
+the value''.
+
+The dynamic programming algorithm works by generating all possible
+solutions based on a set of rules and the operations available on the
+target machine.  A solution is represented as a type [[solution]]
+which is a record containing the original expression [[e]], the width
+of the original expression [[m]], the cost of this solution [[cost]],
+the widened expression [[e']], the fill type of the widened expression
+[[fill]], the index of the fill type [[n]], and finally the width of
+the widened expression [[w]].
+<<types>>=
+type solution = {e : RP.exp; m : width; cost : int; e' : RP.exp; 
+                 fill : fill; n : index; w : width}
+@ There are three types of environments used by the widener: type
+[[machine_env]] describes the abilities of the target machine, type
+[[fill_env]] gives the fill type of each operator, and [[gamma]] gives
+a fill type to each local variable.
+<<types>>=
+type machine_env = { ops      : (string * (width list)) list
+                   ; literals : width list
+                   ; pointer  : width
+                   ; word     : width
+                   ; rm       : RP.exp
+                   ; itemps   : width list
+                   ; ftemps   : width list
+                   ; is_hardware_register : RP.loc -> bool
+                   }
+type fill_env    = (string * fill * index) list
+let (gamma : (string, (fill * int)) Hashtbl.t) = Hashtbl.create 50
+@ 
+<<types>>=
+type tcount = {z:int; s:int; h:int; ni:int}
+let (gamma_counts : (string, tcount) Hashtbl.t) = Hashtbl.create 50
+@ 
+
+\subsubsection{Expanding the solution frontier}
+
+The dynamic programming algorithm works bottom-up by applying two
+phases at each AST node.
+\begin{description}
+\item[Apply syntax translation rules:] In the first phase we apply
+each rule that can match the syntax of the original expression---there
+is exactly one rule for each kind of expression.  The first phase is
+implemented in the function [[ast_combine]], which simply
+pattern-matches the incoming AST and applies the appropriate rule.  A
+description of this rule comes a bit later.  Some rules are
+non-determininstic and thus can produce several possible solutions for
+a given input.  Therefore each rule returns a list of all possible
+solutions for a given input.
+
+\item[Apply width-changing and subtyping rules:] In the second phase
+we take all the solutions from the first phase and apply several rules
+that needn't match particular input syntax.  These second-phase rules
+can be applied to any input solution, although they have conditions
+that must be met to produce a non-empty list of result solutions.
+This second phase is implemented in the function [[find_reachable]] in
+the next code chunk.  These two phases are applied bottom up at each
+AST node to produce all possible solutions.
+\end{description}
+
+The function [[find_reachable]] implements the second phase applied at
+each AST node.  The rules we apply at this phase may usefully be
+reapplied to the solutions from other rules in the set.  We want to
+apply each rule to the set of solutions until no new solutions are
+returned.  The function takes two parameters: [[known]], the entire
+set of solutions, and [[frontier]], the set of solutions that have
+just been generated.  [[find_reachable]] applies each rule to the
+[[frontier]] to create a fresh frontier.  It then recurs using the
+``relevant'' solutions in the fresh frontier as the [[frontier]] and
+the union of the old frontier with the old known solutions as
+[[known]].
+<<find reachable solutions>>=
+<<relations>>
+<<solution set utilities>>
+<<applying rules>>
+let rec find_reachable m known frontier =
+  let frontier' = solutions_unique (List.concat (List.map (apply_rules m) frontier)) in
+  let known     = solutions_union frontier known in
+  let frontier  = List.filter (fun soln -> relevant_given soln known) frontier'
+  in
+  if not_null frontier then find_reachable m known frontier else known
+@ [[find_reachable]] relies on the ability to create a set of
+solutions from a list of solutions using the function
+[[solutions_unique]].
+<<solution set utilities>>=
+let solutions_union xs ys =
+  let xs' = List.filter (fun soln -> relevant_given soln ys) xs in
+  xs' @ ys
+@ [[find_reachable]] also needs to construct the union of two sets of
+solutions using the function [[solutions_union]].
+<<solution set utilities>>=
+let solutions_unique =
+  let rec make_unique result = function
+    | []           -> result
+    | soln :: rest -> 
+        if relevant_given soln rest && relevant_given soln result then
+          make_unique (soln :: result) rest
+        else make_unique result rest
+  in make_unique []
+@ All three of these functions rely on being able to tell if a
+solution is \emph{relevant} given a set of known solutions.  A
+solution is relevant if there does not exist a known solution that
+makes it redundant.
+<<relations>>=
+<<redundant>>
+let relevant_given soln known = not (List.exists (redundant_given1 soln) known)
+@ The function [[redundant_given1]] determines if a solution [[a]] is
+redundant given that we already know solution [[b]].
+<<redundant>>=
+<<comparable>>
+let rec redundant_given1 a b =
+  if comparable a b then
+    if is_tau a then
+      if b.m <= index b then
+        if      index a > index b && cost a < cost b then false
+        else if index a < index b && cost a > cost b then false
+        else if index a >= index b then cost a >= cost b
+        else (* index a <  index b *)   false
+      else if a.m > index a then
+        if index a = index b then cost a >= cost b
+        else false
+      else if a.m <= index a then false
+      else impossf "comparing solutions for redundancy: missing case"
+    else if a.fill =*= H then
+      (* pretend we have converted back to some sigma type and compare *)
+      redundant_given1 {a with n = width a - index a; fill = S}
+                       {b with n = width b - index b; fill = S}
+    else (* a.fill =*= F *)
+      cost b < cost a 
+  else false
+@ The first thing that [[redundant_given1]] checks is that the two
+solutions are actually comparable at all---for solutions to be
+comparable, they must widen the same original expression to the same
+width with the same fill type.  We also check that the original
+expression have the same width, although this should be unnecessary.
+Note that to be comparable they do not need to have the same fill
+\emph{index}.  The index is part of how we decide if a solution is
+redundant.  Conditions from the \rul{Subsume-Index} rule are baked
+into [[redundant_given1]].
+\[
+\inferrule [Subsume-Index \sidecond{n<n'\leq w}]
+{\tenv,\menv \derives e \trans{c} \e :: \xty{n}  : \bits{w}\\
+ \polymach \derives e : n
+}
+{\tenv,\menv \derives e \trans{c} \e :: \xty{n'} : \bits{w}}
+\]
+There should probably be a subsumption rule for high bits types.  We
+deal with high bits redundancy by just pretending that the high-bits
+solutions have been converted back to sign-bits solutions and compare
+them as usual.
+
+Determining of a solution is redundant is the way we trim the search
+space, so it's important to throw away as many solutions as we can
+without actually ignoring a potential desired solution.  The dynamic
+programming algorithm is designed to take the minimum cost solution,
+so [[redundant_given1]] throws away solutions that are essentially the
+same as a known solutions but with higher cost.
+<<comparable>>=
+let comparable a b =
+  RU.Eq.exp (ast a) (ast b) && width a = width b && fill a =*= fill b && a.m = b.m
+@ 
+
+\subsubsection{Width-changing and subtyping rules}
+
+\def\widentheta#1{%
+\inferrule [Widen-#1 \sidecond{n\leq w\leq w'}]
+{\tenv,\menv \derives e \trans{c} \e :: \fty[#1]{n} : \bits{w} \\
+ \xx{w'}{w} \in \menv}
+{\tenv,\menv \derives e \trans{c+1} \xx{w'}{w}\e :: \fty[#1]{n}:\bits{w'}}
+}
+\newcommand\droplo[2]{%
+\inferrule [Drop-Lo-#2 \sidecond{n\leq n'\leq w}]
+{\tenv,\menv \derives e \trans{c} \e :: \fty{n'} : \bits{w}}
+{\tenv,\menv \derives \lo{n}{n'}e \trans{c} \e :: #1 : \bits{w}}}
+
+The \rul{Subsume-Index} rule is implicit in the definition of other
+rules---other rules search for solutions at a desired index and may
+accept a smaller index if the preconditions of this rule are met.
+This rule is also partly implemented in the function
+[[redundant_given1]].
+\[
+\inferrule [Subsume-Index \sidecond{n<n'\leq w}]
+{\tenv,\menv \derives e \trans{c} \e :: \xty{n}  : \bits{w}\\
+ \polymach \derives e : n
+}
+{\tenv,\menv \derives e \trans{c} \e :: \xty{n'} : \bits{w}}
+\]
+We use the function [[subsume_index]] to check if a solution [[soln]]
+can be used in place of a solution with index [[n']].  The
+[[subsume_index]] function \emph{assumes} that the solution you have
+and the solution you are asking for have the same fill type even
+though you only pass the index [[n']] in instead of an entire
+solution.
+<<applying rules>>=
+let rec subsume_index soln n' =
+  match fill soln with
+  | S | G | Z -> (soln.n < n' && soln.m <= soln.n) || soln.n = n'
+  | H         -> subsume_index {soln with fill = S; n = soln.w - soln.n} n'
+  | F         -> true
+@ Again, the high-bits type is dealt with by pretending it has been
+converted back to sign-bits type and comparing as usual.
+
+\[
+\inferrule [Subsume-Fill \sidecond{n\leq w}]
+{\tenv,\menv \derives e \trans{c} \e :: \xty{n} : \bits{w}}
+{\tenv,\menv \derives e \trans{c} \e :: \g{n}   : \bits{w}}
+\]
+<<applying rules>>=
+let subsume_fill_rule _ soln =
+  if is_sigma soln then
+    [subst_fill soln G]
+  else []
+@ 
+
+\[\inferrule [Natural]
+{\tenv,\menv \derives e \trans{c} \e :: \g{w}   : \bits{w}}
+{\tenv,\menv \derives e \trans{c} \e :: \xty{w} : \bits{w}}
+\]
+The \rul{Natural} rule tells us that if the fill index is already at
+the high end of the bitvector then we can switch to any fill type
+desired (it's vacuously true).  The first part of the [[natural_rule]]
+function implements \rul{Natural} as follows:
+<<applying rules>>=
+let natural_rule _ soln =
+  let create fill' = {soln with fill = fill'; n = soln.w} in    
+  if width soln = index soln && fill soln =*= G then
+    [create Z; create S;
+     (* {soln with fill = H; n = 0} *)
+    ]
+@ However, we also need to take into account the possiblility that
+\rul{Natural} is combined with the \rul{Subsume-Index} rule, which
+says that we can increase the fill index under certain
+circumstances---the next branch of the conditional gives solutions for
+the combined rule case.
+<<applying rules>>=
+  else match fill soln with
+  | S | Z -> List.filter (fun s -> subsume_index soln (index s)) [create Z; create S]
+  | H | G | F -> []
+@ 
+
+\[\inferrule [Fill \sidecond{\uns(k_w)=n,n\leq w\leq w'}]
+{\tenv,\menv \derives e \trans{c} \e :: \g{n} : \bits{w} \\
+ \xxlo{w'}{w} \in \menv}
+{\tenv,\menv \derives e \trans{c+1} \xxlo{w'}{w}(k_w, \e) :: \xty{n}:\bits{w'}}
+\]
+<<applying rules>>=
+let fill_rule m soln =
+  match fill soln with
+  | G ->
+    let w = width soln in
+    let lo_exists = not_null (find_exts_from m w "lobits") in
+    if lo_exists then
+      let n = index soln in
+      let zx_exists = not_null (find_exts_to m w "zx") in
+      let sx_exists = not_null (find_exts_to m w "sx") in
+      let create fill' ext =
+        { soln with
+          cost = soln.cost + 2;
+          e'   = RP.App((ext, [n;w]), [RP.App(("lobits", [w;n]), [soln.e'])]);
+          fill = fill' }
+      in
+      let zx_solns = if zx_exists then [create Z "zx"] else [] in
+      let sx_solns = if sx_exists then [create S "sx"] else [] in
+      let solns    = zx_solns @ sx_solns in
+      List.filter (fun s -> s.n <= s.w) solns (* this is necessary *)
+    else []
+  | _ -> []
+@ 
+
+\[\widentheta{{\ensuremath{\sigma}}}
+\]
+<<applying rules>>=
+let widen_sigma m soln =
+  if is_sigma soln then
+    let ext        = ext_of_fill soln.fill in
+    let w          = width soln in
+    let ext_widths = find_exts_from m w ext in
+    let create ws =
+      match Rtlop.mono (Rtl.opr ext ws) with
+      | ([Types.Bits _], Types.Bits w') ->
+          { soln with
+            e' = RP.App((ext, ws), [soln.e']);
+            cost = soln.cost + 1;
+            w = w' }
+      | _ -> impossf "%s operator should have some type bits#n->bits#w" ext
+    in
+    List.map create ext_widths
+  else []
+@ 
+
+\[\widentheta{{\ensuremath{\gtname}}}
+\]
+<<applying rules>>=
+let widen_garbage m soln =
+  match fill soln with
+  | G ->
+    let w         = width soln in
+    let zx_widths = find_exts_from m w "zx" in
+    let sx_widths = find_exts_from m w "sx" in
+    let create fill' ext ws =
+      match Rtlop.mono (Rtl.opr ext ws) with
+      | ([Types.Bits _], Types.Bits w') ->
+          { soln with
+            e' = RP.App((ext, ws), [soln.e']);
+            cost = soln.cost + 1;
+            w = w' }
+      | _ -> impossf "%s operator should have some type bits#n->bits#w" ext in
+    List.map (create Z "zx") zx_widths @ List.map (create S "sx") sx_widths
+  | _ -> []
+@ 
+
+<<applying rules>>=
+let insert_f2f m soln =
+  match fill soln with
+  | F ->
+      let srcw = width soln in
+      let dstwss = find_exts_from m srcw "f2f" in
+      let create dstws =
+        match Rtlop.mono (Rtl.opr "f2f" dstws) with
+        | ([Types.Bits _; Types.Bits _], Types.Bits dstw) ->
+            { soln with
+              e' = RP.App(("f2f", dstws), [soln.e'; m.rm]);
+              cost = soln.cost + 1;
+              w = dstw }
+        | _ -> impossf "%%f2f should be a binary operator" in
+      List.map create dstwss
+  | _ -> []
+@
+<<applying rules>>=
+let insert_i2f m soln =
+  match fill soln with
+  | S ->
+      let srcw = width soln in
+      let dstwss = find_exts_from m srcw "i2f" in
+      let create dstws =
+        match Rtlop.mono (Rtl.opr "i2f" dstws) with
+        | ([Types.Bits _; Types.Bits _], Types.Bits dstw) ->
+            { soln with
+              e' = RP.App(("i2f", dstws), [soln.e'; m.rm]);
+              cost = soln.cost + 1;
+              fill = F;
+              w = dstw }
+        | _ -> impossf "%%i2f should be a binary operator" in
+      List.map create dstwss
+  | _ -> []
+@ 
+
+\[
+\inferrule [Widen-hw-$\sigma$ \sidecond{n\leq n'\leq w, x_{n'} \text{ is hardware reg}}]
+{w \in itempwidth \\
+ \tenv,\menv \derives e \trans{c}              x_{n'} :: \fty[\sigma]{n} :\bits{n'}}
+{\tenv,\menv \derives e \trans{c+1} \xx{w}{n'}\x_{n'} :: \fty[\sigma]{n} :\bits{w}}
+\]
+\[
+\inferrule [Widen-hw-$\gtname$ \sidecond{n\leq n'\leq w, x_{n'} \text{ is hardware reg}}]
+{w \in itempwidth \\
+ \tenv,\menv \derives e \trans{c}              x_{n'} :: \fty[\gtname]{n} :\bits{n'}}
+{\tenv,\menv \derives e \trans{c+1} \xx{w}{n'}\x_{n'} :: \fty[\gtname]{n} :\bits{w}}
+\]
+<<applying rules>>=
+let widen_hw m soln =
+(*  if Debug.on "widen" then
+    Printf.eprintf "widen_hw: %s -> %s :: %s[%i] : %i\n"
+       (Rtlutil.ToString.exp (Up.exp soln.e)) (Rtlutil.ToString.exp (Up.exp soln.e'))
+       (string_of_fill soln.fill) (index soln) (width soln); *)
+  match soln.e' with
+  | RP.Fetch(l,_) when m.is_hardware_register l ->
+      let n' = width soln in
+      let ws = List.filter (fun w -> n' <= w) m.itemps in
+      let create ext f w = {soln with e'   = RP.App((ext, [n';w]),[soln.e']);
+                                      fill = f;
+                                      w    = w;
+                                      cost = soln.cost + 1}
+      in
+      let solns' =
+        match fill soln with
+        | G -> List.map (create "zx" G) ws
+        | Z -> List.map (create "zx" Z) ws
+        | S -> List.map (create "sx" S) ws
+        | H -> []
+        | F -> []
+      in
+(*      if Debug.on "widen" then
+        List.iter (fun s -> Printf.eprintf 
+                            "widen_hw success: %s -> %s :: %s[%i] : %i\n"
+                            (RU.ToString.exp (Up.exp s.e))
+                            (RU.ToString.exp (Up.exp s.e'))
+                            (string_of_fill s.fill)
+                            (index s) (width s)) solns'; *)
+      solns'
+  | _ -> []
+@ 
+
+\[\inferrule [Narrow \sidecond{n\leq w\leq w'}]
+{\tenv,\menv \derives e \trans{c} \e :: \fty{n} : \bits{w'} \\
+ \lo{w}{w'} \in \menv}
+{\tenv,\menv \derives e \trans{c+1} \lo{w}{w'} \e :: \fty{n} :
+\bits{w}}
+\]
+<<applying rules>>=
+let narrow_rule m soln =
+  if is_tau soln then
+    let w'           = width soln in
+    let trunc_widths = find_exts_from m w' "lobits" in
+    let create ws =
+      match Rtlop.mono (Rtl.opr "lobits" ws) with
+      | ([Types.Bits _], Types.Bits w) ->
+          { soln with
+            e' = RP.App(("lobits", ws), [soln.e']);
+            cost = soln.cost + 1;
+            w = w }
+      | _ -> impossf "lobits operator should have some type bits#w->bits#n"
+    in
+    List.filter (fun s -> s.n <= s.w) (List.map create trunc_widths)
+  else []
+@
+
+\[
+\inferrule[To-High\sidecond{\uns(k_w)=w-n,n\leq w}]
+{\tenv,\menv \derives e \trans{c} \e :: \g{n}\\
+ \oname{shl}:\bits{w}\times\bits{w}\rightarrow\bits{w}}
+{\tenv,\menv \derives e \trans{c+1}\oname{shl}_w(\e, k_w) :: \h{w-n} :\bits{w}}
+\]
+<<applying rules>>=
+let to_high_rule m soln =
+  match fill soln with
+  | G when
+      List.exists (function [w] -> w = soln.w | _ -> false) (machine_widths m "shl") ->  
+    let w = soln.w in
+    let n = soln.n in
+    [{ soln with
+       e' = RP.App(("shl", [w]), [soln.e';
+                                  RP.Const(RP.Bits(Bits.S.of_int (w-n) w))]);
+       cost = soln.cost + 1;
+       n    = w - n;
+       fill = H }]
+  | _ -> []
+@ 
+
+\[
+\inferrule[From-High-s\sidecond{\uns(k_w)=n}]
+{\tenv,\menv \derives e \trans{c} \e :: \h{n} : \bits{w}\\
+ \oname{shra}:\bits{w}\times\bits{w}\rightarrow\bits{w}}
+{\tenv,\menv \derives e \trans{c+1}\oname{shra}(e', k_w) :: \s{w-n}:\bits{w}}
+\]
+<<applying rules>>=
+let from_high_s_rule m soln =
+  match fill soln with
+  | H when
+      List.exists (function [w] -> w = soln.w | _ -> false) (machine_widths m "shra") ->
+    let w = soln.w in
+    let n = soln.n in
+    [{ soln with
+       e'   = RP.App(("shra", [w]), [soln.e';
+                                     RP.Const(RP.Bits(Bits.S.of_int n w))]);
+       cost = soln.cost + 1;
+       n    = w - n;
+       fill = S }]
+  | _ -> []
+@ 
+
+\[
+\inferrule[From-High-z\sidecond{\uns(k_w)=n}]
+{\tenv,\menv \derives e \trans{c} \e :: \h{n} : \bits{w}\\
+ \oname{shra}:\bits{w}\times\bits{w}\rightarrow\bits{w}}
+{\tenv,\menv \derives e \trans{c+1}\oname{shrl}(e', k_w) :: \z{w-n}:\bits{w}}
+\]
+<<applying rules>>=
+let from_high_z_rule m soln =
+  match fill soln with
+  | H when
+      List.exists (function [w] -> w = soln.w | _ -> false) (machine_widths m "shrl") ->
+    let w = soln.w in
+    let n = soln.n in
+    [{ soln with
+       e'   = RP.App(("shrl", [w]), [soln.e';
+                                     RP.Const(RP.Bits(Bits.S.of_int n w))]);
+       cost = soln.cost + 1;
+       n    = w - n;
+       fill = Z }]
+  | _ -> []    
+@ 
+
+All the width-changing and subtyping rules are applied by the function
+[[apply_rule]].  Each rule returns a list of solutions when applied to
+a solution.  [[apply_rule]] concatenates all the lists of solutions
+from applying relevant rules to the argument [[soln]].  Usually the
+relevent rules are all the rules, but there are two special cases:
+boolean constants shouldn't have their width changed since they aren't
+really bitvectors, and bitvector constants can be widened at compile
+time making it unnecessary to apply most of the rules.
+<<applying rules>>=
+let apply_rules m soln =
+  let all_general_rules = [subsume_fill_rule;
+                           natural_rule;
+                           fill_rule;
+                           widen_sigma;
+                           widen_garbage;
+                           widen_hw;
+                           narrow_rule;
+                           insert_f2f;
+(*                           insert_i2f THIS IS BOGUS *)
+                          ]
+(*
+                          ; from_high_s_rule; from_high_z_rule; to_high_rule]
+*)
+  in
+  let all_general_rules = List.map (fun r -> r m) all_general_rules in
+  let const_rules = [subsume_fill_rule; natural_rule; narrow_rule; insert_f2f] in
+  let const_rules = List.map (fun r -> r m) const_rules in
+  let relevant_rules = 
+    match ast soln with
+    | RP.Const (RP.Bool _) -> []
+    | RP.Const (RP.Bits _) -> const_rules
+    | _                    -> all_general_rules
+  in List.concat (List.map (apply_with soln) relevant_rules)
+@ 
+
+\subsubsection{Syntax translation rules}
+
+\[
+\inferrule [Lit \sidecond{k'_w = \xx{w}{n} k_n, n\leq w}]
+{ }
+{\tenv,\menv \derives k_n \trans{0} k'_w :: \xty{n} : \bits{w}}
+\]
+\[
+\inferrule [Lit-h \sidecond{k'_w = 2^{w-n}k_n, n\leq w}]
+{ }
+{\tenv,\menv \derives k_n \trans{0} k'_w :: \h{w-n} : \bits{w}}
+\]
+<<combine solutions>>=
+let mksolutions_lit_bool e = match e with 
+| (RP.Const (RP.Bool b)) -> [{e = e; m = 1; cost = 0; e' = e; fill = Z; n = 1; w = 1}]
+| _ -> impossf "mksolutions_lit_bool requires a bool const"
+
+let mksolutions_lit_bits m tau e = match e with
+| (RP.Const (RP.Bits b)) ->
+  let n = Bits.width b in
+  let litwidths = List.filter (fun w' -> n <= w') m.literals in
+  (match tau with
+  | S | Z ->
+      let f w' =
+        let ext = if tau =*= S then Bits.Ops.sx else Bits.Ops.zx in
+        {e = e; m = n; cost = 0; e' = RP.Const(RP.Bits (ext w' b)); fill = tau; n = n; w = w'} in
+      List.map f litwidths
+  | H ->
+      let f w' =
+        let ext = Bits.Ops.shl (Bits.Ops.zx w' b) (Bits.S.of_int (w' - n) w') in
+(*        if Debug.on "widen" then
+          Printf.eprintf "%s -> %s :: H[%i] : %i\n"
+            (Bits.to_string b) (Bits.to_string ext) n w'; *)
+        {e = e; m = n; cost = 0; e' = RP.Const(RP.Bits ext); fill = H; n = w' - n; w = w'}
+      in
+      List.map f litwidths
+  | F -> if List.mem n m.ftemps then
+           [{e = e; m = n; cost = 0; e' = e; fill = F; n = n; w = n}]
+         else []
+  | G -> impossf "widening failed: literals cannot have garbage type")
+| _ -> impossf "mksolutions_lit_bits requires a bitvector const"
+@ 
+
+% Assume that each use of a variable is garbage type with index same
+% as width.
+
+\[\inferrule [Var \sidecond{n\leq w}]
+{\tenv(x_w)=\fty{n}}
+{\tenv,\menv \derives x_w \trans{0} x_w :: \fty{n} : \bits{w}}
+\]
+Use [[gamma]] to find the appropriate fill type for this variable.
+<<combine solutions>>=
+let lookup_gamma name w =
+  try
+    let (fill, n) = Hashtbl.find gamma name in
+    if Debug.on "gamma" then
+      Printf.eprintf "Found %s :: %s[%i]\n" name (string_of_fill fill) n;
+    (fill, n)
+  with Not_found ->
+    if Debug.on "gamma" then
+      Printf.eprintf "%s not found in gamma\n" name;
+    (G, w)
+
+let mksolutions_var name e w =
+  let (fill, n) = lookup_gamma name w in
+  let create f = {e = e; m = n; cost = 0; e' = e; fill = f; n = n; w = w} in
+  match fill with
+  | H -> [{e = e; m = n; cost = 0; e' = e; fill = H;    n = w - n; w = w}]
+  | _ -> [create fill; create F]
+@ 
+
+\[\inferrule [Binop \sidecond{\n1\leq\w1,\n2\leq\w2,n\leq w}]
+{%%%\bwtype[\polymach]{e_1}{\n1} \qquad \bwtype[\polymach]{e_2}{\n2} \\
+ \oplus :: \fidx1 \times \fidx2 \rightarrow \tau \\
+ \,\bwoptype [\polymach] \oplus  {\n1 \cross \n2 \arrow n}\\
+ \bwoptype [\rlap{$\menv$}\phantom{\polymach}]
+     {\oplus} {\bits{\w1} \times \bits{\w2} \rightarrow \bits{w}} \\
+ \tx {e_1} {c_1} {\e_1} {\fty[\fidx1]{\n1}} {\bits{\w1}} \\
+ \tx {e_2} {c_2} {\e_2} {\fty[\fidx2]{\n2}} {\bits{\w2}}\\
+}
+{
+\Gamma, M \derives \oplusn(e_1,e_2) \trans{c_1 + c_2} \oplusw(\e_1,\e_2) :: \fty{n} : \bits{w}
+}
+% \tx {\oplusn(e_1,e_2)} {c_1 + c_2} {\oplusw(\e_1,\e_2)} {\fty{n}} {\bits{w}}}
+\]
+<<combine solutions>>=
+let mksolutions_op m args_solns opname ws args =
+  let dbg_print_args_solns solnss =
+    Printf.eprintf "\t %s\n"
+      (strconcatmap ";\n\t " (strconcatmap "\n\t " string_of_soln) args_solns)
+  in
+
+  if Debug.on "widen-op-solns" then
+    (Printf.eprintf "Solving %%%s " opname;
+     Printf.eprintf "ws = [%s]\n" (String.concat "; " (List.map string_of_int ws));
+     Printf.eprintf "\targs_solns =\n";
+     dbg_print_args_solns args_solns);
+
+  (* here we just want to pretend that booleans are 1-bit values *)
+  let monomorphic opname ws =
+    let to_int = function
+      | Types.Bits n -> n
+      | Types.Bool   -> 1
+    in
+    let (a, b) = 
+      if List.mem_assoc opname op_fill_types then
+        Rtlop.mono (Rtl.opr opname ws)
+      else raise Not_found
+    in
+    (List.map to_int a, to_int b)
+  in
+
+  let (args_indices, result_index) = 
+    try monomorphic opname ws
+    with Not_found -> raise Abort_unknown
+  in
+  let args_solns =
+    map2_find_all (fun n' s -> subsume_index s n') args_indices args_solns
+  in
+  if Debug.on "widen-op-solns" then
+    (Printf.eprintf "\targs_solns subsume_index\n";
+     dbg_print_args_solns args_solns);
+
+  let m_widths = machine_widths m opname in
+  let m_widths = List.map (fork (monomorphic opname) id) m_widths in
+  if Debug.on "widen-op-solns" then
+    Printf.eprintf "\tm_widths = %s\n"
+      (strconcatmap ", "
+         (fun (x,y) -> "["^strconcatmap "->" string_of_int x^"->"^string_of_int y^"]")
+         (List.map fst m_widths));
+
+  let solns_combinations = cross_list_all args_solns in
+
+  let has_widths solns widths =
+    List.for_all2 (fun s w -> s.w = w) solns (fst (fst widths)) in
+  let solns_and_widths = cross_pair_filter has_widths solns_combinations m_widths in
+
+  if Debug.on "widen-op-solns" then
+    (Printf.eprintf "\tmap fst solns_and_widths =\n";
+     dbg_print_args_solns (List.map fst solns_and_widths));
+
+  let taus = try List.assoc opname op_fill_types with _ -> [] in
+  let has_taus (solns, _) (taus, _) =
+    List.for_all2 (fun s t -> s.fill =*= t) solns taus in
+  let solns_widths_and_taus = cross_pair_filter has_taus solns_and_widths taus in
+  
+  let mkopsoln ((solns, ((_,w'), ws')), (_,t)) =
+    (* THIS MIGHT BE BOGUS *)
+    (* I suspect what this is trying to do is get rid of widths that
+       are 1 because we were replacing a boolean.  However, there are operators
+       that actually do operate on one bit values.  On the other hand,
+       since they are special purpose, the width probably doesn't
+       appear as a parameter for the op.  Can we show that we never
+       want to accept a parameter width 1?
+     *)
+    let ws' = List.filter (fun x -> x > 1) ws' in
+    { e    = RP.App((opname, ws), args);
+      m    = result_index;
+      cost = List.fold_left (+) 0 (List.map cost solns);
+      e'   = RP.App((opname, ws'), List.map ast' solns);
+      fill = t;
+      n    = result_index;
+      w    = w' }
+  in
+  let solns = List.map mkopsoln solns_widths_and_taus in
+  if Debug.on "widen-op-solns" then
+    Printf.eprintf "\tsolutions:\n\t%s\n"
+    (String.concat "\n\t" (List.map string_of_soln solns));
+  solns
+@ 
+<<combine solutions>>=
+let mksolutions_nullary_op m opname ws =
+  let monomorphic opname ws =
+    let to_int = function Types.Bits n -> n | Types.Bool -> 1 in
+    let (a, b) =
+      if List.mem_assoc opname op_fill_types then Rtlop.mono (Rtl.opr opname ws)
+      else raise Not_found
+    in (List.map to_int a, to_int b)
+  in
+  let snds xs = List.map snd xs in
+  let (_, result_index) = try monomorphic opname ws
+                          with Not_found -> raise Abort_unknown in
+  let m_widths         = machine_widths m opname in
+  let result_widths    = snds (List.map (monomorphic opname) m_widths) in
+  let result_fills     = try snds (List.assoc opname op_fill_types) with _ -> [] in
+  let widths_and_fills = cross_pair result_widths result_fills in
+  let create (ws', (w, t)) = { e    = RP.App((opname, ws), []);
+                               m    = result_index;
+                               cost = 0;
+                               e'   = RP.App((opname, ws'), []);
+                               fill = t;
+                               n    = result_index;
+                               w    = w } in
+  match ws with
+  | []   -> List.map (fun x -> create ([], x))
+                     (List.filter (fun (w,_) -> w = result_index) widths_and_fills)
+  | [_] -> List.map create (List.map (fun (w,t) -> ([w],(w,t))) widths_and_fills)
+  | _ -> impossf "Unary operator could have one width parameter at most"
+@
+
+Drop extention rule from the paper:
+\[\inferrule [Drop-Ext \sidecond{n\leq n'\leq w}]
+{\tenv,\menv \derives e \trans{c} e' :: \xty{n} : \bits{w}}
+{\tenv,\menv \derives \xx{n'}{n}e \trans{c} e' :: \xty{n} : \bits{w}}
+\]
+More flexible revised rule that is implemented:
+\[\inferrule [Drop-Ext \sidecond{n\leq n'\leq n''\leq w}]
+{\tenv,\menv \derives e \trans{c} e' :: \xty{n} : \bits{w}}
+{\tenv,\menv \derives \xx{n''}{n}e \trans{c} e' :: \xty{n'} : \bits{w}}
+\]
+<<combine solutions>>=
+let mksolutions_ext ext ws arg_solnss =
+  let arg_solns = match arg_solnss with [s] -> s | _ -> impossf "extension arity" in
+
+  (* find all solutions that have the appropriate sigma *)
+  let sigma = fill_of_ext ext in
+  let arg_solns = List.filter (fun s -> s.fill =*= sigma) arg_solns in
+
+  (* find all solutions with index equal to the input width of the extension *)
+  let (n, n'') =
+    match Rtlop.mono (Rtl.opr ext ws) with
+    | ([Types.Bits n], Types.Bits n'') -> (n, n'')
+    | _ -> impossf "%s operator should have some type bits#n->bits#w" ext in
+  (* assert that n <= n'' *)
+
+  let arg_solns = List.filter (fun s -> subsume_index s n && n <= s.w) arg_solns in
+
+  let create1 arg_soln = { arg_soln with e = RP.App((ext,ws),[arg_soln.e]); 
+                          m = n''; n = n} in
+  let create2 arg_soln = { arg_soln with e = RP.App((ext,ws),[arg_soln.e]); 
+                          m = n''; n = n''} in
+  List.map create2 arg_solns @ List.map create1 arg_solns
+@ Dropping f2f may not be a great idea since we sort of lose the
+rounding mode information.  We will try to pick the correct rounding
+mode back up when inserting an f2f or other operation.
+<<combine solutions>>=
+let mksolutions_drop_f2f ws args_solns rm =
+  let s = match args_solns with [s;_] -> s | _ -> impossf "f2f arity" in
+  let arg_solns = List.filter (fun s -> s.fill =*= F) s in
+  let (srcw, dstw) =
+    match Rtlop.mono (Rtl.opr "f2f" ws) with
+    | ([Types.Bits n; Types.Bits _], Types.Bits n') -> (n, n')
+    | _ -> impossf "%%f2f should be a binary operator"
+  in
+  let arg_solns = List.filter (fun s -> s.w <= dstw && s.w <= srcw) arg_solns in
+  let create arg_soln = { arg_soln with
+                             e = RP.App(("f2f",ws),[arg_soln.e; rm]); m = srcw }
+  in
+  List.map create arg_solns
+@ 
+
+Implementation of the drop rules for truncation.
+
+These rules need to be revised, I think.  They are sound in the paper,
+but they could be less restrictive.  In their original versions:
+\[\droplo{{\fty{n'}}}{Copy}
+\]
+\[\droplo{{\g{n}}}{Ignore}
+\]
+
+Modified versions I've implemented:
+\[\inferrule[Drop-Lo-Copy \sidecond{n\leq n'\leq n''\leq w}]
+{\tenv,\menv \derives e \trans{c} \e :: \fty{n'} : \bits{w}}
+{\tenv,\menv \derives \lo{n}{n''}e \trans{c} \e :: \fty{n'} :\bits{w}}
+\]
+\[\inferrule[Drop-Lo-Ignore \sidecond{n\leq n'\leq n''\leq w}]
+{\tenv,\menv \derives e \trans{c} \e :: \fty{n'} : \bits{w}}
+{\tenv,\menv \derives \lo{n}{n''}e \trans{c} \e :: \g{n} :\bits{w}}
+\]
+In the new versions, the index of the input solution doesn't have to
+be exactly the same as the input width to the lobits operation.  This
+is still sound because the fill type is correct (same as input
+solution) and the value in the low $n'$ bits is required (by
+precondition) to be the same as the original expression---the fact
+that the original expression has lost some bits doesn't matter.
+<<combine solutions>>=
+let mksolutions_trunc ws arg_solnss =
+  let arg_solns =
+    assert (List.length arg_solnss = 1);
+    List.filter is_tau (List.hd arg_solnss)
+  in
+  (* [[e]] just updates the original expression *)
+  let e arg = RP.App(("lobits", ws), [arg]) in
+  let (n'', n) =
+    match Rtlop.mono (Rtl.opr "lobits" ws) with
+    | ([Types.Bits n''], Types.Bits n) -> (n'', n)
+    | _ -> impossf "lobits operator should have some type bits#w->bits#n"
+  in
+  let drop_lo_copy arg_soln = { arg_soln with e = e arg_soln.e; m = n} in
+  let drop_lo_ignore arg_soln = 
+    { arg_soln with e = e arg_soln.e; fill = G; m = n; n = n}
+  in
+  let ok_soln s =
+    let n' = s.n in
+    n' <= n'' && (n <= n' || subsume_index s n)
+  in
+  let arg_solns = List.filter ok_soln arg_solns in
+  List.map drop_lo_copy arg_solns @ List.map drop_lo_ignore arg_solns
+@ 
+The following rule doesn't occur because we don't really have a sxlo
+or zxlo operator.
+\[\inferrule [Extlo \sidecond{n\leq n'\leq w\leq w'}]
+{\xxlo{w'}{w} \in \menv \\
+ \tenv,\menv \derives b \trans{c_1} \b :: \z{n} : \bits{w} \\
+ \tenv,\menv \derives e \trans{c_2} \e :: \g{n} : \bits{w}
+}
+{\tenv,\menv \derives \xxlo{n'}{n}(b, e) \trans{c_1+c_2+1} \xxlo{w'}{w}(\b, \e) :: \xty{n} : \bits{w'}}
+\]
+<<combine solutions>>=
+let var_name = function
+  | RP.Const(RP.Link(nm,_,_)) -> nm#original_text
+  | RP.Const(RP.Late(nm,_))   -> nm
+  | RP.Fetch((RP.Var(nm,_,_) | RP.Global(nm,_,_)),_) -> nm
+  | _ -> "/*" (* impossible name *)
+
+let ast_combine m solns = function
+  | RP.Const(RP.Bool b) as e -> mksolutions_lit_bool e
+  | RP.Const(RP.Bits b) as e ->
+      (mksolutions_lit_bits m Z e)
+      @ (mksolutions_lit_bits m S e)
+      @ (mksolutions_lit_bits m F e)
+      (* @ (mksolutions_lit_bits m.literals H e) *)
+  | (RP.Fetch(RP.Mem(_, _, mcell as ms,c,addr,a),_)) as e ->
+      let all  = match solns with [s] -> s | _ -> impossf "mem arity" in
+      let best = List.filter (fun s -> fill s =*= Z && s.w = m.pointer) all in
+      if null best then
+        impossf "couldn't widen address in %s" (Rtlutil.ToString.exp (Up.exp e));
+      let best = minimum_cost best in
+      let w = Cell.to_width mcell c in
+      let create f = { best with
+                       e    = e;
+                       e'   = RP.Fetch(RP.Mem(ms,c,best.e',a),w);
+                       fill = f;
+                       w    = w;
+                       n    = w } in
+      [create G; create F]
+  | (RP.Const(RP.Link(_,_,w)|RP.Late(_,w)) | RP.Fetch(_,w)) as e ->
+      mksolutions_var (var_name e) e w
+  | RP.App((("sx"|"zx" as ext), ws), [arg])    -> mksolutions_ext ext ws solns
+(*  | RP.App(("f2f",              ws), [arg;rm]) ->
+  mksolutions_drop_f2f ws solns rm *)
+  | RP.App(("lobits",           ws), [arg])    -> mksolutions_trunc ws solns
+  | RP.App((opname,             ws), [])       -> mksolutions_nullary_op m opname ws
+  | RP.App((opname,             ws), args)     -> mksolutions_op m solns opname ws args
+  | _ -> impossf "Widen.ast_combine couldn't handle the rtl"
+@ 
+<<bottom-up transform>>=
+let rec bottom_up f = function
+  | RP.App(_,es) as e -> f (List.map (bottom_up f) es) e
+  | RP.Fetch(RP.Mem(_, _, addr, _), _) as e -> f [bottom_up f addr] e
+  | e -> f [] e
+@ 
+[[all_solutions]] is where the two phases of the dynamic programming
+algorithm are applied bottom-up on each AST node.
+<<dynamic programming>>=
+let all_solutions m =
+  let solve_node known e =
+    find_reachable m [] (solutions_unique (ast_combine m known e)) 
+  in
+  bottom_up solve_node
+@ 
+<<solution utilities>>=
+let cost  s = s.cost
+let index s = s.n
+let width s = s.w
+let ast   s = s.e
+let ast'  s = s.e'
+let fill  s = s.fill
+
+let string_of_fill = function
+  | S -> "S"
+  | Z -> "Z"
+  | G -> "G"
+  | H -> "H"
+  | F -> "F"
+
+let is_sigma s = match fill s with (S | Z) -> true | (G | H | F) -> false
+let is_tau   s = match fill s with (S | Z | G) -> true | (H | F) -> false
+@ 
+<<solution utilities>>=
+let subst_fill s tau = {s with fill = tau}
+@ 
+
+<<solution utilities>>=
+let apply_with x f = f x
+let map2_find_all prop xss ys = List.map2 (fun x -> List.filter (prop x)) xss ys
+let fork f g x = (f x, g x)
+let id x = x
+let compose f g x = f (g x)
+@ 
+
+<<solution utilities>>=
+let rec cross_list xs ys =
+  match xs, ys with
+  | [],      _  -> []
+  | _,       [] -> []
+  | x::rest, ys -> List.map (fun y -> [x;y]) ys @ cross_list rest ys
+
+let rec cross_pair xs ys =
+  match xs, ys with
+  | [], _ -> []
+  | _, [] -> []
+  | x::rest, ys ->
+      List.map (fun y -> (x, y)) ys @ cross_pair rest ys
+@ 
+
+<<solution utilities>>=
+let rec cross_pair_filter p xs ys =
+  match xs, ys with
+  | [], _ -> []
+  | _, [] -> []
+  | x::rest, ys ->
+      List.map (fun y -> (x, y)) (List.filter (p x) ys) @ cross_pair_filter p rest ys
+@ 
+
+<<solution utilities>>=
+let cross_list_all xss =
+  let nest_each = List.map (fun x -> [x]) in
+  let rec combinations current = function
+    | [] -> current
+    | xs :: rest -> 
+        let current' = List.map List.concat (cross_list current (nest_each xs)) in
+        combinations current' rest
+  in
+  match xss with
+  | [] -> []
+  | xs :: rest -> combinations (nest_each xs) rest
+@ 
+
+<<solution utilities>>=
+let rec minimum_cost = function
+  | [] -> impossf "can't take minimum of empty list"
+  | [x] -> x
+  | x :: rest -> let m = minimum_cost rest in if cost x < cost m then x else m
+
+let rec maximum_cost = function
+  | [] -> impossf "can't take maximum of empty list"
+  | [x] -> x
+  | x :: rest -> let m = minimum_cost rest in if cost x > cost m then x else m
+
+let minimum = function
+  | [] -> impossf "empty list"
+  | x :: rest -> List.fold_left min x rest
+@ 
+<<solution utilities>>=
+let string_of_soln s =
+  Printf.sprintf "%s -> %s :: %s[%i] : %i"
+    (RU.ToString.exp (Up.exp s.e))
+    (RU.ToString.exp (Up.exp s.e'))
+    (string_of_fill s.fill)
+    s.n
+    s.w
+@
+<<helpers>>=
+let ext_of_fill = function
+  | S -> "sx"
+  | Z -> "zx"
+  | _ -> raise Not_found
+
+let fill_of_ext = function
+  | "sx" -> S
+  | "zx" -> Z
+  | ext  -> raise Not_found
+
+let strconcatmap x y z = String.concat x (List.map y z)
+@ 
+
+<<environments>>=
+let op_fill_types =
+  [ "add", [[G;G],G;
+            [H;H],H]
+  ; "addc", [[G;G;G], G]
+  ; "and", [[S;S],S;
+            [Z;G],Z;
+            [G;Z],Z;
+            [G;G],G;
+            [H;H],H]
+  ; "borrow", [[S;S;G], Z;
+               [Z;Z;G], Z]
+  ; "carry", [[S;S;G], Z]
+  ; "com", [[S],S;
+            [G],G]
+  ; "div", [[S;S],S]
+  ; "divu", [[Z;Z],Z]
+  ; "mod", [[S;S],S]
+  ; "modu", [[Z;Z],Z]
+  ; "mul", [[S;S],S] (* maybe garbage instead? *)
+  ; "mulx", [[S;S],S]
+  ; "mulux", [[Z;Z],Z]
+  ; "neg", [[G],G;
+            [H],H]
+  ; "or", [[S;S],S;
+           [Z;Z],Z;
+           [G;G],G;
+           [H;H],H]
+  ; "quot", [[S;S],S]
+  ; "popcnt", [[Z], Z]
+  ; "rem", [[S;S],S]
+(* rotl, rotr must be rewritten *)
+  ; "shl",  [[G;Z],G]
+  ; "shra", [[S;Z],S]
+  ; "shrl", [[Z;Z],Z]
+  ; "sub", [[G;G],G;
+            [H;H],H]
+  ; "subb", [[G;G;G], G]
+  ; "xor", [[G;G],G
+           ;[S;S],S
+           ;[Z;Z],Z
+           ;[H;H],H]
+  ; "eq",     [[S;S],Z;
+               [Z;Z],Z;
+               [H;H],Z]
+  ; "ge",     [[S;S],S;
+               [H;H],Z]
+  ; "geu",    [[S;S],Z;
+               [Z;Z],Z;
+               [H;H],Z]
+  ; "gt",     [[S;S],Z;
+               [H;H],Z]
+  ; "gtu",    [[S;S],Z;
+               [Z;Z],Z;
+               [H;H],Z]
+  ; "le",     [[S;S],Z;
+               [H;H],Z]
+  ; "leu",    [[S;S],Z;
+               [Z;Z],Z;
+               [H;H],Z]
+  ; "lt",     [[S;S],Z;
+               [H;H],Z]
+  ; "ltu",    [[S;S],Z;
+               [Z;Z],Z;
+               [H;H],Z]
+  ; "ne",     [[S;S],Z;
+               [Z;Z],Z;
+               [H;H],Z]
+
+  ; "fabs", [[F],F]
+  ; "fadd", [[F;F;Z],F]
+  ; "fdiv", [[F;F;Z],F]
+  ; "feq", [[F;F],Z]
+  ; "fge", [[F;F],Z]
+  ; "fgt", [[F;F],Z]
+  ; "fle", [[F;F],Z]
+  ; "flt", [[F;F],Z]
+  ; "fne", [[F;F],Z]
+  ; "fordered", [[F;F],Z]
+  ; "fmul", [[F;F;Z],F]
+  ; "fneg", [[F],F]
+  ; "funordered", [[F;F],Z]
+  ; "fsqrt", [[F;Z],F]
+  ; "fsub", [[F;F;Z],F]
+  ; "f2f", [[F;Z],F]
+  ; "i2f", [[S;Z],F]
+  ; "f2i", [[F;Z],S]
+  ; "minf",  [[],F]
+  ; "pinf",  [[],F]
+  ; "mzero", [[],F]
+  ; "pzero", [[],F]
+  ; "round_up",      [[],Z]
+  ; "round_down",    [[],Z]
+  ; "round_zero",    [[],Z]
+  ; "round_nearest", [[],Z]
+(*
+  ; "NaN",
+  ;  "add_overflows",
+  ;  "div_overflows",
+  ;  "mul_overflows",
+  ;  "mulu_overflows",
+  ;  "quot_overflows",
+  ;  "sub_overflows",
+*)
+  ; "not",    [[Z],Z]
+  ; "bool",   [[Z],Z]
+  ; "disjoin", [[Z;Z],Z]
+  ; "conjoin", [[Z;Z],Z]
+  ; "bit",    [[Z],G]
+  ]
+
+let machine_has m opname ws = List.mem (opname,ws) m.ops
+
+let machine_widths m opname =
+  let all = List.filter (fun (opname',_) -> opname =$= opname') m.ops in
+  List.map (fun (opname,ws) -> ws) all
+
+let find_exts_from m w extname =
+  let ext_widths = machine_widths m extname in
+  List.filter (function (w1::_) -> w1 = w
+                        | _ -> impossf "ill formed machine env") ext_widths
+
+let find_exts_to m w extname =
+  let ext_widths = machine_widths m extname in
+  List.filter (function [_;w2] -> w2 = w
+                        | _ -> impossf "ill formed machine env") ext_widths
+@ 
+<<widen.ml>>=
+<<types>>
+<<solution utilities>>
+<<helpers>>
+<<environments>>
+<<find reachable solutions>>
+<<combine solutions>>
+<<bottom-up transform>>
+<<dynamic programming>>
+@ 
+
+@ 
+To know if a global variable is a hardware register, we have to look
+it up in the map associated with the procedure.
+We are careful to avoid infinite recursion for the case in which a global
+variable is mapped to itself, as is done by the interpreter back end,
+for example.
+
+The general idea is that if a back end allows something to get into a
+hardware register, the expander will assume the obligation of
+extending it if needed.
+<<helpers>>=
+let is_hardware_register proc loc =
+  match loc with
+  | RP.Global (_, i, w) ->
+      (match Dn.exp (proc.Proc.global_map.(i).Automaton.fetch w) with
+      | RP.Fetch (l, _) -> RU.is_hardware l
+      | _ -> false)
+  | _ -> RU.is_hardware loc
+@ 
+<<widen.ml>>=
+let needs_widening t r =
+  let targetwidth = t.Target.wordsize in
+  let rec loc = function
+    | RP.Mem((_, _, ms),c,e,_) -> Cell.to_width ms c < targetwidth || exp e
+    | RP.Reg((_,_,ms),_,c) -> Cell.to_width ms c < targetwidth
+    | RP.Var(_,_,w)     -> w < targetwidth
+    | RP.Global(_,_,w)  -> w < targetwidth
+    | RP.Slice(w,_,l)   -> w < targetwidth || loc l
+  and exp = function
+    | RP.Fetch(l, w) -> w < targetwidth || loc l
+    | RP.App((_, ws), es) ->
+        List.exists (fun w -> w < targetwidth) ws || List.exists exp es
+    | RP.Const c -> const c
+  and const = function
+    | RP.Link(_,_,w) -> w < targetwidth
+    | RP.Diff(x,y)   -> const x || const y
+    | RP.Late(_,w)   -> w < targetwidth
+    | RP.Bits b      -> Bits.width b < targetwidth
+    | RP.Bool _      -> false
+  in
+  let guard (g, eff) =
+    let eff' =
+      match eff with
+      | RP.Store(l, r, w) -> w < targetwidth || loc l || exp r
+      | RP.Kill l -> loc l
+    in
+    eff' || exp g
+  in
+  let RP.Rtl es = Dn.rtl r in
+  List.fold_left (fun b e -> b || guard e) false es
+@ 
+
+I'll choose in the [[widen_guarded]] code to find a solution of type Z,
+just to match what some C-- frontends seem to want to do...not that it
+matters.
+Calling [[widen_loc]] never changes the width of the location---it
+simply fixes up any code in an addressing expression that might need
+widening. 
+<<widen.ml>>=
+let dpwiden (g,proc) r =
+  let PA.T t      = proc.Proc.target in
+  let targetwidth = t.Target.wordsize in
+  let ptrwidth    = t.Target.pointersize in
+  let rm          =
+    let fetch t = R.fetch t (R.locwidth t) in
+    Dn.exp (fetch t.Target.rounding_mode) in
+  let ops         = List.map Dn.opr t.Target.capabilities.Target.operators in
+  let litwidths   = t.Target.capabilities.Target.literals in
+  let m = {ops=ops; literals=litwidths; pointer=ptrwidth; word=targetwidth;
+           itemps=t.Target.capabilities.Target.itemps;
+           ftemps=t.Target.capabilities.Target.ftemps;
+           rm=rm;
+           is_hardware_register=is_hardware_register proc} in
+
+  let find_best_soln' r filter =
+    let construct r =
+      let solns  = all_solutions m r in
+      List.filter filter solns in
+    let solns = construct r in
+    let solns =
+      if null solns then construct (Dn.exp (Simplify.exp (Up.exp r)))
+      else solns in
+    let () = if null solns then
+      impossf "dpwiden couldn't widen %s" (Rtlutil.ToString.exp (Up.exp r))
+    in
+    let soln = minimum_cost solns in
+    if print_debug then Printf.eprintf "cost: %i\n" soln.cost;
+    soln.e'
+  in
+
+  let find_best_soln_index r tau n w =
+    find_best_soln' r (fun s -> index s = n && width s = w && fill s =*= tau) in
+  let find_best_soln r tau w =
+    find_best_soln' r (fun s -> width s = w && fill s =*= tau) in
+
+  let rec widen_loc = function
+    | RP.Mem(sp,w,e,a) -> RP.Mem(sp,w,find_best_soln e Z ptrwidth, a)
+    | RP.Slice(w,i,l)  -> RP.Slice(w,i, widen_loc l)
+    | l                -> l in
+@ 
+
+(*
+  let find_best_soln_index r tau n w =
+    let solns  = all_solutions m r in
+    let solns  = List.filter (fun s -> index s = n && width s = w && fill s =*= tau) solns in
+    let () = if null solns then
+      (* try simplifier and run again *)
+      impossf "dpwiden couldn't widen %s" (Rtlutil.ToString.exp (Up.exp r)) in
+    let soln   = minimum_cost solns in
+    if print_debug then Printf.eprintf "cost: %i\n" soln.cost;
+    soln.e' in
+  let find_best_soln r tau w =
+    let construct r = 
+      let solns  = all_solutions m r in
+      let solns  = List.filter (fun s -> width s = w && fill s =*= tau) solns in
+      solns
+    in
+    let solns = construct r in
+    let solns =
+      if null solns then (* try the simplifier and run again *)
+        construct (simplify r)
+      else solns
+    in
+    let () = if null solns then
+      impossf "dpwiden couldn't widen %s" (Rtlutil.ToString.exp (Up.exp r)) in
+    let soln = minimum_cost solns in
+    if print_debug then Printf.eprintf "cost: %i\n" soln.cost;
+    soln.e' in
+*)
+
+\[
+\inferrule [Assign \sidecond{n\leq w\leq w', x_w \text{ is a hardware reg}}]
+{\tenv(x_w)=\fty{n} \\
+ \tenv,\menv \derives e \trans{c} \e :: \fty{n} : \bits{w'}}
+{\tenv,\menv \derives x_w :=_w \lo{w}{w'}e \trans{c} x_w :=_w \lo{w}{w'}\e}
+\]
+\[
+\inferrule [Assign \sidecond{n\leq w}]
+{\tenv(x_w)=\fty{n}\\
+ \tenv,\menv \derives e \trans{c} \e :: \fty{n} : \bits{w}}
+{\tenv,\menv \derives x_w :=_w e \trans{c} x_w :=_w \e}
+\]
+Note that [[widen_guarded]] doesn't seem to be checking the index of the result!
+<<widen.ml>>=
+  let widen_guarded (g, eff) =
+    try
+      let effsoln = 
+        match eff with
+        | RP.Store(l, (RP.App(op, args) as e), w)
+          when safe_has_floating_result (Up.opr op) ->
+            if Debug.on "widen" then
+              Printf.eprintf " looking for %s -> ... :: F : %i\n"
+                (RU.ToString.exp (Up.exp e)) w;
+            RP.Store(l, find_best_soln e F w, w)
+        | RP.Store(l, RP.App(("lobits", [w';_]), [e]), w) 
+          when is_hardware_register proc l && w <= w' ->
+            let (fill, _) = lookup_gamma (var_name (RP.Fetch(l,w))) w in
+            if Debug.on "widen" then
+              Printf.eprintf " looking for %s -> ... :: %s[_] : %i\n"
+                 (RU.ToString.exp (Up.exp e)) (string_of_fill fill) w';
+            RP.Store(l, RP.App(("lobits", [w';w]), [find_best_soln e fill w']), w)
+        | RP.Store(l, r, w) ->
+            let (fill, n) = lookup_gamma (var_name (RP.Fetch(l,w))) w in
+            if Debug.on "widen" then
+              Printf.eprintf " looking for %s -> ... :: %s[%i] : %i\n"
+                 (RU.ToString.exp (Up.exp r)) (string_of_fill fill) n w;
+            RP.Store(widen_loc l, find_best_soln_index r fill n w, w)
+        | RP.Kill l         -> RP.Kill (widen_loc l)
+      in
+      let gsoln = find_best_soln g Z 1 in
+      (gsoln, effsoln)
+    with Abort_unknown -> (g, eff)
+  in
+  let rtl = Rtlutil.ToString.rtl in
+  let () = if Debug.on "widen-pre" then
+    (Printf.eprintf "DP widening %s\n" (rtl r); flush stderr) in
+  let r' =
+    let RP.Rtl es = Dn.rtl r in
+    Up.rtl (RP.Rtl (List.map widen_guarded es)) in
+  if Debug.on "widen" && not (rtl r' =$= rtl r) then
+    (Printf.eprintf "`->      %s\n" (rtl r'); flush stderr);
+  r'
+@ 
+
+We don't touch registers because actual hardware registers should
+already be at the right width---otherwise there is something wrong
+with the frontend.  We also don't touch memory references or slices.
+I'm not sure what the right way to deal with globals is---maybe they
+should be widened and maybe not.  So for now, we only handle the
+``Var'' case.  For now, we always do zero extension when extension is
+necessary.  I choose to do zx instead of sx here to be consistent with
+choices that seem to be made by frontends for QC--.  (So I don't start
+failing tests).
+<<widen.ml>>=
+let widenlocs t r =
+  let targetwidth = t.Target.wordsize in
+  let tostr = Rtlutil.ToString.rtl in
+  let lo n e = RP.App(("lobits", [targetwidth; n]), [e]) in
+  let rec widen_loc = function
+    | RP.Mem(sp, w, e, a) -> RP.Mem(sp, w, widen_exp e, a)
+    | RP.Slice(w, i, l)   -> RP.Slice(w, i, widen_loc l)
+    | l                   -> l
+  and widen_exp = function
+    | (RP.Fetch(RP.Var(name, i, vw), fw)) as e ->
+        if vw <> fw then
+          impossf "Fetch and var widths are not the same in Fetch(%s::bits%i, %i)"
+            name vw fw
+        else if vw < targetwidth
+        then lo vw (RP.Fetch(RP.Var(name, i, targetwidth), targetwidth))
+        else e
+    | RP.Fetch(l, w) -> RP.Fetch(widen_loc l, w)
+    | RP.App(opr, es) -> RP.App(opr, List.map widen_exp es)
+    | e -> e
+  in
+  let widen_guarded (g, eff) =
+    let eff' = 
+      match eff with
+      | RP.Store(RP.Var(name, i, vw), r, sw) ->
+          if vw <> sw then
+            impossf "Store and var widths are not the same in %s::bits%i :=_%i %s"
+              name vw sw (RU.ToString.exp (Up.exp r))
+          else if vw < targetwidth
+          then
+            let ext =
+              try ext_of_fill (fst (lookup_gamma name vw)) with Not_found -> "zx"
+            in
+            RP.Store(RP.Var(name, i, targetwidth),
+                        RP.App((ext, [vw; targetwidth]), [widen_exp r]),
+                        targetwidth)
+          else RP.Store(RP.Var(name, i, vw), widen_exp r, sw)
+      | RP.Store(l, r, w) -> RP.Store(widen_loc l, widen_exp r, w)
+      | RP.Kill l         -> RP.Kill (widen_loc l)
+    in
+    (widen_exp g, eff') in
+  let r' =
+    let RP.Rtl es = Dn.rtl r in
+    Up.rtl (RP.Rtl (List.map widen_guarded es)) in
+  let () =
+    if Debug.on "widen-vars" && not (RU.Eq.rtl (Dn.rtl r') (Dn.rtl r)) then
+      (Printf.eprintf "rewritten to %s\n" (tostr r'); flush stderr) in
+  r'
+@ 
+
+Needs work: this function should only count those variables that need
+widening.
+NOTE: REMOVING THE H TYPE VOTING---SEE ANDREW WILKINS BUG FROM THE C-- LIST.
+<<widen.ml>>=
+let update_gamma_counts t r =
+  let add c i n = function
+    | G -> c
+    | Z -> {c with z=c.z+i; ni = n}
+    | S -> {c with s=c.s+i; ni = n}
+    | H -> c (* {c with h=c.h+i; ni = n} *)
+    | F -> c in
+  let update h x n t =
+    if Hashtbl.mem h x then Hashtbl.replace h x (add (Hashtbl.find h x) 1 n t)
+    else Hashtbl.add h x (add {z=0; s=0; h=0; ni=n} 1 n t) in
+  let targetwidth = t.Target.wordsize in
+  let rec loc fty = function
+    | (RP.Var(s,_,w)) -> 
+        if w < targetwidth then
+          (if Debug.on "gamma" then
+            Printf.eprintf "Updating count of %s: +%s\n" s (string_of_fill fty);
+           update gamma_counts s w fty)
+    | RP.Mem(_, _, e, _) -> ignore(exp fty e)
+    | RP.Slice(_, _, l)  -> loc fty l
+    | _ -> ()
+  and exp fty = function
+    | RP.Fetch(l, w) -> loc fty l; [fty]
+    | RP.App((opname, ws), es) ->
+        (try
+          let ftys = List.assoc opname op_fill_types in
+          ignore(List.map (fun (arg_ftys, _) -> List.map2 exp arg_ftys es) ftys);
+          List.map snd ftys
+        with _ -> [G])
+    | _ -> [G] in
+  let guard (g, eff) =
+    (match eff with
+    | RP.Store(l, r, w) -> List.iter (fun fty -> loc fty l) (exp G r)
+    | RP.Kill l -> ());
+    ignore(exp Z g) in
+  let RP.Rtl es = Dn.rtl r in
+  List.iter guard es
+@ 
+
+<<widen.ml>>=
+let init_gamma_counts () = Hashtbl.clear gamma_counts
+
+let create_gamma () =
+  let argmax z s h =
+    if z > h then
+      if z > s then Z
+      else S
+    else if h > s then H
+    else S
+  in
+  Hashtbl.clear gamma;
+  Hashtbl.iter (fun s c -> Hashtbl.add gamma s (argmax c.z c.s c.h, c.ni)) gamma_counts;
+  if Debug.on "gamma" then
+    (Printf.eprintf "Printing gamma:\n";
+     Hashtbl.iter (fun s (t,n) -> Printf.eprintf "Gamma |- %s :: %s[%i]\n" s (string_of_fill t) n) gamma)
+@ 
+
+\subsection{Counting operations and testing}
+<<widen.ml>>=
+let width_cost r =
+  let rec count_loc c = function
+    | RP.Mem(_,_,e,_) -> do_count c e
+    | RP.Slice(_,_,l) -> count_loc c l
+    | _               -> impossf "count_loc can only handle mem and slice"
+  and do_count ((sx, zx, lo) as c) = function
+    | RP.Const _ -> c
+    | RP.Fetch(l, w) -> c
+(* considering sx(const) the same as const *)
+    | RP.App ((("sx"|"zx"), _), [(RP.Const _ | RP.Fetch _)]) -> c
+    | RP.App (("sx", _), [arg]) -> do_count (sx+1, zx, lo) arg
+    | RP.App (("zx", _), [arg]) -> do_count (sx, zx+1, lo) arg
+    | RP.App (("lobits", _), [RP.Const(RP.Bits _)]) -> c
+    | RP.App (("lobits", _), [arg]) -> do_count (sx, zx, lo+1) arg
+    | RP.App ((opname, _), args) -> List.fold_left do_count c args
+  in
+  let do_count_guard counts (g, eff) =
+    let counts' = 
+      match eff with
+      | RP.Store(l, r, w) -> do_count counts r
+      | RP.Kill l         -> counts
+    in
+    do_count counts' g
+  in
+  let rtl = Rtlutil.ToString.rtl in
+  let _ = if print_debug then (Printf.eprintf "Counting %s\n" (rtl r); flush stderr) in
+  let (sx, zx, lo) =
+    let RP.Rtl es = Dn.rtl r in
+    List.fold_left do_count_guard (0, 0, 0) es
+  in
+  Printf.eprintf "Counted %i sx, %i zx, %i lo\n" sx zx lo;
+  (sx, zx, lo)
+@ 
+
+<<widen.ml>>=
+let app_count r =
+  let rec count_loc c = function
+    | RP.Mem(_,_,e,_) -> do_count c e
+    | RP.Slice(_,_,l) -> count_loc c l
+    | _               -> impossf "count_loc can only handle mem and slice"
+  and do_count c = function
+    | RP.Const _     -> c
+    | RP.Fetch(l, w) -> c
+
+    | RP.App ((("sx"|"zx"), _), [(RP.Const _ | RP.Fetch _)]) -> c
+    | RP.App (("lobits", _),    [RP.Const(RP.Bits _)])       -> c
+
+    | RP.App (_, args) -> 1 + List.fold_left do_count c args
+  in
+  let do_count_guard c (g, eff) =
+    let c' = 
+      match eff with
+      | RP.Store(l, r, w) -> do_count c r
+      | RP.Kill l         -> c
+    in
+    do_count c' g
+  in
+  let rtl = Rtlutil.ToString.rtl in
+  let _ = if print_debug then (Printf.eprintf "Counting %s\n" (rtl r); flush stderr) in
+  let count =
+    let RP.Rtl es = Dn.rtl r in
+    List.fold_left do_count_guard 0 es
+  in
+  Printf.eprintf "Counted %i ops\n" count;
+  count
+@ 

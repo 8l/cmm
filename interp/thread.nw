@@ -1,0 +1,357 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*- %
+
+\ifx\nointro\undefined
+This document contains the interface and implementation of {\PAL} threads.
+\fi
+
+% ----------------------------------------------------------------------------
+\interface{[[thread]] : {\PAL} Threads of Execution}
+% ----------------------------------------------------------------------------
+
+<<thread.h>>=
+#ifndef _THREAD_H
+#define _THREAD_H
+
+#include "intervals.h"
+#include "label.h"
+#include "types.h"
+#include "uid.h"
+#include "controlflow.h"
+
+<<type definitions>>
+<<function prototypes>>
+
+#endif /* _THREAD_H */
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Data Structures}
+% ----------------------------------------------------------------------------
+
+A {\PAL} thread may simply be realized as a separate activation stack.  
+
+For matters of $uid$ bookkeeping, we need to keep track of the next frame id
+to be handed out to a fresh activation, as well as a list of dead frame id's.  
+We use an [[interval_list]] to represent this list (see [[intervals.nw]]).  
+
+We maintain one stack internal to a thread; it is from this that we allocate
+space for [[activation]]s, local variables, and stackdata.
+The allocation of this stack is the responsibility of the front-end runtime
+client of the interpreter, not the [[thread]] module itself.
+Please see the section below on stack layout for more information about this
+stack.
+
+DJP: Previously, the thread structure contained the program counter, justified
+by the comment below.  I don't think this makes any sense; it should always be
+restored either from the continuation or from the activation.
+
+
+\quote{
+Additionally, we include a program counter in the [[thread]] structure.
+The idea of this is, in the runtime system, we might want to get some
+sort of ``handle'' on a resumption point of the youngest activation without
+yet changing the [[pc]] stored in this activation's actual [[activation]]
+record.
+}
+<<type definitions>>=
+struct thread {
+  unsigned int   next_frame_id;
+
+  void          *stack_base;
+  void          *stack_limit;
+
+  interval_list *dead_list;
+};
+
+typedef struct thread thread;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Stack Layout}
+% ----------------------------------------------------------------------------
+
+Stackdata, locals, and activation information are all stored on a thread's
+single stack.
+
+\begin{verbatim}
+
+ A diagram of the stack in a sample, non-suspended thread:
+
+   |----------|<--- stack_space pointer given to init_thread.
+   | thread   |
+   | structure|
+   |----------|<--- t->stack_base
+   |          |
+   | actptr_0 |
+   |----------|
+   |          |
+   | stackd_0 |
+   |__________|
+   |          |     
+   | locals_0 |
+   |__________|
+   |          |
+   |  act_0   | frame # 0 (oldest frame)
+___|__________|_____________
+   |          |
+   | actptr_1 |
+   |----------|
+   |          |
+   | stackd_1 | frame # 1 (youngest frame)
+   |__________|
+   |          |
+   | locals_1 |
+   |          |
+---|----------|<--- t->stack_free
+   |          |
+   |          | free space on stack
+
+
+   |          |
+   |----------|<--- t->stack_limit
+   
+\end{verbatim}
+
+This is a diagram of a sample non-suspended thread's stack.  The top of the
+drawing represents the oldest end of the stack; growth is drawn toward the
+bottom.  (In our implementation, growth is directed toward increasing
+addresses.)
+
+Note that some space at the oldest end of the stack is reserved for the
+interpreter's thread structure.  Thus, t->stack_base is not the same as
+the stack_space pointer given to init_thread.
+
+  When creating space for a new frame on the stack, we first carve out space
+for stackdata, and then we allocate space for locals.  The activation record 
+for a currently-running frame is not actually stored away on the stack until
+we must leave the frame for some reason (cut/call/etc.).  Until then, the
+activation record for the currently running frame is distributed across local C
+variables (in function [[run_interp]] of the [[interp]] module).
+  When we must leave a frame or suspend a frame's thread (in order to return 
+control to the runtime system or to cut to another thread), we write the
+activation record for the thread's youngest frame at the stack's extremum--just
+beyond the this frame's stackdata space (at [[t->stack_free]]).
+  If we left the frame to make a {\PAL} call, then we create space for the
+stackdata and locals of the callee's activation, and continue execution.
+When we resume the execution of a suspended thread, we pop the activation
+record of the suspended frame off the stack and resume execution.
+
+Note that all activations are of fixed size ([[sizeof(activation)]]). 
+Stackdata and locals space vary in size, depending on a specific activation's 
+needs (and on the memory alignment requirements of the host's architecture).
+
+Finally, a few more words on suspended threads.
+A suspended thread is essentially one that is not presently running through
+the interpreter; in such a thread, the youngest activation \emph{is} present
+atop the thread's stack--but it is distinguishable from an ordinary activation.
+Such a ``suspended activation'' has a [[NULL]] $\kappa$ field (its call-site 
+annotations) as well as a [[NULL]] [[callee]] field.
+
+A suspended activation might be found as the first initialized activation of a
+brand-new thread, as the youngest activation of a thread that had been
+running and then cut over to another thread, or as the youngest activation of
+a thread that transferred control to a C function or the runtime system.
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Functions}
+% ----------------------------------------------------------------------------
+
+Helper functions [[init_thread]] and [[find_thread]] assist in thread 
+management.
+
+[[init_thread]] initializes a new stack, given the label of a function to run, a 
+sufficient amount of pre-allocated stack space (this means that it is the
+front-end's responsibility to allocate stack space when it asks for a new 
+thread).
+[[init_thread]] returns a continuation.  Cutting to this continuation runs the
+given function on the new stack.  To get the underlying thread structure, call
+[[find_thread_c]] on this continuation.
+
+[[find_thread]] returns the thread uniquely identified by some [[uid]].
+
+[[Cmm_AllocFrame]] is a utility function that allocates a frame on the stack.
+
+<<function prototypes>>=
+continuation init_thread(CMM_label *lbl, void *stack_space, unsigned n);
+thread *find_thread(uid u);
+thread *find_thread_c(continuation* k);
+actptr actptr_from_sp(void* sp);
+activation* Cmm_AllocFrameFirst(int num_locals, int stackdata_size, void* stack_free, void* stack_limit);
+activation* Cmm_AllocFrameNext(int num_locals, int stackdata_size, void* sp, void* stack_limit);
+@
+
+% ----------------------------------------------------------------------------
+\implementation{{\PAL} Threads of Execution}
+% ----------------------------------------------------------------------------
+
+<<thread.c>>=
+#include "thread.h"
+
+#include <stdlib.h>
+#include "interp.h"
+#include "value.h"
+#include "activation.h"
+#include "table.h"
+
+<<function definitions>>
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Thread Initialization}
+% ----------------------------------------------------------------------------
+
+It takes a bit of work to initialize a new thread.
+
+Given sufficient space in memory, we set up a stack for storing stackdata,
+locals, and activations.
+See the section above on stack layout for more information on how exactly
+we allocate memory on the stack.
+
+We have to remember to initialize the [[thread]]'s fields, as well as set
+up the thread's first activation--in suspended state, of course.
+
+<<function definitions>>=
+continuation init_thread(CMM_label *lbl, void *stack_space, unsigned n) {
+  void   *stack_limit = (void *) (((u_int8 *) stack_space) + n);
+  continuation k;
+  k.code = CMM_label_location(lbl);
+
+  /* Allocate the thread structure at the bottom of the stack.
+   * This fixes a memory leak.
+   */
+  thread *t = (thread *) stack_space;
+  stack_space = t + sizeof(*t);
+  mem_assert(stack_space < stack_limit);
+
+  t->next_frame_id = 0;
+  
+  t->stack_base  = round_up(stack_space);  /* align to hardware requirements */
+  t->stack_limit = stack_limit;
+
+  t->dead_list   = interval_list_new();
+
+  <<set up first activation record>>
+
+  return k;
+}
+@
+
+When we initialize a thread, we start it off with an activation in a
+suspended state.
+The only difference between this suspended activation and a normal activation
+is that its [[kappa]] field (as well as its [[callee]] field) is left [[NULL]],
+for it was not called by any other activation.
+
+<<set up first activation record>>= 
+  assert(lbl != NULL);
+  assert(lbl->ty == CMM_PROCEDURE);
+  assert(lbl->lbl.proc != NULL);
+  {
+    /* actptr, stackdata, then locals (and then activation) */
+    actptr      act;
+
+    procedure  *start = lbl->lbl.proc;
+    assert(location_known(start->raddr));
+
+    act = Cmm_AllocFrameFirst(start->num_locals, start->stackdata_size, t->stack_base, t->stack_limit);
+
+    act->pc            = (bytecodeptr) location(start->raddr);
+    act->u             = new_uid(t);
+
+    /* leave kappa and callee NULL to indicate this is the end of a thread */
+    act->kappa         = NULL;
+    act->callee        = NULL;
+    act->caller        = NULL;
+
+    act->proc          = NULL;
+    act->name          = NULL;
+
+    /* Set stack pointer */
+    k.sp               = act->stackdata;
+  }
+@
+% ----------------------------------------------------------------------------
+\subsection{Helper Functions}
+% ----------------------------------------------------------------------------
+
+Recall that the thread id of a given [[uid]] is actually a pointer to the
+thread containing the activation uniquely identified by the [[uid]].
+
+[[find_thread]] returns the thread structure for a given [[uid]].
+[[find_thread_c]] returns the thread structure for a given continuation.
+
+<<function definitions>>=
+thread *find_thread(uid u) {
+  return (thread *) u.thread;
+}
+
+thread *find_thread_c(continuation* k) {
+  actptr a = actptr_from_sp(k->sp);
+  return find_thread(a->u);
+}
+
+actptr actptr_from_sp(void* sp) {
+  return *((actptr*) sp - 1);
+}
+
+activation* Cmm_AllocFrameFirst(int num_locals, int stackdata_size, void* stack_free, void* stack_limit)
+{
+    actptr* actptrptr;
+    void* stackdata;
+    void* stackdata_end;
+    void* locals;
+    void* locals_end;
+    activation* copy;
+
+    actptrptr     = stack_free;
+    stack_free = round_up((void *)((actptr *)(stack_free)+1));
+    mem_assert(stack_free <= stack_limit);
+
+    stackdata     = stack_free;
+    stack_free = round_up((void *) (((dataptr) stack_free) + stackdata_size));
+    stackdata_end = (dataptr) (stack_free);
+    mem_assert(stack_free <= stack_limit);
+
+    locals        = stack_free;
+    stack_free = (vptr)(stack_free) + num_locals;
+    locals_end    = (vptr) (stack_free);
+    mem_assert(stack_free <= stack_limit);                             
+
+    *actptrptr    = stack_free;
+
+    copy  = (actptr) stack_free;
+    stack_free  = round_up(((actptr) stack_free) + 1);
+    mem_assert(stack_free <= stack_limit);
+
+    copy->locals = locals;
+    copy->locals_end = locals_end;
+    copy->stackdata = stackdata;
+    copy->stackdata_end = stackdata_end;
+    
+    copy->caller = NULL;
+    copy->callee = NULL;
+
+    return copy;
+}
+
+activation* Cmm_AllocFrameNext(int num_locals, int stackdata_size, void* sp, void* stack_limit)
+{
+    activation* caller = actptr_from_sp(sp);
+    void* stack_free = round_up(caller + 1);
+    activation* callee = Cmm_AllocFrameFirst(num_locals, stackdata_size, stack_free, stack_limit);
+
+    callee->caller = caller;
+    caller->callee = callee;
+    
+}
+
+activation* Cmm_AllocFrame(int num_locals, int stackdata_size, void* sp, void* stack_free, void* stack_limit)
+{
+    if (sp == NULL) {
+        return Cmm_AllocFrameFirst(num_locals, stackdata_size, stack_free, stack_limit);
+    } else {
+        return Cmm_AllocFrameNext(num_locals, stackdata_size, sp, stack_limit);
+    }
+}
+@ 
+

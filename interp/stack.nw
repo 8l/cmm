@@ -1,0 +1,180 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*- %
+
+\ifx\nointro\undefined
+\ifx\nointro\undefined
+This document contains the interface and implementation of the stack data structure, as used heavily in the interpreter.
+\fi
+\fi
+
+% ----------------------------------------------------------------------------
+\interface{[[stack]] : Value Stacks}
+% ----------------------------------------------------------------------------
+
+<<stack.h>>=
+#ifndef _STACK_H
+#define _STACK_H
+
+#include "value.h"
+
+<<type definitions>>
+<<function prototypes>>
+<<macro definitions>>
+#endif /* _STACK_H */
+@ 
+
+A number of stacks are used in the interpreter, including the value stack and the activation stack.
+Additionally, stacks are used to store local variable environments ($\rho$ from the machine state) and local stack-data ($sp$).
+All of these stacks are represented in the same manner: as arrays.
+
+% ----------------------------------------------------------------------------
+\subsection{Data Structures}
+% ----------------------------------------------------------------------------
+
+We represent a stack pointer as a [[value *]], but create a [[typedef]]'d
+[[struct]] to represent an entire value stack data structure.
+In these [[struct]] records, we keep pointers to the beginning of a stack's
+array, the next free space in the array, and the limit of the array.
+
+<<type definitions>>=
+typedef value  *valsptr;      /* stack pointer */
+
+typedef struct {
+  valsptr s_base;
+  valsptr s_free;
+  valsptr s_limit;
+} valstack;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Facilities}
+% ----------------------------------------------------------------------------
+
+To ease the notational burden and to abstract away from some 
+representation-dependent details of accessing value stacks, we developed a few
+simple macros for use with value stacks.  Below are ``faux prototypes'' for 
+these macros; that is, if these macros were implemented as functions, the 
+functions would have the following prototypes:
+
+<<faux prototypes>>=
+value STACK_ELT(valstack s, int i);
+void  PUSH(value v, valstack s);
+value POP (value v, valstack s);
+void  UNDERFLOW_CHECK(valstack s, int n);
+void  OVERFLOW_CHECK (valstack s, int n);
+void  ASSERT_EMPTY   (valstack s);
+@ 
+
+[[stack_elt]] simply returns the [[i]]th element of value stack [[s]], 
+where [[STACK_ELT(s, 0)]] returns the top value on stack [[s]] and 
+[[STACK_ELT(s, -1)]] returns the next-to-top value on the stack.
+We additionally guarantee that calls to this macro evaluate to legal C lvalues.
+
+[[PUSH]] and [[POP]] push or pop a [[value]] atop a value stack, performing 
+underflow or overflow checks as necessary.
+[[UNDERFLOW_CHECK]] checks to make sure that the interpreter would not be 
+accessing an array out-of-bounds if it were to pop [[n]] [[value]]s off stack 
+[[s]], and [[OVERFLOW_CHECK]] checks for stack overflow resulting from [[n]] 
+push operations.
+[[ASSERT_EMPTY]] asserts that the given value stack [[s]] is empty; if [[s]]
+is non-empty, a runtime interpreter error is signalled.
+
+Helper function [[print_value_stack]] is mainly used for debugging purposes,
+and only outputs data when program verbosity is turned ON (see global variable
+[[verbosity]] in [[interp.nw]]).
+
+<<function prototypes>>=
+void  print_value_stack(valsptr s_free, valsptr s_base, const char *s_name);
+@
+
+% ----------------------------------------------------------------------------
+\implementation{Value Stacks}
+% ----------------------------------------------------------------------------
+
+<<stack.c>>=
+#include "stack.h"
+
+#include "interp.h"
+
+<<function definitions>>
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Macros}
+% ----------------------------------------------------------------------------
+
+Presently, we maintain the convention that the free-space pointer of a 
+[[value]] stack (e.g., [[values.s_free]]) points to the top stack value.  
+However, we provide a stack access macro that allows the rest of the code to
+be more or less ignorant of how exactly we maintain our pointers to [[value]]
+stacks.
+
+<<macro definitions>>=
+/* STACK_ELT(S, I) evaluates to the value on stack S indexed by I, such that:
+  
+   STACK_ELT(S, 0) evaluates to the top value on stack S
+   STACK_ELT(S, -1) evaluates to the next-to-top value on stack S
+   etc.
+
+   (note: STACK_ELT is only intended to work with the value stack and the 
+    argument stack)
+ */
+#define STACK_ELT(S, I)       ((S).s_free[(I)])
+@ 
+
+We provide convenience macros and functions to perform such common value stack 
+operations as pushing, popping, checking for underflow or overflow, printing 
+the contents of a stack, and asserting that a stack is empty.  
+Note that [[UNDERFLOW_CHECK]], [[OVERFLOW_CHECK]], and [[ASSERT_EMPTY]] all 
+depend on our naming convention for the C variables representing a value stack.
+Note that a call to [[print_value_stack]] only has a noticeable effect if
+the [[verbosity]] flag declared in [[interp.h]] is turned on.
+
+<<macro definitions>>=
+/* PUSH(V, S) pushes value V onto value stack S and returns void */
+
+#define PUSH(V, S)            ( OVERFLOW_CHECK(S, 1)                    \
+                              , (S).s_free++                            \
+                              , (STACK_ELT(S, 0)) = V                   \
+                              , print_value_stack((S).s_free, S.s_base, #S) \
+							  )
+
+/* POP(S) pops the value on top of stack S and returns it */
+#define POP(S)                ( UNDERFLOW_CHECK(S, 1)                       \
+                              , print_value_stack((S).s_free-1, S.s_base, #S) \
+                              , (S).s_free--                                \
+							  , STACK_ELT(S, 1)                             \
+                              )
+
+/* UNDERFLOW_CHECK(S, N) checks to make sure that popping N elements off stack
+   S will not cause it to underflow
+ */
+#define UNDERFLOW_CHECK(S, N) \
+cmm_assert(((S).s_free - (S).s_base > -1), \
+           "failed underflow check on empty stack ["#S"]")
+
+/* OVERFLOW_CHECK(S, N) checks to make sure that pushing N elements onto stack
+   S will not cause it to overflow
+ */
+#define OVERFLOW_CHECK(S, N)  \
+cmm_assert(((S).s_limit - (S).s_base >= 0), \
+           "failed overflow check on full stack ["#S"]")
+
+#define ASSERT_EMPTY(S) \
+cmm_assert(((S).s_free + 1 == (S).s_base), \
+           "stack [" #S  "] not empty at call/return/cut")
+@ 
+
+<<function definitions>>=
+void print_value_stack(valsptr s_free, valsptr s_base, const char *s_name) {
+  if (!verbosity) return;
+  printf("stack [[%s]]: ", s_name);
+  if (s_free < s_base) {
+    printf("<EMPTY>\n");
+    return;
+  }
+  for ( ; s_free > s_base; s_free--) {
+    printf("%u, ", (unsigned) (s_free->bits32));
+  }
+  printf("%u\n", (unsigned) (s_free->bits32));
+}
+@ 

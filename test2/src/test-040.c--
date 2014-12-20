@@ -1,0 +1,56 @@
+
+// execute the commands below to use this file as a test case
+//
+
+target byteorder little;
+import player, players, makeMove, getMove, Exn_illegalMove, Exn_NoMoreTiles;
+
+bits32 next, movesTried;
+const EXN = 1;
+
+section "text" 
+{
+    TryAMove ()
+    {
+        bits32 s, t;
+        span EXN ex1 {
+            t = getMove(player) 
+                also returns to c1
+                also returns to c2;
+            makeMove(t)
+                also returns to c1
+                also returns to c2;
+            t = bits32[players];
+            next = (next + 1) `modu` t;
+        }
+
+        finish:
+        movesTried = movesTried -1 ;
+        return ;
+                
+        continuation c1 ():
+        t = bits32[bits32[player+12]];
+        t(s);
+        goto finish;
+
+        continuation c2 ():
+        t = bits32[bits32[player+12]];
+        t(lit1);
+        goto finish;
+        
+    }
+}
+
+section "data" 
+{
+    lit1:   
+        bits8[] "not enugh tiles left\000";
+    ex1:
+        align 4;
+        bits32 {2};
+        bits32 {Exn_illegalMove};
+        bits32 {0};
+        bits32 {Exn_NoMoreTiles};
+        bits32 {-1};
+
+}

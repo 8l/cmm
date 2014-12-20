@@ -1,0 +1,213 @@
+
+% ------------------------------------------------------------------ 
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+\section{Alternative Parser Combinators}
+% ------------------------------------------------------------------ 
+
+<<pc2.mli>>=
+(*  ------------------------------------------------------------------ 
+
+    $Id: pc2.nw,v 1.3 2002-06-05 19:32:14 lindig Exp $
+  
+    This module provides parser combinators.  Parsers are build from
+    primitive parsers which can be combined to larger paresers by
+    parser combinators.  Parser combinators are described in the
+    following article:
+  
+        Graham Hutton, Higher-Order Functions for Parsing, J of
+        Functional Programming 2(3):323-343, July 1992
+  
+    Parsers in this implementation do not return a list of results but
+    only one result for efficency reasons.
+    ------------------------------------------------------------------ *)
+    
+
+exception Error of string
+(* [Error] reports parse errors *)
+
+type ('t, 'v) par   = 't list -> 'v * 't list
+
+(* A parser [par] takes a list of tokens ['t] and returns a value ['v]
+   together with a remaining ['t list] of unconsumed tokens.  BTW: 
+   "parser" is a keyword in OCaml and so could not be used for the
+   type declaration.
+
+   This module provides functions to create primitve parsers and
+   parser combinators which combine parsers to new parsers. The
+   primitive parsers are declared first.
+
+   All parsers are greedy - so beware: although they look much like
+   regular expressiones they have different semantics. 
+*)
+
+
+val succeed: 'v -> ('t,'v) par 
+(* [succeed] consumes no token and returns result v *)
+
+val fail: string -> 'a
+(* [fail] raises [Error] with a descriptive message *)
+
+val any: ('t,'t) par
+(* [any] consumes the next token and returns it as result.  Fails if
+   there is no next token *)
+
+val eof: ('t,bool) par
+(* [eof] succeeds when the end of input is reached, that is, there
+   are no more tokens to consume *)
+
+val satisfy: ('t -> bool) -> ('t,'t) par
+(* [satisfy f] returns the next token as result if it satisfies
+   predicate [f], fails otherwise *)
+
+val literal: 't -> ('t,'t) par
+(* [literal x] succeeds if the next token is [x], fails otherwise *)
+
+(*
+ *  Parser combinators - they combine existing parsers to new ones.
+ *  Precedence of the new operators; operators that bind more tightly 
+ *  (have higher precedence) come first:
+ *
+ *  p1 *-* p2, f % p    both left associative
+ *  p1 <|> p2           left associative
+ *
+ *  A typical production looks like this:
+ *
+ *  let plus =    (fun left _ right -> left + right)
+ *              % mult *-* literal "+" *-* mult
+ *  
+ *  First comes the semantic action with a parameter for each 
+ *  parser in the following sequence (*-*) of parsers.
+ *  Semantic actions (%) and sequences (*-*) interact very closely with
+ *  each other. It is nearly impossible to have a sequence without a
+ *  semantic action. 
+ *)  
+ 
+val (<|>) : ('t,'v) par -> ('t,'v) par -> ('t,'v)  par
+(* [p1 <|> p2] succeeds when either [p1] or [p2] succeeds. [p1] is tried 
+ * first and only when it fails [p2] is tried. Both parsers must
+ * return a semantic value of the same type.  
+ *)
+ 
+val ( *-* ) : ('t, 'y -> 'z) par -> ('t, 'y) par -> ('t, 'z) par
+(* [p1] is used to parse the input and then
+ * [p2] the remaining input.  [p1 *-* p2] applies the function
+ * returned by parser [p1] to the result of parser [p2]. This operator 
+ * interacts with the [%] operator which helps to provide the right
+ * functions for [p1].
+ *)
+
+val (%) : ('x -> 'y) -> ('t, 'x) par -> ('t, 'y) par
+(* [f % p] applies [f] to the semantic value returned by parser [p].
+ * See above for the interaction with the sequence operator [*-*].
+ *)  
+
+ val many: ('t,'v)  par -> ('t,'v list)   par
+(* [many p] applies p as often as possible to the input and 
+ * returns a list of results *)
+   
+val some: ('t,'v)  par -> ('t,'v list) par
+(* [some p] tries to apply [p] as often as possible to the input, at
+ * least one time.  Returns a list of length >= 1 on success.  *)
+
+val opt: ('t,'v)  par -> 'v -> ('t,'v) par
+(* [opt p v] tries to apply [p] to the input and returns its sementic value on success
+ * and [v] if [p] fails.  *)
+@
+
+<<pc2.ml>>=
+(*  ------------------------------------------------------------------ 
+    $Id: pc2.nw,v 1.3 2002-06-05 19:32:14 lindig Exp $
+
+    Copyright (c) 1999 Christian Lindig <lindig@ips.cs.tu-bs.de>. All
+    rights reserved. See COPYING for details.
+  
+    This module provides parser combinators.  Parsers are build from
+    primitive parsers which can be combined to larger paresers by
+    parser combinators.  Parser combinators are described in the
+    following articles:
+  
+        Graham Hutton, Higher-Order Functions for Parsing, J of
+        Functional Programming 2(3):323-343, July 1992
+
+        Deterministic, Error-Correcting Combinator Parsers, 
+        S. Doaitse Swierstra and Luc Dupomched, Dept. of Computer
+        Science, Utrecht University, http://www.cs.ruu.nl 
+        
+    The parsers and combinators in this module are a mixture of the 
+    above cited approaches.
+    ------------------------------------------------------------------  *)
+
+(* error reporting, used for parse errors *)
+    
+exception Error of string
+let error s = raise (Error s)
+
+(*  ------------------------------------------------------------------ 
+    Every parser returns a pair: result * (remaining_token list) 
+    Naming conventions: t=token, ts=token list, v=value, p=parser
+    ------------------------------------------------------------------  *)
+
+type ('t,'v) par = 't list -> 'v * ('t list)
+
+(*  ------------------------------------------------------------------ 
+    Primitive parsers - they can be combined to larger parsers using
+    the parser combinators from below.
+    ------------------------------------------------------------------  *)
+
+let succeed v ts = (v,ts)
+let fail msg     = error msg
+
+let any = function
+    | []        -> fail "token expected but none found"
+    | t::ts     -> succeed t ts
+
+let eof = function
+    | []        -> succeed true []
+    | _         -> fail "end of input expected but token found"
+
+let satisfy f = function 
+    | []        -> fail "satisfy parser: no input" 
+    | t::ts     -> if f t 
+                   then succeed t ts
+                   else fail "token does not satisfy predicate"
+
+let literal x = satisfy ((=) x)
+
+(* ------------------------------------------------------------------  
+    From the OCaml lexer: all infix operators. Operators with
+    lower precedence come first
+    
+    %left  INFIXOP0 EQUAL LESS GREATER      /* = < > | ^ $  */
+    %right INFIXOP1                         /* @ ^          */
+    %left  INFIXOP2 SUBTRACTIVE             /* + -          */
+    %left  INFIXOP3 STAR                    /* * / %        */
+    %right INFIXOP4                         /* **           */
+    ------------------------------------------------------------------ *) 
+
+let (<|>) p1 p2 = fun ts ->
+    try p1 ts with 
+    Error _ ->  try p2 ts with
+                Error _ -> fail "all alternatives failed"
+
+let ( *-* ) p1 p2 = fun ts0 ->
+    let (f,ts1)  = p1 ts0 in
+    let (v,ts2)  = p2 ts1 in
+    	(f v, ts2)
+
+let (%) f p = (succeed f) *-* p 
+
+let opt p v = p <|> succeed v
+
+let rec many p = fun ts ->
+    ((fun x xs -> x::xs) 
+  % p *-* (many p <|> succeed [])) ts
+    
+let some p = 
+    (fun x xs -> x::xs) 
+  % p *-* many p
+@

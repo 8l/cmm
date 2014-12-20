@@ -1,0 +1,389 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+% l2h substitution C C--
+% l2h substitution asdl ASDL
+% l2h substitution ocaml OCaml
+% l2h substitution forall forall
+% l2h substitution to ->
+% l2h substitution rtl RTL
+
+%%Grades: B Central Immediate
+
+% ------------------------------------------------------------------  
+\section{Types}\label{sec:types}
+% ------------------------------------------------------------------  
+
+Expressions in {\PAL} are type checked. This module provides types and
+type checking functions for {\rtl} operators. 
+
+Conditions in {\PAL} have type [[bool]], values types [[bits]]$n$. These
+two are the basic types. {\PAL} and their closely related {\rtl}
+operators have polymorphic function types. The typical case is an
+operator like [[add]]:
+
+$$[[add]]: \forall~n.[[bits]]n \times [[bits]]n \to [[bits]]n$$
+
+The result size of [[add]] is the size of its arguments. A concrete
+instance like $n=32$ is called a (function) type. The general scheme is
+called a (polymorphic) \emph{type scheme}.
+
+{\PAL} has a number of operators whose types are a bit more complicated
+than that of [[add]]. The first complication is illustrated by the
+[[zx]] operator. The [[zx]] operator widens a value by filling high
+bits with zeros. In {\PAL} the width of the result is encoded into the
+name: [[zx32]] widens a value to 32 bits; its type scheme can be thought
+of like this:
+
+$$[[sz32]]: \forall~n.[[bits]]n \to [[bits32]]$$
+
+However, this is not the way [[zx]] is implemented in the compiler. All
+{\PAL} operators are translated to {\rtl} operators that are allowed to
+be polymorphic in the result size. The general [[sz]] operators has the
+following type:
+$$[[sz]]: \forall~n,m.[[bits]]n \to [[bits]]m$$
+The translation (in \module{rtlop}) of [[sz32]] into [[sz]] takes care
+that $m$ is bound to $32$.
+
+The second complication is introduced by multiplication operators like
+[[mulx]]:
+$$[[mulx]]: \forall~n,m.[[bits]]$n$ \times [[bits]]$n$ \to [[bits]]m, m = 2n$$
+The result of a multiplication is twice as wide as the operands. This
+constraint cannot be easily expressed in the above formalism using bound
+variables. We therefore have to employ a little hack to express it.
+
+The same goes the other way round, the result of a [[div]] operator is
+half the width of its operands.
+
+% ------------------------------------------------------------------ 
+\subsection{Interface (Types)}
+% ------------------------------------------------------------------ 
+
+The parameterized type [['a t]] describes either a type [[ty]] when 
+[['a]] equals [[int]], or a type scheme, when [['a]] is a [[size]]. In a
+type scheme the width of a value is one of the following:
+\begin{itemize}
+\item A constant, like 32.
+\item A bound variable. To maximize confusion, variables are identified
+      by integers. Maybe we should switch to characters. Bound variables
+      allow to express that two values in a function type have the same
+      width.
+\item The size of a another bound variable, times two. This is a hack to
+      express the result width of a multiplication operator, as explained
+      above.
+\end{itemize}
+<<exported type definitions>>=
+<<definition of type [[size]]>>
+type 'a t = Bool
+          | Bits of 'a 
+type ty   = int t
+@
+The type of a function is a pair of a list of operand types and a result
+type. A [[tyscheme]] describes a type scheme, a [[monotype]] the
+instance of a type scheme.
+<<exported type definitions>>=
+type tyscheme = (size t) list * (size t)
+type monotype = (int  t) list * (int  t)
+@
+Unlike in the formalism that uses $\forall$ to bind type variables
+explicitly, type variables in the implementation are bound implicitly:
+The [[tyscheme]] for the [[add]] and [[mulx]] primitves are encoded as
+follows:
+\begin{quote}
+    \begin{verbatim}
+add:  ([Bits(Var 1); Bits(Var 1)], Bits(Var 1))
+mulx: ([Bits(Var 1); Bits(Var 1)], Bits(Double 1))
+    \end{verbatim}
+\end{quote}
+The [[Var 1]] values identify the variable in the type scheme that is
+replaced by an integer when the type scheme is instantiated. In case of
+[[mulx]], the size of the result is twice the number of bits [[Var 1]]
+gets bound to.
+@
+% ------------------------------------------------------------------ 
+\subsection{Interface (Functions)}
+% ------------------------------------------------------------------ 
+
+The [[appl]] function implements the type checking of arguments that are
+supplied to a primitive function: given the [[tyscheme]] to describe the
+primitive, and the list of argument [[ty]]s, [[appl]] returns the type
+of the primitive's result. In case the primitive's [[tyscheme]] can not
+be instantiated such that the supplied argument type match, the error
+exception is raised.
+
+Each function takes a first argument that is the name of the operator
+being applied.
+<<appl>>=
+val appl      : string -> tyscheme -> ty list -> ty       (* raises Error.ErrorExn *)
+val widthlist : string -> tyscheme -> ty list -> int list (* raises Error.ErrorExn *)
+@
+Instantiation of a type scheme fails  when a type scheme contains a
+variable in the result position that does not also show up in an
+argument position. This indicates a checked run-time error in the type
+specification of a primitive and should never happen.  
+
+The [[widthlist]] function takes the type of a primitive (a
+[[tyscheme]]) and a list of argument types and returns the sizes bound
+by the variables in the type scheme.
+<<appl>>=
+val split : string -> string * int option     (* RTL op name, return width *)
+@
+Some operators encode the size of their return values in their name:
+[[zx32]] is the zero-extension function that returns a 32 bit value.
+The [[split]] function returns the operator name (without the numbers)
+and the size of the return value, if it exists:
+<<appl>>=
+val instantiate: tyscheme -> widths:int list -> monotype
+@
+An operator inside an {\rtl} is monomorphic. It carries a \emph{width
+list} that allows to reconstruct the monomorphic type from its
+polymorphic type scheme. This process is called instantiation. It is a
+checked run-time error if the width list is too short to instantiate all
+variables in the type scheme.
+@
+% ------------------------------------------------------------------ 
+\subsection{Useful abbreviations}
+% ------------------------------------------------------------------ 
+
+When dealing with type the same types are used over and over again. 
+Here are some useful definitions for them.  There are at least three
+target dependent types:  the native word type [[word]], the native
+code pointer type [[code]], and the native data pointer type.  We
+define types for them here, but only for the moment. 
+<<abbrevs>>=
+val fixbits : int -> size t              (* fixed/constant size       *)
+val var     : key -> size t              (* variable size             *)
+val double  : key -> size t              (* doubled width - see above *)
+val half    : key -> size t              (* halfed width  - see above *)
+val bool    : 'a t                       (* bool                      *)
+val bits    : 'a -> 'a t
+val proc    : size t list -> size t -> tyscheme   (* build proc type  *)
+  (* keys used in sizes must be dense, or an unchecked RTE [SHOULD BE CHECKED] *)
+val largest_key : tyscheme -> key
+  (* return the largest key in the type scheme, or 0 if no keys *)
+@
+Finally, here we put together the interface file.
+<<types.mli>>=
+<<exported type definitions>>
+<<appl>>
+<<abbrevs>>
+val to_string     : ty -> string
+val scheme_string : tyscheme -> string
+@
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+A substitution associates a width variable (identified by an [[int]])
+with an integer bit width. We use a map to implement a substitution.  In
+addition to the functions provided by [[Map]] we define some helper
+functions. 
+<<definition of type [[size]]>>=
+type key  = int
+type size = Const  of int
+          | Var    of key
+          | Double of key      
+          | Half   of key
+<<types.ml>>=
+<<exported type definitions>>  (* types from the interface definition *)
+@
+\emph{Rather than having a fixed operator [[Double]] we could implement a
+map: [[Fun of key * (int -> int)]]. The key indentifies a width
+variable, and ultimately a width. We take it, and apply the function to
+obtain a new width. In our case the function is simply multiplication by
+two. I haven't thought about this, but would in the general case expect
+problems with circular dependencies among types. What is the right
+formalism here? -- CL}
+@ 
+<<types.ml>>=
+module E = Error
+module S = Map.Make(struct type t=key let compare=compare end)
+
+let impossf fmt = Printf.kprintf Impossible.impossible fmt
+
+let to_string = function
+  | Bool -> "bool"
+  | Bits n -> "bits" ^ string_of_int n
+
+let lookup key env = S.find key env 
+let dump env       = let f key data res = (key,data)::res in S.fold f env []
+@
+To check that the application of an operator is well typed, we
+\emph{match} the type scheme of the operator against the operand types.
+A match takes a type scheme and a type, and produces a substitution. The
+substitution records bindings for width variables, resulting from a
+match between a constant width and a variable width. These are the
+important cases:
+\begin{itemize}
+\item A type variable width matches with a fixed width; this leads to an
+      instantiation of the variable that is recorded in the
+      substitution.
+\item A width variable might have been instantiated; thus the
+      instantiation must be looked up in the substitutions and checked
+      against the fixed width.
+\end{itemize}
+The [[match]] function matches a [[tyscheme]] with a [[ty]] and
+returns a substitution.  In case of a mismatch, [[matchExn]] is
+raised. 
+
+We never expect to see a [[Double]] constructor during matching. It should
+only show up in the result position of a function type. Since only the
+argument positions are matched, we should never see it here. However,
+a succeeding match can bind a width variable that \emph{is} mentioned in
+a [[Double]] result position.
+
+\emph{Is it possible to define a general match function where [[Double]]
+can show up in all positions? -- CL}
+<<types.ml>>=
+let match' opname sigma expected actual =
+  let to_string' = function
+    | Bool -> to_string Bool
+    | Bits (Const x) -> to_string (Bits x)
+    | Bits (Var x) when S.mem x sigma -> to_string (Bits (lookup x sigma))
+    | Bits _ -> "bitsxxx (not easily identified)" in
+  let badarg () =
+    E.errorf
+      "operator %%%s expected argument of type %s, got %s (in unspecified position)"
+      opname (to_string' expected) (to_string actual) in
+  match expected, actual with
+    | Bool          , Bool                      -> sigma
+    | Bits(Const x) , Bits y when x = y         -> sigma
+
+    | Bits(Var x)   , Bits y when S.mem x sigma -> if lookup x sigma = y then sigma
+                                                   else badarg()
+    | Bits(Var x)   , Bits y                    -> S.add x y sigma
+    
+    | Bits(Double x), Bits y when S.mem x sigma ->
+        if (lookup x sigma) * 2 = y then sigma else badarg()
+    | Bits(Double x), Bits y                    -> S.add x (y/2) sigma
+    
+    | Bits(Half x)  , Bits y when S.mem x sigma ->
+        if (lookup x sigma) / 2 = y then sigma else badarg()
+    | Bits(Half x)  , Bits y                     -> S.add x (y*2) sigma
+    
+    | _             , _                          -> badarg()
+@
+The [[subst]] function applies a substitution [[sigma]] to a [[size t]]
+and returns a [[ty]].  In the context of C-- this must always succeed,
+because primitive operators are predefined and only their type schemes
+are used for matching and substitution.
+<<types.ml>>=
+let subst opname sigma = function
+    | Bool             -> Bool
+    | Bits(Const x)    -> Bits x
+    | Bits(Var x)      -> (try Bits(lookup x sigma) with Not_found -> 
+        E.errorf "operator %%%s is polymorphic;\n    to indicate the size, \
+                  use a suffix such as %%%s32" opname opname)
+    | Bits(Double x)   -> (try Bits(2*(lookup x sigma)) with Not_found ->
+                                impossf "internal error (2) in application")
+    | Bits(Half x)     -> (try Bits((lookup x sigma)/2) with Not_found ->
+                                impossf "internal error (3) in application")
+@
+The [[appl]] function matches the argument types with the [[size t]]
+values at the argument positions of a [[tyscheme]].  The resulting
+substitution is applied to the result [[size t]] to get the result
+[[ty]].
+<<types.ml>>=
+let wrongargs opname args' args =
+  E.errorf "operator %s expected %d arguments, got %d"
+    opname (List.length args') (List.length args)
+
+let appl opname (args',r) args =
+  let sigma = try List.fold_left2 (match' opname) S.empty args' args with
+              | Invalid_argument _ -> wrongargs opname args' args in
+  subst opname sigma r
+@
+The [[widthlist]] function takes the type of a primitive (a
+[[tyscheme]]) and a list of argument types and returns the sizes bound
+by the variables in the type scheme.
+<<types.ml>>=
+let widthlist opname (args',r) args =
+  let sigma = try List.fold_left2 (match' opname) S.empty args' args with
+              | Invalid_argument _ -> wrongargs opname args' args in
+  let sorted = List.sort (fun (key1,_) (key2,_) -> compare key1 key2) (dump sigma) in
+  List.map snd sorted
+@
+The implementation of [[spilt]] uses regular expressions to split off
+a trailing number.
+<<types.ml>>=
+let rtlop = Str.regexp "^\\([A-Za-z0-9_]*[A-Za-z_]\\)\\([0-9]+\\)?$"
+
+let split op =
+    let matched n l = Str.matched_group n l in  
+    if Str.string_match rtlop op 0 then
+        let basename = matched 1 op in
+        let size     = try Some (int_of_string (matched 2 op))
+                       with Not_found -> None in
+            (basename, size)
+    else
+        impossf "illegal operator %%%s?" op
+@            
+[[Instantiate]] computes a monomorphic function type from a width list
+and a polymorphic [[tyscheme]] by instantiating it. The $n$-th element
+in the (zero based) width list instantiates [[Var]] $n+1$ in the
+[[tyscheme]]. It is a checked run-time error if [[tyscheme]] contains a
+variable [[Var]] $x$ where $x > |[[width]]|$. 
+<<types.ml>>=
+<<key size>>
+let instantiate ((args,ret):tyscheme) ~widths  =
+  if List.length widths <> largest_key (args, ret) then
+    impossf "instantiated %d-key type scheme with %d widths"
+      (largest_key (args, ret)) (List.length widths);
+  let inst = function
+    | Bits (Var i)   -> ( try Bits (List.nth widths (i-1)) with 
+                        | Failure _ -> assert false
+                        ) 
+    | Bits (Double i)-> ( try Bits (2 * (List.nth widths (i-1))) with 
+                        | Failure _ -> assert false
+                        )
+    | Bits (Half i)  -> ( try Bits ((List.nth widths (i-1))/2) with 
+                        | Failure _ -> assert false
+                        )
+    | Bits (Const k) -> Bits k
+    | Bool           -> Bool in
+  (List.map inst args, inst ret)
+@        
+The implementation of the abbreviations is trivial:
+<<types.ml>>=
+let fixbits x        = assert (x > 0); Bits(Const x)
+let var    x         = assert (x > 0); Bits(Var x)
+let double x         = assert (x > 0); Bits(Double x)
+let half   x         = assert (x > 0); Bits(Half x)
+let bool             = Bool
+let bits x           = Bits x
+let proc args res    = (args,res)
+@
+<<key size>>=
+let largest_key (args, res) =
+  let rec count k = function
+    | [] -> k
+    | (Bool | Bits (Const _)) :: ws -> count k ws
+    | (Bits (Var n) | Bits (Double n) | Bits (Half n)) :: ws -> count (max k n) ws in
+  count 0 (res :: args)
+@ 
+<<types.ml>>=
+let keyname = function
+| 1 -> "n"
+| 2 -> "m"
+| n -> Printf.sprintf "t%d" (n-2)
+
+let scheme_string (args, result) =
+  let spr = Printf.sprintf in
+  let ty = function 
+    | Bits (Var i)    -> spr "#%s bits"   (keyname i)
+    | Bits (Double i) -> spr "2*#%s bits" (keyname i)
+    | Bits (Half i)   -> spr "#%s/2 bits" (keyname i)
+    | Bits (Const k)  -> spr "#%d bits"   k
+    | Bool            -> "bool" in
+  let scheme = match args with
+  | _ :: _ -> String.concat " * " (List.map ty args) ^ " -> " ^ ty result 
+  | [] -> ty result in
+  match largest_key (args, result) with
+  | 0 -> scheme
+  | n -> spr "\\/ %s . %s" (String.concat ", " (List.map keyname (Auxfuns.from 1 ~upto:n)))
+                           scheme

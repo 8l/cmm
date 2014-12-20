@@ -1,0 +1,129 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 sw=4 et sts=4
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+%%Grades: 
+
+% inc: \usepackage{alltt}
+
+The [[also unwinds to]] convention supports a limited set of C types.
+These types are lifted from Fraser and Hanson's [[lcc]] compiler.
+To help the run-time system, we can print out an enumeration type for
+these C types.
+To help the author of a front end, we can print out this set of types,
+with the corresponding \PAL\ declaration.
+Note that the \PAL\ declarations differ depending on whether the C function
+uses varargs.
+<<ctypes.mli>>=
+<<types>>
+val enum_int : string -> int
+(*
+val ctypes_vararg_enum : string
+val ctypes_vararg_str  : string
+*)
+@
+From lcc, we steal the following C types:
+<<types>>=
+type 'a ctypes = { char               : 'a
+                 ; double             : 'a
+                 ; float              : 'a
+                 ; int                : 'a
+                 ; long_double        : 'a
+                 ; long_int           : 'a
+                 ; long_long_int      : 'a
+                 ; short              : 'a
+                 ; signed_char        : 'a
+                 ; unsigned_char      : 'a
+                 ; unsigned_long      : 'a
+                 ; unsigned_short     : 'a
+                 ; unsigned_int       : 'a
+                 ; unsigned_long_long : 'a
+                 ; address            : 'a
+                 }
+@
+For each type, we need a string representation of the type, the width of the type,
+and the width to which the type is promoted when passed to a varargs function.
+<<types>>=
+type width   = int
+type metrics = { w : width; va_w : width}
+@
+
+<<ctypes.ml>>=
+<<types>>
+module SM = Strutil.Map
+let sprintf = Printf.sprintf
+let fetch_ct ct str = match str with
+  | "char"               -> ct.char
+  | "double"             -> ct.double
+  | "float"              -> ct.float
+  | ""                   -> ct.int 
+  | "int"                -> ct.int 
+  | "long double"        -> ct.long_double
+  | "long int"           -> ct.long_int
+  | "long long int"      -> ct.long_long_int
+  | "short"              -> ct.short
+  | "signed char"        -> ct.signed_char
+  | "unsigned char"      -> ct.unsigned_char
+  | "unsigned long"      -> ct.unsigned_long
+  | "unsigned short"     -> ct.unsigned_short
+  | "unsigned int"       -> ct.unsigned_int
+  | "unsigned long long" -> ct.unsigned_long_long
+  | "address"            -> ct.address
+  | s -> Impossible.impossible (sprintf "Unexpected C type %s\n" s)
+
+let ct_foldi f ct z = 
+ let f str = f str (fetch_ct ct str) in
+ f "char" (f "double" (f "float" (f "int" (f "long double"
+   (f "long int" (f "long long int" (f "short" (f "signed char"
+   (f "unsigned char" (f "unsigned long" (f "unsigned short"
+   (f "unsigned int" (f "unsigned long long" (f "address" z))))))))))))))
+let ct_fold f = ct_foldi (fun _ x -> f x)
+@
+This description of the X86's types should probably fit somewhere in the [[Target.t]].
+<<ctypes.ml>>=
+let x86_ctypes =
+  { char               = {w = 8 ; va_w = 32}
+  ; double             = {w = 64; va_w = 64}
+  ; float              = {w = 32; va_w = 64}
+  ; int                = {w = 32; va_w = 32}
+  ; long_double        = {w = 96; va_w = 96}
+  ; long_int           = {w = 32; va_w = 32}
+  ; long_long_int      = {w = 64; va_w = 64}
+  ; short              = {w = 16; va_w = 32}
+  ; signed_char        = {w = 8 ; va_w = 32}
+  ; unsigned_char      = {w = 8 ; va_w = 32}
+  ; unsigned_long      = {w = 32; va_w = 32}
+  ; unsigned_short     = {w = 16; va_w = 32}
+  ; unsigned_int       = {w = 32; va_w = 32}
+  ; unsigned_long_long = {w = 64; va_w = 64}
+  ; address            = {w = 32; va_w = 32}
+  }
+@
+<<ctypes.ml>>=
+let enum_ct =
+  { char               = ("CHAR"            , 0)
+  ; double             = ("DOUBLE"          , 1)
+  ; float              = ("FLOAT"           , 2)
+  ; int                = ("INT"             , 3)
+  ; long_double        = ("LONGDOUBLE"      , 4)
+  ; long_int           = ("LONGINT"         , 5)
+  ; long_long_int      = ("LONGLONGINT"     , 6)
+  ; short              = ("SHORT"           , 7)
+  ; signed_char        = ("SIGNEDCHAR"      , 8)
+  ; unsigned_char      = ("UNSIGNEDCHAR"    , 9)
+  ; unsigned_long      = ("UNSIGNEDLONG"    , 10)
+  ; unsigned_short     = ("UNSIGNEDSHORT"   , 11)
+  ; unsigned_int       = ("UNSIGNEDINT"     , 12)
+  ; unsigned_long_long = ("UNSIGNEDLONGLONG", 13)
+  ; address            = ("ADDRESS",          14)
+  }
+let ctypes_vararg_enum ct =
+  let str_lst = ct_fold (fun (s,id) rst -> (sprintf "%s = %d" s id)::rst) enum_ct [] in
+  Printf.sprintf "{ %s }" (String.concat ", " str_lst)
+let enum_int h = snd (fetch_ct enum_ct h)
+@

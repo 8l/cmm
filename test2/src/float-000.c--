@@ -1,0 +1,24 @@
+
+// execute the commands below to use this file as a test case
+//
+
+target byteorder little;
+
+
+const     x = 2::bits64 + 3.1415::bits64;
+
+section "data" 
+{
+    a:
+    bits32[5];
+    b: bits64[] { x };
+    fmt: bits8[] "pi with 2 ulps is %18g\n\0";
+}
+
+import printf; export main;
+
+foreign "C" main(bits32 argc, "address" bits32 argv) {
+  foreign "C" printf("address" fmt, "float" bits64[b]);
+  foreign "C" return(0);
+}
+

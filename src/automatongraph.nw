@@ -1,0 +1,412 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 et sw=4
+%
+% $Id: automatongraph.nw,v 1.20 2006-03-08 22:33:11 nr Exp $
+%
+
+% ------------------------------------------------------------------ 
+\section{Automaton-Graph}
+% ------------------------------------------------------------------ 
+
+The Quick {\PAL} compiler represents a calling convention as an
+automaton [[Automaton.t]]. When a client supplies a \emph{type} to an
+automaton it advances to a new state. A type is a triple:
+a width, a kind, and an alignment.
+The state
+of an automaton comprises a set of register locations and the alignment
+of a memory block. We are interested in a graph representation of the
+reachable states: states form the nodes, and transitions the edges of
+the graph. For any realistic calling convention the set of reachable
+states in its automaton and the corresponding edges should be finite.
+The module traverses the state graph and emits it for analysis.
+
+Function [[print]] takes a function [[mk]] and a list of types.
+The [[mk]] argument creates an automaton in
+its initial state.
+Function [[print]] prints all
+edges of the automaton to [[stdout]] in the Dot language.  The types
+ are used to construct requests: in every state of the
+automaton, every type is explored to reach
+a new state.
+
+Function [[paths]] works like [[print]] but emits all ``interesting''
+argument lists. An argument list corresponds to a path in an automaton.
+Together, all argument lists cover every pair of an incoming and
+outgoing edge at a node.
+
+Function [[summary]] prints the number of nodes, edges, and paths.
+<<automatongraph.mli>>=
+type ty = int * string * int (* width * kind * alignment *)
+val print: mk:(unit -> Automaton.t) -> ty list -> unit
+val paths: mk:(unit -> Automaton.t) -> ty list -> unit
+val summary : what:string -> mk:(unit -> Automaton.t) -> ty list -> unit
+@
+I now realize that the [[graph]] type defined in the implementation is
+basically an isomorphism of the automaton defined in \module{automaton}.
+Given the graph, the underlying automaton can be simulated.  After this
+realization I changed the type definition of [[graph]] to make
+simulation easy. This should help to apply Bailey's algorithm to
+automatongraph.ml.
+
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+The basic idea is simple: we start from the initial state of an
+automaton and explore all outgoing edges. An edge is labeled with a
+type, which is a triple of width, kind, and alignment. As long as we find new
+edges we continue depth first. The graph should be finite because a
+typical calling convention has only a limited set of registers and a
+limited set of stack alignments. Once the graph is explored, we can
+print it.
+
+The state of an automaton can only be observed after is was
+\emph{frozen}. This presents a small difficulty: to observe a given
+state, we have to freeze it. But to follow a new edge we need an
+unfrozen automaton. Thus, we have to re-construct the automaton's
+current state such that we can make the transition. To do that, we
+maintain a \emph{path} of types that allows to reconstruct the state of
+the automaton, starting from the initial state of an automaton. This in
+turn requires to create an automaton in its initial state when needed.
+
+
+<<automatongraph.ml>>=
+module A    = Automaton
+let sprintf = Printf.sprintf
+let printf  = Printf.printf
+@
+A type is a width, kind, and alignment.
+Types label edges in the graph.
+A path is a list of types that indirectly describes the state of an
+automaton: starting from the initial state, the types are forming a
+path. When they are fed into the automaton, the automaton advances its
+state accordingly. (The same state may be represented by different
+paths.)
+
+<<automatongraph.ml>>=
+type ty = int * string * int (* width * kind * alignment *)
+type path =     ty list                         (* leads to a node *)
+@
+A [[node]] is the observable state of an automaton. It comprises the set
+of allocated registers and the alignment of the next slot in the
+overflow memory block. The register set inside a node forces us to
+define a [[compare_nodes]] function since sets have no normal form.
+<<automatongraph.ml>>=
+type node    =  { regs:     Register.Set.t
+                ; align:    int
+                }
+
+let compare_nodes (x:node) (y:node) =
+    ( match compare x.align y.align with
+    | 0 -> Register.Set.compare x.regs y.regs
+    | x -> x
+    )
+@
+An [[edge]] is a node where an edge originates and a label that
+identifies the outgoing edge.  The destination of the edge is uniquely
+defined in the [[graph]], but is not part of the [[edge]] type.
+<<automatongraph.ml>>=
+type edge =     node * ty
+
+let compare_edges (x:edge) (y:edge) =
+    ( match Pervasives.compare (snd x) (snd y) with
+    | 0 -> compare_nodes (fst x) (fst y)
+    | x -> x
+    )
+@
+A [[graph]] value records for every [[edge]] its endpoint in [[edges]],
+The map models a transition function $\mathit{node} \times \mathit{type}
+\to \mathit{node}$. An [[edge]] is therefore only meaningful in the
+context of a [[graph]] which provides the map. In addition, the
+[[graph]] maintains a set of all nodes, and a [[start]] node,
+corresponding to the start state of the automaton.
+<<automatongraph.ml>>=
+module NS = Set.Make (struct type t=node let compare=compare_nodes end)
+module ES = Set.Make (struct type t=edge let compare=compare_edges end)
+module T  = Map.Make (struct type t=edge let compare=compare_edges end)
+
+type graph =    { nodes:    NS.t            (* all the nodes *)
+                ; start:    node            (* start node    *)
+                ; edges:    node T.t        (* transition: node*ty => node *)
+                }
+
+let graph node = { nodes = NS.add node NS.empty
+                 ; start = node
+                 ; edges = T.empty
+                 }
+@
+
+Several other definitons of [[graph]] would have been possible. This
+definition is close to the underlying automaton such that it is easy to
+follow edges in the same way the automaton changes its state.
+
+We have a membership predicate for edges and a function to [[add]]
+edges. We maintain the following invariant: the origin of an edge is
+already in the set of node when we call [[add]], we thus only have to
+add the destination node.
+
+<<automatongraph.ml>>=
+let mem edge graph = T.mem edge graph.edges     (* is edge in graph? *)
+let add (n,t as edge) node graph =              (* add endpoint of edge *)
+    assert (NS.mem n graph.nodes);
+    { graph with edges = T.add edge node graph.edges
+               ; nodes = NS.add node graph.nodes }
+@
+
+For debugging, the [[ToString]] module provides us with a function to
+represent all our types as strings. Feel free to improve this. 
+
+<<automatongraph.ml>>=
+module ToString = struct
+    let register ((sp,_,_),i,_) = sprintf "$%c%i" sp i
+    let ty (width,kind,a) = sprintf "%s::%d@%d" kind width a
+    let align n           = sprintf "%i:" n
+    let node s            = let regs = Register.Set.elements s.regs in
+                            String.concat "" 
+                                ((align s.align):: List.map register regs)
+    let edge src label dst= sprintf "%s --%s--> %s"
+                                (node  src)
+                                (ty    label)
+                                (node  dst)
+    let path p            = String.concat " "  (List.map ty p) 
+    let paths ps          = String.concat "\n" (List.map path ps)
+    let graph g = 
+        let add_edge (src,label) dst strs = edge src label dst :: strs in
+        let edges = T.fold add_edge g.edges [] in
+            String.concat "\n" edges
+end
+@
+Below is a rather ugly emitter for the AT\&T graph layouter Dot. This is
+now the standard output format.
+<<automatongraph.ml>>=
+module ToDot = struct
+    let size = function
+        | 32 -> ""
+        | 64 -> "q"
+        | n  -> sprintf ":%d" n
+        
+    let register ((sp,_,ms),i,c) = sprintf "$%c%i%s" sp i (size (Cell.to_width ms c))
+    let ty (width,kind,a) = sprintf "%s::%d@%d" kind width a
+    let node s            = let regs = Register.Set.elements s.regs in
+                            sprintf "\"%i:%s\"" 
+                                        s.align 
+                                        (String.concat "" 
+                                            (List.map register regs))
+    let edge src label dst= printf "%s -> %s [label=\"%s\"]\n"
+                                (node  src)
+                                (node  dst)
+                                (ty    label)
+    
+    let path p            = String.concat " "  (List.map ty p) 
+    let paths ps          = List.iter (fun s -> printf "%s\n" s)
+                                                (List.map path ps)
+    
+    let graph g = 
+        ( printf "digraph \"calling convention\" {\n"
+        ; printf "// nodes=%d \n" (NS.cardinal g.nodes)
+        ; printf "size=\"9,6\"\n"
+        ; printf "ratio=fill\n"
+        ; let print_edge (src,label) dst () = edge src label dst  in
+            T.fold print_edge g.edges () 
+        ; printf "}\n"
+        )
+end
+@
+[[goto]] takes a function [[mk]] that creates an automaton in its initial
+state, and a [[path]] (of types). It feeds [[path]] through the automaton,
+and returns the reached state as a [[node]].
+<<automatongraph.ml>>=
+let goto mk path =
+    let t    = mk ()                        in
+    let ()   = List.iter (fun (w,h,a) -> ignore (A.allocate t w h a)) path in
+    let res  = A.freeze t in
+        { regs  = res.A.regs_used     
+        ; align = res.A.align_state
+        }
+@
+Given an abstract location, we would like to know the registers it
+contains. To find out, we use a trick: we store a (possibly ill-sized)
+constant into the location and receive an {\rtl} for this operation.
+This we can analyse and should find the registers we are looking for.
+<<automatongraph.ml>>=
+let registers loc =
+    let c   = Rtl.bits (Bits.zero 32) 32 in
+    let rtl = A.store loc c 32 in
+    let (read, written) = Rtlutil.ReadWrite.sets rtl in
+        written
+@    
+The heart of the algorithm are two mutually recursive functions, [[dfs]]
+and [[follow]]. The depth-first search function [[dfs]] explores a
+[[graph]] in all direction, starting from [[node]]. [[Follow]]
+specifically explores a [[node]] by following a potentially new edge
+labeled with [[ty]].
+
+Both functions take common arguments [[mk]], [[dirs]], [[path]], and the
+current [[graph]]. [[mk]] creates the automaton under investigation in
+its initial state when applied to [[()]]. [[dirs]] is the list of all
+labels for outgoing edges that are explored from the current node.
+[[path]] allows to reconstruct the state of the current [[node]] by
+passing it with [[mk]] to [[goto]].
+
+From the current node, we follow an edge labeled with [[ty]]. If this
+edge hasn't been seen before, we add it to the graph and then follow it
+(reaching [[node']]) From there we explore all outgoing edges
+recursively depth first.
+
+Allocating a location for [[ty]] has led us from [[node]] to [[node']].
+We like to check that the location for [[ty]] wasn't used before:
+\begin{itemize}
+\item 
+If [[ty]] is passed in a register, [[node'.regs]] must include it;
+more specifically, [[node.regs]] must be a subset of [[node'.regs]].
+\item 
+If [[ty]] is passed in memory, the alignment of [[node']] should
+differ from [[node]]. However, this is not 100\% sure. There may exist
+parameters that are so large that they cause to alignment to wrap in
+which case we cannot observe a difference. This corresponds to a seld
+loop in the automaton. 
+\end{itemize}
+<<automatongraph.ml>>=
+let rec follow (mk:unit->Automaton.t) (dirs: ty list) graph path node ty =
+    let path  = path @ [ty]  in
+    let node' = goto mk path in
+    let edge  = (node,ty)    in
+    if mem edge graph then
+        graph
+    else
+        (* assert (Register.Set.subset node.regs node'.regs) *)
+        dfs mk dirs (add edge node' graph) path node'
+
+and dfs mk dirs graph path node =   (* call this *)
+    List.fold_left 
+        (fun graph ty -> follow mk dirs graph path node ty) graph dirs
+@
+Finally, here is the function we export. 
+Function
+[[mk]] creates an automaton in its initials state. The initial graph
+contains the node corresponding to the initial state and is otherwise
+empty.
+<<automatongraph.ml>>=
+let _dump g = print_endline (ToString.graph g)
+
+let print ~mk dirs =
+    let init    = {regs=Register.Set.empty; align=0}   in
+    let g       = graph init            in
+    let g       = dfs mk dirs g [] init in
+    ToDot.graph g
+@
+
+% ------------------------------------------------------------------ 
+\subsection{automatongraph.ml}
+% ------------------------------------------------------------------ 
+
+To test a calling convention, we like to find interesting parameter
+lists, which correspond to automatongraph.ml in a [[graph]]. The goal is
+to find enough paths such that for any node, each pair of incoming and
+outgoing edge is covered by at leat one path. This criterion was
+proposed by Bailey in his Ph.D.~thesis. The parameter list that
+corresponds to a path is simply the list of edge labels. 
+
+The alogithm by Bailey is a variant of a depth-first search: we move
+along edges and collect their labels in a list called [[path]]. When we
+come to a node, we build (reversed) parameter lists by taking our path
+and prefixing it with each of the labels of the node's outgoing edges:
+say, our current path is $w$ and the labels of the outgoing edges are
+$a$, $b$, and $c$, so we build the parameter lists $aw$, $bw$ and $cw$.
+Next we mark the edge on which we reached the node.  This implies that
+we have generated parameter lists that cover our incoming edge and all
+outgoing edges of the node we just reached.  We continue on all
+\emph{unmarked} outgoing edges; we extend our path with the label of the
+chosen edge, as we move along.  The algorithms carries two main results:
+the set of visited edges, and the generated argument lists. The
+functional implementation passes them around; a more imperative
+algorithm could also use global state.  
+
+[[next]] returns the [[node]] at the end of an edge.
+
+<<automatongraph.ml>>=
+let next graph edge = T.find edge graph.edges
+@
+
+[[outgoing]] returns the labels (types) on outgoing edges of a given
+[[node]].
+
+<<automatongraph.ml>>=
+let outgoing graph node =
+    let add_label (src, label) dst labels =
+        if compare_nodes src node = 0 then label :: labels else labels
+    in    
+        T.fold add_label graph.edges []
+@
+
+All paths and parameter lists are reversed, because we append results in
+the front.
+
+The [[explore]] function implements the depth-first algorithm explained
+above. 
+\begin{itemize}
+\item [[visited]] is the set of visited (or marked) edges. We never
+       follow a marked edge to reach new nodes.
+\item [[path]] is the reversed list of types that lead from the start
+      node of the graph to the current [[node]].
+\item [[paths]] are constructed parameter lists. For efficiency, it is a
+      list of path lists that is flattened later.
+\item [[node]] is the node we just reached having followed [[path]].       
+\item [[labels]] are the labels on outgoing edges of [[node]].
+\end{itemize}
+
+The [[follow]] function follows an edge to a new node. It
+carries the visited edges and parameter lists constructed so far. If the
+current edge is already marked, it is not followed, but the current
+result is just returned. Otherwise the edge is marked, the current path
+extened and the reached recursively explored.
+
+<<automatongraph.ml>>=
+let rec explore graph (visited:ES.t) (path:path) (paths:path list list) node =
+    let labels  = outgoing graph node in
+    let paths  = (List.map (fun l -> l::path) labels) :: paths in
+    let follow (node, ty as edge) visited paths =
+        if ES.mem edge visited then
+            (paths, visited)    (* do nothing, return result *)
+        else
+            explore 
+                graph (ES.add edge visited) (ty::path) paths (next graph edge)
+    in
+        List.fold_left 
+            (fun (paths,visited) edge -> follow edge visited paths)
+            (paths,visited)
+            (List.map (fun ty -> (node,ty)) labels)
+@
+
+I have tested this code by looking at the number of paths generated for
+a graph: for every node with $i$ incoming and $o$ outgoing edges,
+$i\times o$ paths are generated. The start node has only $n$ outgoing
+edges, for each of which one paths is generated. Overall, $n+i\times o$
+paths must be generated. For the single test case with 13 nodes and 54
+paths, the result was correct. 
+
+The main function extracts the parameter lists, flattens and reverses
+them.
+<<automatongraph.ml>>=
+let interesting_paths graph = 
+    let (paths,_) = explore graph ES.empty [] [] graph.start in
+        List.map List.rev (List.concat paths)
+
+let paths ~mk dirs =
+    let init    = {regs=Register.Set.empty; align=0}   in
+    let g       = graph init           in
+    let g       = dfs mk dirs g [] init in
+        ToDot.paths (interesting_paths g)
+
+let mapsize m = T.fold (fun _ _ n -> n + 1) m 0
+
+let summary ~what ~mk dirs =
+    let init    = {regs=Register.Set.empty; align=0}   in
+    let g       = graph init           in
+    let g       = dfs mk dirs g [] init in
+    Printf.printf "Automaton graph for %s has %d nodes, %d edges, %d paths\n" what
+      (NS.cardinal g.nodes) (mapsize g.edges) (List.length (interesting_paths g))
+
+
+

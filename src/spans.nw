@@ -1,0 +1,76 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 sw=4 et sts=4
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+% inc: \usepackage{alltt}
+
+
+% ------------------------------------------------------------------ 
+\section{Representing spans, including internal spans}
+% ------------------------------------------------------------------ 
+
+This module would love to hide the representation of spans, but for
+reasons involving horrid circular dependencies, it doesn't hide the
+represntation very well. 
+All the truth about what the representation means lives off in the
+[[Runtimedata]] module.
+<<spans.mli>>=
+type t
+type label   = string
+type link    = Reloc.t
+type aligned = int
+val to_spans : inalloc:Rtl.loc -> outalloc:Rtl.loc -> ra:Rtl.loc ->
+               users:((Bits.bits * link) list) ->
+               csregs:((Register.t * Rtl.loc option) list) ->
+               conts:((label * Rtl.loc * (string * int * aligned) list) list) ->
+                          (* (ra, sp, parms : (hint, var number, alignment) list) *)
+               sds:(Rtl.loc list)                          ->
+               vars:(Rtl.loc option array)                 ->
+               t
+<<regrettably exposed [[rep]] type>>
+val expose : t -> rep
+@ 
+That was the fig leaf.  Now we expose it.
+<<regrettably exposed [[rep]] type>>=
+type rep =
+  { mutable inalloc  : Rtl.loc
+  ; mutable outalloc : Rtl.loc
+  ; mutable ra       : Rtl.loc
+  ; mutable users    : (Bits.bits * link) list
+  ; mutable csregs   : (Register.t * Rtl.loc option) list
+  ; mutable conts    : (label * Rtl.loc * (string * int * aligned) list) list
+  ; mutable sds      : Rtl.loc list
+  ; mutable vars     : Rtl.loc option array
+  }
+@
+To walk the stack, we need to keep the stack pointer, previous stack pointer,
+and return address live.
+We provide a function to fold over live locations in the span.
+Unfortunately, the [[CFG]] needs to call this function, so it goes here.
+<<spans.mli>>=
+val fold_live_locs : (Register.x -> 'a -> 'a) -> t -> 'a -> 'a
+@
+<<spans.ml>>=
+type label = string
+type link  = Reloc.t
+type aligned = int
+<<regrettably exposed [[rep]] type>>
+type t = rep
+let to_spans ~inalloc ~outalloc ~ra ~users ~csregs ~conts ~sds ~vars =
+  { inalloc = inalloc; outalloc = outalloc; ra = ra; users = users; csregs = csregs;
+    conts = conts; sds = sds; vars = vars; }
+let expose spans = spans
+@
+We apply the input function to each of the locations we need to maintain live.
+<<spans.ml>>=
+let fold_live_locs f spans z =
+  let fold = Rtlutil.Fold.RegX.loc f in
+  let foldcsreg z = function (_, Some l) -> fold l z | (_, None) -> z in
+  List.fold_left foldcsreg (fold spans.inalloc (fold spans.outalloc (fold spans.ra z)))
+                           spans.csregs
+@

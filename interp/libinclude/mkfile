@@ -1,0 +1,28 @@
+TOP       = ../..
+
+<$TOP/config/config.mk
+<$TOP/config/install.mk
+
+HEADERS    = qc--interp.h
+
+all:V:      $HEADERS
+all.opt:V:  all
+
+depend:V: $HEADERS
+
+install:V: all $install_inc
+	cp qc--interp.h $install_inc/qc--interp.h
+
+install.opt:V: install
+
+clobber:V:    
+  rm -f $HEADERS
+
+# ------------------------------------------------------------------
+# rules and tools 
+# ------------------------------------------------------------------
+
+<$TOP/config/noweb.mk
+
+&.h:D: &.nw
+        $NOTANGLE -L -R$target $prereq > $target

@@ -1,0 +1,716 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 sw=4 et:
+%
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+% $Id: automaton.nw,v 1.82 2006-08-24 21:19:41 dias Exp $
+
+%%Grades: A Central Later
+
+
+% ------------------------------------------------------------------ 
+\section{Automaton-Based Slot Allocation}
+% ------------------------------------------------------------------ 
+
+\emph{The predicates for [[choice]] and [[first_choice]] take [[width]]
+and [[kind]] in different orders. Maybe we should define an extra type
+alias. --CL}
+
+This module supports Bailey-Davidson automata for allocating locations
+for value-passing.
+An automaton manages a set of hardware locations, which it uses to
+satisfy allocation requests.
+In the Bailey-Davidson framework, the set of locations is split into
+two parts:
+\begin{itemize}
+\item
+A finite set of locations, which may be managed arbitrarily
+\item
+An infinite set of locations, which must be allocated sequentially and
+contiguously
+\end{itemize}
+We call the infinite set of locations the \emph{overflow block}.
+@
+The overflow block has a number of properties.
+\begin{itemize}
+\item
+The overflow block has a \emph{maximum alignment}.
+This alignment is the maximum possible alignment of any location in
+the block, and it is a function of the calling convention.
+\item
+The overflow block has a \emph{direction of growth}.
+\item
+The overflow block has a \emph{number of bytes allocated}.
+\end{itemize}
+The maximum alignment and direction of growth are fixed when the
+overflow block is created; the number of bytes allocated increases
+monotonically during allocation.
+@
+The Bailey-Davidson automaton has two parts: a finite-state control
+that manages the finite set of locations, and an infinite-state
+control for the overflow block.
+The infinite set of states is mapped to a finite set by considering
+only the number of bytes allocated modulo the maximum alignment.
+We use a value of type [[Memalloc.t]] to manage this part of the
+automaton.
+@
+The interface exports abstract types, concrete types, and values.
+<<automaton.mli>>=
+<<abstract types>>
+<<exposed types>>
+<<registration types>>
+<<exported values>>
+@ 
+\subsection{Standard kinds}
+
+We might use these kinds:\\
+\begin{tabular}{>{\ttfamily}ll}
+signed& Signed integer\\
+unsigned& Unsigned integer\\
+address&  Address\\
+float&    Floating-point value\\
+\end{tabular}\\
+A missing or empty kind is assumed to be [[unsigned]].
+@
+\subsection{Observer-Mutator interface}
+An [[Automaton.t]] encapsulates mutable state.  
+Allocating a location mutates its state.
+After allocation is completed, an automaton is \emph{frozen},
+and it can no longer be mutated.
+A~frozen automaton gives us an overflow block, its state, and the set
+of locations handed out.
+The set implicitly includes every location in the overflow block; the
+rest of the set is explicit.
+<<abstract types>>=
+type t
+<<exposed types>>=
+type result =
+  { overflow    : Block.t
+  ; regs_used   : Register.Set.t
+  ; mems_used   : Rtl.loc list
+  ; align_state : int   (* final alignment state of overflow block *)
+  }
+@ 
+We allocate a location by identifying a value's type, which in {\PAL}
+is a width and a kind.
+<<exported values>>=
+val allocate : t -> width:int -> kind:string -> align:int -> loc
+val freeze   : t -> result
+@
+In some conventions, a value must be split between two registers or
+between registers and memory.
+Accordingly, we need a special type of location: an object with fetch
+and store methods.
+<<exposed types>>=
+type width = int
+type kind  = string
+type loc = Rtlutil.aloc =
+    { fetch  : width -> Rtl.exp
+    ; store  : Rtl.exp -> width -> Rtl.rtl
+    }
+<<exported values>>=
+val fetch  : loc ->            width -> Rtl.exp
+val store  : loc -> Rtl.exp -> width -> Rtl.rtl
+@ 
+Most locations are easy.
+<<exported values>>=
+val of_loc : Rtl.loc -> loc
+@ 
+\subsection{Constructor interface}
+Most clients will simply use an automaton, but some will need to
+create one.
+For these a representation with two functions: an allocator, and
+something that implements [[freeze]].
+The allocator takes an additional alignment, which it uses if it has
+to put the value in memory.
+If called directly from [[val allocate]], the alignment is always~$1$,
+but it may be changed by upstream implementations.
+The [[freeze]] function accumulates information about locations handed
+out, which information it passes to the right. 
+At the very end is the overflow block.
+<<exposed types>>=
+type methods =
+    { allocate : width: int -> alignment: int -> kind: string -> loc
+    ; freeze   : Register.Set.t -> Rtl.loc list -> result
+    } 
+@ To get an instance of an automaton, we need to provide a memory
+space and a start address for the overflow block.
+(I'M CONCERNED THAT WE USE A START ADDRESS HERE BUT TYPICALLY USE A
+BASE ADDRESS ELSEWHERE.  THIS DIFFERENCE MAY CAUSE PROBLEMS FOR THINGS
+THAT GROW DOWN.) 
+<<exported values>>=
+val at         : Rtl.space -> start:Rtl.exp -> stage -> t
+val of_methods : methods -> t
+@ 
+The idea is that we build an implementation by a composition of
+stages.
+We provide stages that change alignment, adjust widths, hand out
+locations, and so on.
+In addition, we expect that a client might write its own stages.
+<<abstract types>>=
+type stage
+<<exported values>>=
+val ( *> ) : stage -> stage -> stage
+@ 
+Because it's a nuisance to manage the threading of the [[start]]
+parameter through the stages, we provide a function that lets clients
+build their own stages.
+<<exported values>>=
+val wrap   : (methods -> methods) -> stage
+@ 
+\paragraph{The overflow block, if any}
+The final stage in any implementation is the overflow block.
+To make an overflow block, you need a bunch of information about the
+machine and a bunch of information about the convention.
+<<exported values>>=
+val overflow : growth:Memalloc.growth -> max_alignment:int -> stage
+@ 
+It is possible to have {no} overflow block.
+In this case, it's up to clients to gather that only finitely many
+requests are made and that the automaton satisfies all of them.
+Such an automaton is useful for conventions in which only finitely 
+many values can be passed,  such as the C~return
+convention.
+@ 
+\paragraph{Selection and adjustment of width}
+The [[widths]] stage can restrict the convention to satisfy only
+requests naming a listed width.
+<<exported values>>=
+val widths : int list -> stage
+@
+The [[widen f]] stage  alters a request for a
+width~[[w]] so it has a width [[f w]], which must be at least as large as~[[w]].
+The widening operation depends on the kind.
+For a little-endian machine passing values in memory, widening an
+unsigned integer or address is
+equivalent to adding padding.
+For a big-endian machine, it isn't.
+It is an unchecked run-time error for [[f]] to return a result that is
+less than its argument.
+<<exported values>>=
+val widen  : (int -> int) -> stage
+@ We expect stages such as
+[[Automaton.widen (Auxfuns.round_up_to ~multiple_of:32)]] 
+to be useful.
+@
+\paragraph{Adjustment of alignment}
+If a value must be allocated in memory, it needs an alignment.
+All alignments start out at~1, but we can provide a function that
+maps a width to an alignment.
+Danger Will Robinson!
+The argument to the function is a width in \emph{bits}, but the
+alignment is a size in \emph{bytes} (actually the unit is not the byte
+but the cell size of target memory).
+<<exported values>>=
+val align_to : (int -> int) -> stage
+@ 
+\paragraph{Allocation of registers}
+Although it may not be terribly useful, we provide a simple stage that
+hands out registers sequentially.
+To satisfy a request, the stage takes the first~$n$ registers, where
+$n$~is chosen such that the number of bits in these registers is
+exactly the number of bits in the request.
+If there is no such~$n$, it barfs with an error message.
+<<exported values>>=
+val useregs : Register.t list -> bool -> stage
+@ The [[useregs]] stage is stateful; a register handed out in response
+to an earlier request cannot be used to satisfy a later request.
+@
+See the paper for these.
+(The boolean value that [[regs_by_bits]] and [[regs_by_args]]
+expect to receive indicates whether you would like normal semantics
+or "reserve" semantics: allocate a register if available, pass
+request on to successive stages, throw away any allocations they
+make, and return the register.  [[false]] indicates normal semantics
+and [[true]] turns on reserve semantics.)
+<<abstract types>>=
+type counter = string
+type counterenv
+<<exported values>>=
+val bitcounter  : counter -> stage
+val regs_by_bits: counter -> Register.t list -> bool -> stage
+
+val argcounter  : counter -> stage
+val regs_by_args: counter -> Register.t list -> bool -> stage
+
+val pad         : counter -> stage
+@ 
+And this is documented nowhere, not even in the paper.  It is used
+to post-process the results from a [[freeze]] request.  For example,
+\module{mipscall.nw} uses [[postprocess]] to require that the overflow
+block is padded with an extra 16-byte block.
+<<exported values>>=
+val postprocess : stage -> (result -> result) -> stage
+@
+\paragraph{Combination of multiple stages}
+It can be useful to hand out different registers from different piles.
+For example, we might want to use floating-point registers to satisfy
+[["float"]] requests and integer registers to satisfy other requests.
+The following combinator makes it possible to use different stages for
+different requests.
+Because the stages don't communicate, it is probably not too useful
+for describing C~conventions (C~varargs hell), but it should be useful
+for {\PAL} conventions.
+
+The idea is that for an allocation, we use the first stage for which
+the predicate is satisfied.
+It is a checked run-time error if no predicate is satisfied.
+<<exposed types>>=
+type choice_predicate = int -> string -> counterenv -> bool
+<<exported values>>=
+val choice : (choice_predicate * stage) list -> stage
+@ To help create predicates we provide several convenience functions.
+<<exported values>>=
+val counter_is : counter -> (int -> bool) -> choice_predicate
+val is_kind    : kind                     -> choice_predicate
+val is_width   : int                      -> choice_predicate
+val is_any     :                             choice_predicate
+@ 
+\paragraph{Using an automaton as a stage}
+
+Although it is not necessary for calling conventions, we have found it
+convenient to abuse the abstraction by using an automaton [[inner]] as
+a stage in an [[outer]] automaton.
+The idea is to use [[as_stage inner]] as a stage.
+When this stage receives an allocation request, it passes the request
+to the [[inner]] automaton.  
+Thus [[as_stage inner]] behaves like an overflow block: it is the
+final stage in its automaton, and it has no successor.
+But when the [[outer]] automaton is frozen, it has no effect on the
+[[inner]] automaton, which can continue to satisfy allocation
+requests.
+<<exported values>>=
+val as_stage : t -> stage
+@
+\paragraph{Other forms of history}
+
+Most calling conventions keep track of little history beyond knowing
+what locations have been used.
+The MIPS convention is unusual in that the placement a second
+parameter, if of floating-point type, may be placed in one of two
+different available locations depending on the type of the first
+parameter. 
+My solution is to enable an automaton to ``become'' another on the
+basis of the first allocation request.
+Because these things can be chained, I~believe the solution may be
+general.
+
+The first time an allocation reaches this stage, we select the
+first alternative satisfying the predicate.
+Thereafter \emph{the whole automaton behaves as this alternative}.
+If no choice is ever made, the automaton freezes as the first
+alternative.
+It is a checked run-time error if no predicate is satisfied.
+<<exported values>>=
+val first_choice : (choice_predicate * stage) list -> stage
+@ 
+
+QUESTION FOR MARK BAILEY: HAS HE CAREFULLY ANALYZED WHAT CLASS OF
+AUTOMATA CAN BE SPECIFIED IN CCL?
+
+\paragraph{The unit stage}
+The [[unit]] stage does nothing, passing on an allocation
+or freeze request straight to the stages that follow it in the pipeline.
+It may be useful either as a default stage within a [[choice]] stage
+(along with the [[is_any]] primitive) to make sure we don't fall off
+the end of the [[choice]], or with [[List.fold_right]] in OCaml to compose a
+list of stages into one stage (using the [[*>]] operator).
+
+<<exported values>>=
+val unit : stage
+@
+\paragraph{Debugging}
+<<exported values>>=
+val debug : counter -> (int -> string -> int -> int -> unit) -> stage
+@ 
+\paragraph{Lua Registration of Calling Conventions}
+Ideally it would be nice for these types to sit in some other module
+(maybe \module{call.nw}?) but there are some dependency issues that force
+it to be in here for now.
+<<registration types>>=
+type cc_spec  = { call : stage; results : stage; cutto : stage }
+type cc_specs = (string * cc_spec) list
+@
+<<exported values>>=
+val init_cc : cc_specs
+@ 
+\section{Implementation}
+
+Those internal types not fully defined in the interface:
+<<hidden types>>=
+type counter    = string
+type counterenv = string -> int ref option
+<<hidden types that refer to [[methods]]>>=
+type t = methods
+type implementation = I of (start:Rtl.exp -> space:Rtl.space -> ctrs:counterenv -> t)
+type stage = S of (implementation -> implementation)
+@ 
+
+During a debugging session I reviewed the [[Exclude]] submodule and
+believe it is correct. However, I did not review the handling of
+[[cellcount]]. --CL
+
+<<automaton.ml>>=
+<<hidden types>>
+<<exposed types>>
+<<hidden types that refer to [[methods]]>>
+
+module R   = Rtl
+module RS  = Register.Set
+module B   = Block
+module M   = Memalloc
+let impossf fmt = Printf.kprintf Impossible.impossible fmt
+let unimp  = Impossible.unimp
+@ 
+The big idea here is hooking up the end of the pipeline:
+<<automaton.ml>>=
+let ( *> ) (S f1) (S f2) = S (fun rhs -> f1 (f2 rhs))
+
+let pipeline_end = I (
+  fun ~start ~space ~ctrs -> 
+    let block = Block.at ~base:start ~size:0 ~alignment:1 in
+    { allocate = (fun ~width ~alignment ~kind -> impossf
+                  "fell off end of pipeline -- multiple return values from C?")
+    ; freeze   =
+      (fun regs mems -> 
+       {overflow = block; regs_used = regs; mems_used = mems; align_state = 0})
+    })
+@
+All the work of the implementation is in the closures.
+<<automaton.ml>>=
+let at space ~start (S s) =
+  let I f = s pipeline_end in
+    f ~start ~space ~ctrs:(fun _ -> None)
+
+let of_methods t                     = t
+let allocate   t ~width ~kind ~align = t.allocate width align kind
+let freeze     t                     = t.freeze Register.Set.empty []
+
+let fetch  loc = loc.fetch
+let store  loc = loc.store
+let of_loc loc = { fetch  = R.fetch loc; store = R.store loc }
+@ 
+\subsection{Wrapping etc.}
+
+There's substantial bookkeeping in passing the start address around.
+We prefer to program in terms of [[methods]] rather than
+implementation.
+\nwaddbox{wrap         : (methods                   -> methods) -> stage}
+\nwaddbox{swrap        : (methods -> start:Rtl.exp -> space:Rtl.space -> ctrs:counterenv -> methods) -> stage}
+\nwaddbox{wrap_choice  : (('a*(methods->methods)) list -> methods -> ctrs:counterenv -> methods) -> ('a * stage) list -> stage}
+\nwaddbox{wrap_counter : (Rtl.space -> int ref -> methods -> methods) -> counter -> stage}
+\deeperbox{40pt}
+<<automaton.ml>>=
+let wrap  f = S (fun (I next) -> I (fun ~start ~space ~ctrs ->
+                                    f (next ~start ~space ~ctrs)))
+let swrap f =
+  S (fun (I next) -> I (fun ~start ~space ~ctrs ->
+                           f (next ~start ~space ~ctrs) ~start ~space ~ctrs))
+let wrap_choice f choices = S (fun (I next) ->
+  let apply (I f) = f in
+  let downchoice c ~start ~space ~ctrs =
+   fun meths -> apply (c (I (fun ~start ~space ~ctrs -> meths))) ~start ~space ~ctrs in
+  I (fun ~start ~space ~ctrs ->
+   let choices = List.map (fun (p,(S c)) ->
+                            (p, downchoice c ~start ~space ~ctrs))
+                 choices
+   in f choices (next ~start ~space ~ctrs) ~ctrs))
+@
+The overflow block is slightly interesting.
+<<automaton.ml>>=
+type state = { mutable mem       : M.t; mutable frozen : bool
+             ; mutable mems_list : R.loc list  }
+let overflow ~growth ~max_alignment next =
+  fun ~start ~space:((_, byteorder, memsize) as space) ~ctrs ->
+    let mem = M.at start growth in
+    let state = { mem = mem; frozen = false; mems_list = [] } in
+    <<functions [[allocate]] and [[freeze]] for the overflow block>>
+    { allocate = allocate; freeze = freeze }
+let overflow ~growth ~max_alignment = 
+  swrap (overflow ~growth ~max_alignment) 
+@ 
+To allocate, we align and increment the memory block.
+The address of the new location depends on the direction of stack growth.
+<<functions [[allocate]] and [[freeze]] for the overflow block>>=
+let allocate ~width ~alignment ~kind =
+  if not (Cell.divides memsize width) then
+   impossf "width %d not multiple of memsize %d" width (Cell.size memsize);
+  if max_alignment mod alignment <> 0 then
+   impossf "max alignment %d not multiple of alignment %d" max_alignment alignment;
+  if state.frozen then impossf "Allocation from a frozen overflow block";
+  let (R.C c) as count = Cell.to_count memsize width in
+  let mem  = state.mem in
+  let mem  = M.align mem alignment in
+  let mem' = M.allocate mem c in
+  let addr = M.current (match growth with M.Up -> mem | M.Down -> mem') in
+  let loc  = (R.mem (R.aligned alignment) space count addr) in
+  state.mems_list <- loc :: state.mems_list;
+  state.mem <- mem';
+  of_loc loc in
+@ 
+To freeze, we have to adjust the block alignment if the stack grows down.
+We might not want to be appending lists, but we do so now for simplicity.
+<<functions [[allocate]] and [[freeze]] for the overflow block>>=
+let freeze regs mems =
+  state.frozen <- true;
+  let mem    = state.mem in
+  let astate = M.num_allocated mem mod max_alignment in
+  let mem    = match growth with 
+               M.Up -> mem | M.Down -> M.align mem (M.alignment mem) in
+  let block  = M.freeze mem in
+  { overflow = block; regs_used = regs; mems_used = state.mems_list @ mems
+  ; align_state = astate } in
+@ 
+\paragraph{Higher-order functions for request transformers}
+
+<<automaton.ml>>=
+type allocator = width: int -> alignment: int -> kind: string -> loc
+let txstage f  = wrap (fun next -> 
+                        { allocate = f next.allocate; freeze = next.freeze })
+let _ = (txstage : (allocator -> allocator) -> stage)
+@ 
+<<automaton.ml>>=
+let widths ws = txstage
+  (fun nalloc ~width ~alignment ~kind ->
+    if   List.exists ((=) width) ws then nalloc width alignment kind
+                                    else Unsupported.automaton_widths width)
+@   
+Narrowing and widening.
+<<automaton.ml>>=
+let narrower = 
+  let narrow nopname wopname ~w ~n loc =
+     let widen  = R.opr wopname [n; w] in 
+     let narrow = R.opr nopname [w; n] in 
+       { fetch  = (fun n   -> R.app narrow [loc.fetch w])
+       ; store  = (fun e n -> loc.store (R.app widen [e]) w)
+       } in
+  function
+  | "signed" -> narrow "lobits" "sx"
+  | "float"  -> narrow "f2f_implicit_round" "f2f_implicit_round"
+  | "unsigned" | "address" | "" | _ -> narrow "lobits" "zx"
+let narrowf = narrower "float"
+
+let widen f = txstage 
+  (fun nalloc ~width:n ~alignment ~kind ->
+    let w   = f n in
+    let loc = nalloc w alignment kind in
+    if w = n then loc else narrower kind ~n ~w loc)
+
+let align_to f =
+  txstage (fun nalloc ~width:w ~alignment ~kind -> nalloc w (f w) kind)
+@
+
+\paragraph{Choice and First Choice Stages}
+ 
+The dataflow here is kind of interesting.  
+For the [[allocate]] method, we have a fan-out and fan-in, with a fork
+and join point, so it passes through exactly \emph{one} choice.
+But for the [[freeze]] method, we thread the call straight through the
+whole list, so it passes through \emph{all} choices.
+<<automaton.ml>>=
+let choice choices next ~ctrs =
+    let add (p, stage) alternative =
+      let follows_choice = { allocate = next.allocate
+                           ; freeze   = alternative.freeze } in
+      let choice = stage follows_choice in
+      let alloc ~width ~alignment ~kind =
+        let alloc = if p width kind ctrs then choice.allocate 
+                                         else alternative.allocate in
+        alloc width alignment kind in
+      { allocate = alloc; freeze = choice.freeze } in
+    List.fold_right add choices
+      { allocate = (fun ~width -> impossf "fell off end of choice stage")
+      ; freeze = next.freeze }
+let choice = wrap_choice choice
+
+let first_choice choices next ~ctrs =
+  let choices = List.map (fun (p, c) -> (p, c next)) choices in
+  let myself = ref next in (* temporary *)
+  let allocate ~width ~alignment ~kind = 
+    (!myself).allocate width alignment kind in
+  let freeze regs mems = (!myself).freeze regs mems in
+  let first_allocate ~width ~alignment ~kind =
+    let choice =
+      try snd (List.find (fun (p, _) -> p width kind ctrs) choices)
+      with Not_found -> impossf "missing choice" in
+    myself := choice;
+    allocate width alignment kind in
+  let () = try
+    myself := { allocate = first_allocate
+              ; freeze   = (snd (List.hd choices)).freeze }
+  with Failure _ -> impossf "no first choice" in
+  { allocate = allocate; freeze = freeze }
+let first_choice = wrap_choice first_choice
+
+let counter_is c f _ _ env = match env c with Some i -> f (!i) | None -> false
+let is_kind    h'  w h _   = h =$= h'
+let is_width   w'  w h _   = w = w'
+let is_any         w h _   = true
+@ 
+\paragraph{Register assignment}
+<<automaton.ml>>=
+let wrap_counter f label =
+  S (fun (I next) ->
+       I (fun ~start ~space ~ctrs ->
+           let (ctr, ctrs) = (match ctrs label with
+           | Some n -> (n, ctrs)
+           | None   ->
+              let n = ref 0 in
+              (n, fun s -> if s =$= label then Some n else ctrs s)) in
+           f space ctr (next ~start ~space ~ctrs)))
+
+let counter of_width =
+  let f ctr nalloc ~width ~alignment ~kind =
+    let loc = nalloc ~width ~alignment ~kind in
+    (ctr := !ctr + of_width width ; loc)
+  in (fun ctr next -> { allocate = f ctr next.allocate; freeze = next.freeze })
+@ 
+
+The [[allow_agg]] and [[reserve]] arguments to [[reg_placer]] control
+register allocation semantics.
+The first specifies whether location aggregation is allowed for values
+that don't fit within one register, and the second specifies whether
+we also need to reserve space in a later stage but throw it away.
+<<automaton.ml>>=
+type regstate = { mutable used  : Register.Set.t }
+
+<<definition of [[combine_loc]]>>
+
+let reg_placer of_width agg n regs reserve next =
+  let state = { used = RS.empty } in
+  let getreg = function
+  | []      -> raise (Failure "get register")
+  | r :: rs -> (state.used <- RS.add r state.used; r) in
+
+  let rec drop i regs = if i <= 0 then regs else match regs with
+  | r :: rest -> drop (i - of_width (Register.width r)) rest
+  | []        -> [] in
+
+  let rec alloc ~width ~alignment ~kind =
+    try
+      let ((_, _, ms), _, c) as r = getreg (drop !n regs) in
+      let w = Cell.to_width ms c in
+      if w = width then
+         let allocated = of_loc (R.reg r) in
+         ( if reserve then ignore (next.allocate width alignment kind)
+         ; allocated )
+      else if w < width then match agg with
+             | Some endianness ->
+                let w'  = width - w in
+                let _   = n := !n + w in
+                let ell = combine_loc endianness
+                             (of_loc (R.reg r)) w
+                             (alloc ~width:w' ~alignment ~kind) w'
+                in ( n := !n - w ; ell )
+             | None -> Unsupported.automaton_widen ~have:width ~want:w
+      else unimp "auto-widening for register requests"
+    with Failure _ -> next.allocate width alignment kind in
+  let freeze regs mems = next.freeze (RS.union state.used regs) mems in
+  { freeze = freeze; allocate = alloc }
+
+let bitcounter   = counter (fun w -> w)
+let regs_by_bits = reg_placer (fun w -> w)
+
+let useregs regs reserve = 
+  swrap (fun next ~start ~space:(_, byteorder, _) ~ctrs -> let c = ref 0 in
+          (bitcounter c) ((regs_by_bits (Some byteorder) c regs reserve) next))
+
+let bitcounter   = wrap_counter (fun _ -> bitcounter)
+let regs_by_bits label rs reserve =
+    wrap_counter (fun (_,bo,_) ctr -> regs_by_bits (Some bo) ctr rs reserve) label
+
+let argcounter   = wrap_counter (fun _ -> counter (fun w -> 1))
+let regs_by_args = reg_placer (fun w -> 1) None
+let regs_by_args label rs reserve = 
+    wrap_counter (fun _ ctr -> regs_by_args ctr rs reserve) label
+
+let pad = 
+  let padcounter space ctr next =
+    let (_, _, memsize) = space in
+    let f nalloc ~width ~alignment ~kind =
+      let al = Cell.to_width memsize (R.C alignment) in
+      ctr := Auxfuns.round_up_to ~multiple_of:al !ctr;
+      nalloc ~width ~alignment ~kind
+    in { next with allocate = f next.allocate }
+  in wrap_counter padcounter
+@ 
+
+And now we need to actually define the helper [[combine_loc]] that can
+combine multiple hardware resources into one abstract `location'.
+<<definition of [[combine_loc]]>>=
+<<shift and mask functions>>
+let combine msb msw lsb lsw =
+  { fetch  = (fun ww -> assert (ww = msw + lsw);
+                    orb ww (zx lsw ww (fetch lsb lsw))
+                           (shl ww (zx msw ww (fetch msb msw)) lsw))
+  ; store  = (fun exp ww -> assert (ww = msw + lsw);
+                    R.par [ store lsb (lobits ww lsw exp              ) lsw
+                          ; store msb (lobits ww msw (shrl ww exp lsw)) msw ])
+  }
+
+let combine_loc = function
+  | Rtl.Identity     -> impossf "split without byte-ordering"
+  | Rtl.LittleEndian -> (fun b1 w1 b2 w2 -> combine b2 w2 b1 w1)
+  | Rtl.BigEndian    -> combine
+@ 
+
+<<shift and mask functions>>=
+let const w k = R.bits (Bits.U.of_int k w) w
+let zx n w v = R.app (R.opr "zx" [n; w]) [v]
+let orb w x y = R.app (R.opr "or"  [w]) [x; y]
+let shl  w x k = R.app (R.opr "shl"  [w]) [x; const w k]
+let shrl w x k = R.app (R.opr "shrl" [w]) [x; const w k]
+let lobits w n x = R.app (R.opr "lobits" [w; n]) [x]
+@ 
+
+
+\paragraph{Using an automaton as a stage}
+
+To us an automaton as a stage, we pass on an allocation request but
+ignore a freeze request.
+<<automaton.ml>>=
+let as_stage inner next = 
+  fun ~start ~space ~ctrs ->
+    let freeze regs mems =
+      { regs_used = regs; mems_used = mems;
+        overflow = Block.at start 0 0; align_state = 0 } in
+    { allocate = inner.allocate; freeze = freeze }
+let as_stage inner = swrap (as_stage inner)
+@
+
+\paragraph{The unit stage}
+<<automaton.ml>>=
+let unit = wrap (fun next -> next)
+@ 
+\paragraph{Debugging}
+<<automaton.ml>>=
+let debug f _ ctr next =
+  let allocate ~width ~alignment ~kind =
+    f width kind alignment (!ctr);
+    next.allocate ~width ~alignment ~kind in
+  { allocate = allocate; freeze = next.freeze }
+
+let debug counter f = wrap_counter (debug f) counter
+@ 
+
+\paragraph{Postprocessing a result}
+<<automaton.ml>>=
+let postprocess (S stage) f = S (fun imp ->
+  let I i = stage imp in
+  I (fun ~start ~space ~ctrs ->
+      let m = i start space ctrs in
+      { allocate = m.allocate
+      ; freeze = (fun rs ms -> f (m.freeze rs ms))
+      } ))
+@ 
+
+\paragraph{Lua Registration of Calling Conventions}
+<<automaton.ml>>=
+type cc_spec  = { call : stage; results : stage; cutto : stage }
+type cc_specs = (string * cc_spec) list
+let init_cc = []
+@ 

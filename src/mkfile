@@ -1,0 +1,588 @@
+# ------------------------------------------------------------------ 
+# $Id: mkfile,v 1.358 2007-08-10 04:18:45 dias Exp $ 
+# ------------------------------------------------------------------
+# vim:tw=72 ts=8 sw=4 et:
+#
+# Before you start:
+# (1) this module depends on other directories. Go to the toplevel 
+#     directory and call: "mk". From there on you can work locally 
+#     in this directory. 
+#
+# ------------------------------------------------------------------ 
+# How to add a new foo.mli or foo.ml contained in a foo.nw file:
+# (1) add foo.ml  to ML,  *after* all files it depends on
+# (2) add foo.mli to MLI, keep the list in alphabetical order
+#
+# If you have troubles with undefined symbols during compilation or
+# linking, check these two variables. Rebuild dependencies if
+# necessary.
+# 
+# Useful targets to create documentation from foo.nw:
+# foo.html          - make foo.html from foo.nw
+# foo.dvi           - make foo.dvi  from foo.nw
+#
+# ------------------------------------------------------------------ 
+# N.B. in building this mkfile, when we have a choice between making
+# the mkfile clean and making mk's output readable, we make mk's output
+# readable.
+
+# $P = count|gprof, indicates profiling
+# 
+NAME =      qc--$P
+VERSION =   `cat DATE`
+
+# ------------------------------------------------------------------
+# paths
+# ------------------------------------------------------------------
+
+TOP = ..
+<     $TOP/config/config.mk
+
+LIBDIR =    ${B}../lib
+BINDIR =    ../bin
+MANDIR =    ../man
+
+MLBURG =    $BINDIR/ocamlburg
+MLBURGFIX = $BINDIR/ocamlburgfix
+
+# ------------------------------------------------------------------
+# (high level) virtual targets
+# be careful to use only variables that are defined above
+# ------------------------------------------------------------------
+# INTERP = evaluating | residualizing
+# change the variable below to extract the right variant 
+# from *.nw files
+
+INTERP =    evaluating
+DEPEND =    ${B}DEPEND.$INTERP
+
+all:V:      $NAME       qc--.lua
+all.opt:V:  $NAME.opt   qc--.lua
+
+update:V:       $BINDIR/$NAME     
+update.opt:V:   $BINDIR/$NAME.opt
+
+install-lua:V: peephole.lua $install_lib
+	cp peephole.lua $install_lib
+
+install:V: all install-lua $install_bin
+	cp $NAME $install_bin
+
+install.opt:V: install all.opt
+	cp $NAME.opt $install_bin
+	strip $install_bin/$NAME.opt
+
+depend:V:   $DEPEND
+
+dot:V: $DEPEND.ps
+
+$DEPEND.ps:D: $DEPEND.dot
+	dot -Tps $prereq > $target
+
+$DEPEND.dot:D: $DEPEND
+	ocamldot $DEPEND > $target
+
+test:VQ:     
+	echo "you can run 'mk test' only from the toplevel ($TOP)"
+	echo "developers can run 'mk dtest' or 'mk tx', but don't"
+	echo "expect it to mean anything" 
+	exit 1
+
+tx:VQ: update
+	cd ../test; mk $MKFLAGS test
+
+dtest:VEQ: add hello cut
+	echo hello; ./hello
+	echo add; ./add
+	echo add 1 2 3 4; ./add 1 2 3 4
+	echo cut; ./cut
+
+'^'(add|hello|cut)'$':R: '\1'.c-- qc-- tqc
+	./tqc -o $target $stem1.c--
+
+clean.opt:V:    
+	rm -f $B*.cmx $B*.cmxa $B*.o $B*.a
+
+clean:V:    clean.opt
+	rm -f $B*.cmi $B*.cmo $B*.cma
+
+clobber:V:  dep-clobber clean
+	rm -f $B*.sig 
+	rm -f $B*.ml $B*.ml[ilybx] $B*.output
+	rm -f $B*.c $B*.h 
+	rm -f ${B}this.in
+	rm -f *.inc *.tex *.dvi *.log *.aux *.bbl *.blb *.blg *.toc
+	rm -f *.html *.ps *.pod
+	rm -f *.pod *.1
+	rm -f *~
+	rm -f ${B}qc--.lua 
+	rm -f $NAME $NAME.opt 
+	rm -f `find . -type l -print`
+
+# ------------------------------------------------------------------
+# important file sets
+# ------------------------------------------------------------------
+
+# The order of files defines the link order.  So if you have troubles
+# with undefined symbols during linking re-order this list
+# accordingly.  No module must use any of its successors.
+
+# to emit this info, run ~nr/bin/ocamlsort $DEPEND
+
+ML = alignment.ml         \
+     asm.ml               \
+     auxfuns.ml           \
+     bitset64.ml          \
+     ep.ml                \
+     eqn.ml               \
+     error.ml             \
+     astpp.ml             \
+     float.ml             \
+     idcode.ml            \
+     interval.ml          \
+     lifetime.ml          \
+     liveset.ml           \
+     metrics.ml           \
+     reinit.ml            \
+     idgen.ml             \
+     nast.ml              \
+     parse.ml             \
+     scan.ml              \
+     space.ml             \
+     mipsregs.ml          \
+     sparcregs.ml         \
+     strutil.ml           \
+     ctypes.ml            \
+     mangle.ml            \
+     talloc.ml            \
+     context.ml           \
+     this.ml              \
+     luautil.ml           \
+     topsort.ml           \
+     tx.ml                \
+     types.ml             \
+     rtlop.ml             \
+     interpemitrtl.ml     \
+     opshape.ml           \
+     rtldebug.ml          \
+     rtlutil.ml           \
+     avail.ml             \
+     dag.ml               \
+     mflow.ml             \
+     box.ml               \
+     ppcrec.ml            \
+     rtleqn.ml            \
+     simplify.ml          \
+     spans.ml             \
+     cfg.ml               \
+     cfgx.ml              \
+     varmap.ml            \
+     property.ml          \
+     unique.ml            \
+     x86regs.ml           \
+     x86rec.ml            \
+     fenv.ml              \
+     target.ml            \
+     zipcfg.ml            \
+     dataflow.ml          \
+     availpass.ml         \
+     dead.ml              \
+     dominator.ml         \
+     typecheck.ml         \
+     vfp.ml               \
+     block.ml             \
+     elabexp.ml           \
+     elabstmt.ml          \
+     memalloc.ml          \
+     nelab.ml             \
+     automaton.ml         \
+     automatongraph.ml    \
+     automatonutil.ml     \
+     rewrite.ml           \
+     astasm.ml            \
+     bcopy.ml             \
+     call.ml              \
+     callspec.ml          \
+     contn.ml             \
+     mvalidate.ml         \
+     proc.ml              \
+     preast2ir.ml         \
+     interp.ml            \
+     cfgutil.ml           \
+     live.ml              \
+     dotasm.ml            \
+     optimize.ml          \
+     pic.ml               \
+     ppcasm.ml            \
+     registerclass.ml     \
+     runtimedata.ml       \
+     ast2ir.ml            \
+     backplane.ml         \
+     colorgraph.ml        \
+     dls.ml               \
+     flowra.ml            \
+     driver.ml            \
+     postexpander.ml      \
+     expander.ml          \
+     interpemit.ml        \
+     interpasm.ml         \
+     peephole.ml          \
+     placevar.ml          \
+     ppc.ml               \
+     stack.ml             \
+     widen.ml             \
+     x86asm.ml            \
+     x86call.ml           \
+     x86.ml               \
+     dummy.ml             \
+     lualink.ml           \
+     main.ml              \
+     zipncfg.ml           \
+     #ia64call.ml          \
+     #ia64rec.ml          \
+     #ia64.ml              \
+     #ia64asm.ml           \
+		#arm.ml		 \
+		#mipsregs.ml	 \
+                #mipsrec.ml       \
+                #mipsasm.ml       \
+                #mipscall.ml      \
+                #mips.ml          \
+                #alphacall.ml     \
+                #alpharec.ml      \
+                #alpha.ml         \
+                #alphaasm.ml      \
+                #sparcregs.ml     \
+                #sparccall.ml     \
+                #sparcrec.ml      \
+                #sparc.ml         \
+                #sparcasm.ml      \
+     #cl# asdlasm.ml           \
+
+# interfaces in alphabetical order
+
+MLI =           alpha.mli         \
+                alignment.mli     \
+                alphaasm.mli      \
+                alphacall.mli     \
+                alpharec.mli      \
+                asm.mli           \
+                asdlasm.mli       \
+                astasm.mli        \
+                ast2ir.mli        \
+                astpp.mli         \
+                automaton.mli     \
+                automatongraph.mli\
+                auxfuns.mli       \
+		avail.mli	  \
+		availpass.mli	  \
+                backplane.mli     \
+                bcopy.mli         \
+		bitset64.mli	  \
+                block.mli         \
+                box.mli           \
+		call.mli          \
+                callspec.mli      \
+                cfg.mli           \
+                cfgx.mli          \
+                cfgutil.mli       \
+                colorgraph.mli    \
+                context.mli       \
+                contn.mli         \
+                ctypes.mli        \
+		dag.mli           \
+		dataflow.mli      \
+		dead.mli	  \
+                dls.mli           \
+                dummy.mli         \
+                driver.mli        \
+                dominator.mli     \
+                dotasm.mli        \
+                elabexp.mli       \
+                elabstmt.mli      \
+                eqn.mli           \
+		ep.mli            \
+                error.mli         \
+                expander.mli      \
+                fenv.mli          \
+		float.mli	  \
+                flowra.mli        \
+                ia64.mli          \
+                ia64asm.mli       \
+                ia64call.mli      \
+                ia64rec.mli       \
+                idgen.mli         \
+                idcode.mli        \
+                interp.mli        \
+                interpasm.mli     \
+                interpemit.mli    \
+                interpemitrtl.mli \
+                interval.mli      \
+                lifetime.mli      \
+                live.mli          \
+                liveset.mli       \
+                lualink.mli       \
+                luautil.mli       \
+                mangle.mli        \
+                main.mli          \
+                memalloc.mli      \
+		metrics.mli	  \
+                mips.mli          \
+                mipsasm.mli       \
+                mipscall.mli      \
+                mipsrec.mli       \
+                mipsregs.mli      \
+		mflow.mli         \
+		nast.mli	  \
+		nelab.mli	  \
+                optimize.mli      \
+		opshape.mli	  \
+		peephole.mli	  \
+                parse.mli         \
+                placevar.mli      \
+		pic.mli		  \
+		postexpander.mli  \
+		ppc.mli           \
+                ppcrec.mli        \
+		ppcasm.mli        \
+                preast2ir.mli     \
+                proc.mli          \
+                property.mli      \
+		reinit.mli	  \
+                registerclass.mli \
+		rewrite.mli	  \
+                rtldebug.mli      \
+                rtleqn.mli        \
+                rtlop.mli         \
+                rtlutil.mli       \
+                rtlx.mli          \
+                runtimedata.mli  \
+                scan.mli          \
+                simplify.mli      \
+                space.mli         \
+		spans.mli	  \
+                sparc.mli         \
+                sparcasm.mli      \
+                sparccall.mli     \
+                sparcrec.mli      \
+                sparcregs.mli     \
+                stack.mli         \
+                strutil.mli       \
+                talloc.mli        \
+                target.mli        \
+                this.mli          \
+                topsort.mli       \
+                types.mli         \
+                typecheck.mli     \
+		tx.mli            \
+                varmap.mli        \
+		vfp.mli           \
+		widen.mli	  \
+                mvalidate.mli     \
+		unique.mli	  \
+		x86.mli           \
+		x86call.mli       \
+                x86rec.mli        \
+                x86regs.mli       \
+		x86asm.mli        \
+		zipcfg.mli        \
+		zipncfg.mli        \
+
+ML  = ${ML:%.ml=$B%.ml}
+MLI = ${MLI:%.mli=$B%.mli}
+
+CMO = ${ML:%.ml=%.cmo}
+CMX = ${ML:%.ml=%.cmx}
+
+# The following list of files are scanned for dependencies. They are
+# extracted from Noweb source files, or generated from files which are
+# extracted from Noweb files. Add files here that are not in ML or MLI
+# and that you want to be scanned.
+
+SCAN = $ML $MLI ${B}rtldebug.mli ${B}rtldebug.ml
+<$TOP/config/depend.mk
+
+# The following files contribute Noweb chunks to the main Lua file qc--.lua
+
+CALL_LUA = alphacall.nw ia64call.nw mipscall.nw x86call.nw ppc.nw sparccall.nw
+
+# ------------------------------------------------------------------
+# rules and tools 
+# ------------------------------------------------------------------
+
+<$TOP/config/ocaml.mk
+
+OCAMLC_FLAGS =  $OCAMLC_FLAGS -I $LIBDIR -ccopt -L$LIBDIR
+OCAMLO_FLAGS =  $OCAMLO_FLAGS -I $LIBDIR -ccopt -L$LIBDIR 
+
+<$TOP/config/noweb.mk
+<$TOP/config/man.mk
+
+# ------------------------------------------------------------------
+# binaries
+# ------------------------------------------------------------------
+# PROFCMO is defined in ocaml.mk for profiling
+
+CMOSYS  =       unix.cma str.cma
+CMOCMM  =	cllib.cma asdl.cma lua.cma rtllib.cma gen.cma
+CMOLIBS =       $CMOSYS $PROFCMO $CMOCMM camlburg.cmo 
+
+CMXSYS  =       ${CMOSYS:%.cma=%.cmxa}
+CMXCMM  =       ${CMOCMM:%.cma=%.cmxa}
+CMXLIBS =       $CMXSYS $CMXCMM camlburg.cmx
+
+LIBSLASHCMOLIBS = ${CMOCMM:%=$LIBDIR/%}
+LIBSLASHCMXLIBS = ${CMXCMM:%=$LIBDIR/%}
+
+OBJ =           $LIBDIR/uint64p.o
+
+$NAME:     dep-chk $CMO $OBJ $LIBSLASHCMOLIBS
+	$OCAMLC $INSTR $OCAMLC_FLAGS -custom -o $target $CMOLIBS $OBJ $CMO 
+
+$NAME.opt: dep-chk $CMX $OBJ $LIBSLASHCMXLIBS
+	$OCAMLO $INSTR $GPROF $OCAMLO_FLAGS         -o $target $CMXLIBS $OBJ $CMX
+
+# ------------------------------------------------------------------
+# copy files to their official directories
+# ------------------------------------------------------------------
+
+$BINDIR/$NAME:D:          $NAME
+	cp $prereq $target
+
+$BINDIR/$NAME.opt:D:      $NAME.opt
+	cp $prereq $target
+
+# ------------------------------------------------------------------
+# LaTeX documentation
+# ------------------------------------------------------------------
+# Files we generate documentation from
+
+HTML =          `echo *.nw                             | sed 's/\.nw/.html/g'`
+INC  =          `echo *.nw  ../cllib/*.nw ../test/*.nw | sed 's/\.nw/.inc/g'`
+
+
+html:V:         $HTML 
+
+cfgxx.inc:D: cfg.nw
+	noweave -n -filter "xxchunks -summary -merge $prereq" \
+	  -filter $OCAMLDEFS -index $prereq > $target
+
+X86ALLFILES=`./loadfiles x86all.nw`
+
+x86all.dvi: $X86ALLFILES
+x86all.tex:D: x86all.nw
+	cat $prereq > $target
+
+
+# modules.tex can be used in qc--.tex where documentation for
+# individual modules is included
+
+modules.tex:VD: $INC
+	echo $INC | sed 's!\([a-z0-9./]*inc\)!\\input{\1}!g' | fmt -w 10 > $target
+
+# ------------------------------------------------------------------ 
+# special cases, primarily for multiple sources in one .nw
+# ------------------------------------------------------------------ 
+# these rules clutter up the mkfile, but they make the output from mk,
+# and especially from mk- n, more readable, so they are worth it.
+#
+# we don't use the nocond filter here because currently all our
+# conditional code happens to be in the general case.
+
+${B}interval.mli:D: lifetime.nw
+	$NOTANGLE -L"$LINE" -Rinterval.mli $prereq > $target
+${B}interval.ml:D:  lifetime.nw
+	$NOTANGLE -L"$LINE" -Rinterval.ml  $prereq > $target
+
+${B}postexpander.mli:D: expander.nw
+	$NOTANGLE -L"$LINE" -Rpostexpander.mli $prereq | $CPIF $target
+${B}postexpander.ml:D:  expander.nw
+	$NOTANGLE -L"$LINE" -Rpostexpander.ml  $prereq | $CPIF $target
+
+${B}x86target.ml:D:  x86.nw
+	$NOTANGLE -L"$LINE" -Rx86target.ml $prereq > $target
+
+
+#${B}uint64p.c:D:    uint64.nw
+#	$NOTANGLE -L -Ruint64p.c $prereq > $target
+
+${B}topsorttest.ml:D: topsort.nw
+	$NOTANGLE -L"$LINE" -Rtopsorttest.ml $prereq > $target
+
+${B}this.mli:D:     main.nw
+	$NOTANGLE -L"$LINE" -Rthis.mli $prereq > $target
+${B}this.in:D:      main.nw
+	$NOTANGLE -L"$LINE" -Rthis.in  $prereq > $target
+
+qc--.lua:DQ:     luadriver.nw luacompile.nw colorgraph.nw luautil.nw $CALL_LUA ../rtl/register.nw target.nw
+	echo "# building qc--.lua from source and config"
+	{ echo "Config = Config or { }" 
+	  for i in install_bin install_lib install_lua install_inc install_man1; do
+            varname='$'"$i"
+            dir=`eval "echo $varname"`
+            echo "Config.$i = '$dir'"
+          done
+	  $NOTANGLE -L'$file "%F"%N$line %L%N' -Rqc--.lua $prereq
+	} > $target
+
+${B}parse.mly:D:    parser.nw
+	$NOTANGLE -L"$LINE" -Rparse.mly $prereq > $target
+${B}scan.mll:D:     parser.nw
+	$NOTANGLE -L"$LINE" -Rscan.mll  $prereq > $target
+${B}scan.mli:D:     parser.nw
+	$NOTANGLE -L"$LINE" -Rscan.mli  $prereq > $target
+
+# ------------------------------------------------------------------ 
+# MLburg generated files
+# ------------------------------------------------------------------ 
+
+${B}%.mlx:D:   %.nw
+	$NOTANGLE -L"$LINE" -R${stem}.mlb $prereq > $target
+
+${B}%.mlb:D:   ${B}%.mlx
+	( echo "%head {:"; cat $NOPOLY; echo ":}"; cat $prereq ) > $target
+
+# these must be enumerated since they override a metarule
+
+${B}x86rec.ml:D:    ${B}x86rec.mlb $MLBURG
+	$MLBURG ${B}x86rec.mlb | $MLBURGFIX $target 
+
+${B}ppcrec.ml:D:    ${B}ppcrec.mlb $MLBURG
+	$MLBURG ${B}ppcrec.mlb | $MLBURGFIX $target 
+
+${B}ia64rec.ml:D:    ${B}ia64rec.mlb $MLBURG
+	$MLBURG ${B}ia64rec.mlb  | $MLBURGFIX $target 
+
+${B}mipsrec.ml:D:   ${B}mipsrec.mlb $MLBURG
+	$MLBURG ${B}mipsrec.mlb | $MLBURGFIX $target
+
+${B}alpharec.ml:D:  ${B}alpharec.mlb $MLBURG
+	$MLBURG ${B}alpharec.mlb | $MLBURGFIX $target
+
+${B}sparcrec.ml:D:  ${B}sparcrec.mlb $MLBURG
+	$MLBURG ${B}sparcrec.mlb | $MLBURGFIX $target
+
+# ------------------------------------------------------------------
+# include version and name information
+# ------------------------------------------------------------------
+# The ../doc/qc--.man dependency is across directories; best avoided.
+
+${B}this.ml:DQ: ${B}this.in qc--.lua $TOP/doc/qc--.man DATE
+	echo "# building $target from $prereq"
+	set -x
+	{ sed "s/@this@/$NAME-$VERSION/" ${B}this.in 
+	  echo 'let boot = "'                    
+          sed 's/\\/\\\\/g;s/"/\\"/g' qc--.lua
+          echo '"'
+          echo 'let manual ="'
+          sed 's/\\/\\\\/g;s/"/\\"/g' $TOP/doc/qc--.man
+          echo '"'
+          echo 'let byteorder   = "'$config_endian'"'
+          echo 'let arch_os     = "'$config_arch'"'  
+	  echo 'let install_dir = "'$config_prefix'"'
+	} > $target
+
+date:V:
+	date "+%Y%m%d" > DATE
+
+<     $TOP/config/install.mk

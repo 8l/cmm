@@ -1,0 +1,220 @@
+// reverse.c--
+// 
+// note: runtime system is responsible for allocating memory on heap to store
+// backups of globals; pointer to this memory should be stored at label
+// "globals_backup"
+// 
+// the runtime system, for now, should pass into procedure "main" a pointer
+// to a chunk of malloc'd space that is large enough to hold a backup copy
+// of the globals; this pointer is stored at label "globals_backup" internally
+// in the C-- code and is passed to SaveGlobals and RestoreGlobals when
+// appropriate
+//
+/// ./regr "./qrun-gc $SELF" $REGRFLAGS -out $BASE.cmm.1 -err $BASE.cmm.2
+
+target 
+       byteorder   little
+       memsize     8
+       wordsize    32
+       pointersize 32
+;
+
+export main;
+import bits32 cmmprint32, alloc, gc_helper;
+
+import bits32 SaveGlobals, RestoreGlobals;
+
+// tokens for use with spans
+const GC                = 1;
+const GC_GLOBALS        = 2;
+const GC_globals_backup = 3;
+
+const nil       = 0;
+
+section "data" {
+  // needed by front-end runtime system to store globals backup
+  globals_backup:  bits32[1];
+
+  // GC information -- what types are used here
+
+  // there are 4 bytes in a symbol, none of which are parts of pointers
+  TY_symbol:     bits8[] {4::bits8}; // 4 bytes in a symbol
+                 bits8[] {0::bits8, 0::bits8, 0::bits8, 0::bits8};
+
+  // there are 8 bytes in a cons, and pointers begin at bytes 0 and 3
+  TY_cons:       bits8[] {8::bits8};
+                 bits8[] {1::bits8, 0::bits8, 0::bits8, 0::bits8,
+                          1::bits8, 0::bits8, 0::bits8, 0::bits8};
+
+  // GC information -- which variables are pointers
+  GC_allocate:     bits8[] {1::bits8, 1::bits8};
+  GC_gc:
+  GC_symbolify:    bits8[] {0::bits8, 1::bits8};
+  GC_cons:         bits8[] {1::bits8, 1::bits8};
+  GC_car:          bits8[] {1::bits8};
+  GC_cdr:          bits8[] {1::bits8};
+  GC_number_list:  bits8[] {0::bits8, 0::bits8, 1::bits8, 1::bits8, 1::bits8};
+  GC_print_list:   bits8[] {1::bits8, 1::bits8};
+  GC_print_symbol: bits8[] {1::bits8, 0::bits8};
+  GC_reverse_list: bits8[] {1::bits8};
+  GC_reverse_list_helper: bits8[] {1::bits8, 1::bits8, 1::bits8, 1::bits8};
+  GC_main:         bits8[] {0::bits8, 1::bits8, 1::bits8};
+}
+
+section "text" {
+
+  span GC GC_allocate {
+    allocate( bits32 ty ) {
+      bits32 new;
+
+      SaveGlobals(bits32[globals_backup]);
+      new = foreign "C" alloc(ty, k) also cuts to k;
+      RestoreGlobals(bits32[globals_backup]);
+
+      return( new );
+
+      // we should never actually jump to this, but we need to capture
+      // the continuation
+      continuation k():
+        return(0);
+    }
+  }
+
+  span GC GC_gc {
+    gc() {
+      SaveGlobals(bits32[globals_backup]);
+      foreign "C" gc_helper(k) also cuts to k;
+      RestoreGlobals(bits32[globals_backup]);
+
+      return;
+
+      continuation k():
+        return;
+    }
+  }
+
+  span GC GC_symbolify {
+    symbolify( bits32 s ) {
+      bits32 new;
+      new         = allocate(TY_symbol);
+      bits32[new] = s;
+      return( new );
+    }
+  }
+
+  span GC GC_cons {
+    cons( bits32 car, bits32 cdr ) {
+      bits32 new;
+      new             = allocate(TY_cons);
+      bits32[new]     = car;
+      bits32[new + 4] = cdr;
+      return( new );
+    }
+  }
+
+  span GC GC_car {
+    car( bits32 c ) {
+      return( bits32[c] );
+    }
+  }
+
+  span GC GC_cdr {
+    cdr( bits32 c ) {
+      return( bits32[c + 4] );
+    }
+  }
+
+  span GC GC_number_list {
+    number_list( bits32 lo, bits32 hi ) {
+      bits32 s, elt, cdr;
+    
+      if lo > hi { return( nil ); }
+      cdr = number_list(lo + 1, hi);
+      s = symbolify(lo);
+      elt = cons(s, cdr);
+      return( elt );
+    }
+  }
+
+  span GC GC_print_list {
+    print_list( bits32 list ) {
+      bits32 s;
+    
+      if list == nil { return; }
+      s = car(list);
+      print_symbol(s);
+      s = cdr(list);
+      jump print_list(s);
+    }
+  }
+
+  span GC GC_print_symbol {
+    print_symbol( bits32 s ) {
+      bits32 v;
+      v = bits32[s];
+
+      SaveGlobals(bits32[globals_backup]);
+      foreign "C" cmmprint32(v);
+      RestoreGlobals(bits32[globals_backup]);
+
+      return;
+    }
+  }
+
+  span GC GC_reverse_list {
+    reverse_list( bits32 list) {
+      jump reverse_list_helper(list, nil);
+    }
+  }
+
+  span GC GC_reverse_list_helper {
+    reverse_list_helper( bits32 list, bits32 accum ) {
+      bits32 s, acc_new;
+
+      if list == nil { return( accum ); }
+      s       = car(list);
+      acc_new = cons(s, accum);
+      s       = cdr(list);
+      jump reverse_list_helper(s, acc_new);
+    }
+  }
+
+  span GC_globals_backup globals_backup {
+    span GC GC_main {
+      main(bits32 glob_back) {
+        bits32 list1, list2;
+
+        // store globals_backup ptr away
+        bits32[globals_backup] = glob_back;
+
+        // BEGIN BODY OF TEST PROGRAM
+
+        list1 = number_list(0, 3);
+        print_list(list1);
+        gc();
+
+        list2 = number_list(0, 3);
+        print_list(list2);
+        gc();
+
+        list1 = list2;
+        gc();
+
+        list1 = nil;
+        list2 = nil;
+
+        list1 = number_list(0, 4);
+        print_list(list1);
+        list1 = reverse_list(list1);
+        print_list(list1);
+
+        gc();
+
+        // END BODY OF TEST PROGRAM
+
+        return;
+      }
+    }
+  }
+
+}

@@ -1,0 +1,107 @@
+/*
+ * Daniel J. Peng
+ * overflow-client.c--
+ 
+ * This file shows a client that uses the overflow handler to reinvoke an
+ * overflowed function on a new stack.
+ *
+ * The client must provide:
+ *
+ * A closure invocation function that takes the closure as an argument
+ * and invokes the function using the arguments in the closure.
+ *
+ * The closure invocation function is also responsible for freeing the
+ * new stack/closure.  Unfortunately, since it runs on the new stack, it
+ * cannot free it while running; it must delay freeing it somehow.
+ * 
+ * The return continuation simply takes its arguments and returns it
+ * to the caller on the old stack.
+ *
+ */
+target byteorder little;
+
+import bits32 init_overflow;
+import bits32 overflowhandler;
+import bits32 freestack;
+
+import bits32 printf;
+import bits32 free;
+
+export bits32 main;
+
+const SpanArgs = 1;
+const SpanRets = 2;
+const SpanFP = 3;
+
+section "data" {
+  stack_overflowed : bits32[] { 1::bits32 };
+  formatstring  : bits8[] { '%'::bits8, 'd'::bits8, '%'::bits8, 'd'::bits8, '\n'::bits8, 0::bits8 };
+}
+
+section "text" {
+
+span SpanArgs 5 {
+span SpanRets 4 {
+span SpanFP functionthatoverflows {
+
+functionthatoverflows(bits32 a, bits32 b, bits32 c, bits32 d, bits32 e) {
+
+  if (1 == bits32[stack_overflowed]) {
+    bits32[stack_overflowed] = 0;
+    cut to bits32[overflowhandler](body) also cuts to body;
+  }
+  cut to body() also cuts to body;
+continuation body():  
+  /* function body*/
+  return (a+b,b+c,c+d,d+e);
+}
+
+}}}
+
+identity(bits32 x) { return (x); }
+
+main() {
+  bits32 l1,l2,l3,l4,l5,l6,l7,l8,l9,l10;
+  bits32 y1,y2,y3,y4;
+  bits32 x;
+
+  init_overflow();
+
+  x = 0;
+  l1 = 100;
+loop:
+  l1 = identity(l1 + 1);
+  l2 = l1 + 1;
+  l3 = l2 + 1;
+  l4 = l3 + 1;
+  l5 = l4 + 1;
+  l6 = l5 + 1;
+  l7 = l6 + 1;
+  l8 = l7 + 1;
+  l9 = l8 + 1;
+  l10 = l9 + 1;
+  x = x + 1;
+  if (x < 1000) {
+    goto loop;
+  }
+
+   x = foreign "C" printf(formatstring,y1,y2);
+  x = foreign "C" printf(formatstring,y3,y4);
+  x = foreign "C" printf(formatstring,l1,l2);
+  x = foreign "C" printf(formatstring,l3,l4);
+  x = foreign "C" printf(formatstring,l5,l6);
+  x = foreign "C" printf(formatstring,l7,l8);
+  x = foreign "C" printf(formatstring,l9,l10);
+  /* Call a function that overflows and printf the results. */
+  y1,y2,y3,y4 = functionthatoverflows(1,2,3,4, 5);
+  x = foreign "C" printf(formatstring,y1,y2);
+  x = foreign "C" printf(formatstring,y3,y4);
+  x = foreign "C" printf(formatstring,l1,l2);
+  x = foreign "C" printf(formatstring,l3,l4);
+  x = foreign "C" printf(formatstring,l5,l6);
+  x = foreign "C" printf(formatstring,l7,l8);
+  x = foreign "C" printf(formatstring,l9,l10);
+  return (0);
+}
+
+}

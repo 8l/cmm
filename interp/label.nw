@@ -1,0 +1,347 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*- %
+
+\ifx\nointro\undefined
+This document contains the interface and implementation of labels used in the interpreter.
+\fi
+
+% ----------------------------------------------------------------------------
+\interface{[[label]] : {\PAL} Labels and Namespace Management}
+% ----------------------------------------------------------------------------
+
+We define our own sort of labels to allow more information than a simple
+memory location to be passed around at runtime.
+
+<<label.h>>=
+#ifndef _LABEL_H
+#define _LABEL_H
+
+#include <lua.h>
+#include <mclib.h>
+#include "assemblyunit.h"
+#include "controlflow.h"
+
+<<type definitions>>
+
+<<global variable declarations>>
+<<function prototypes>>
+
+<<macro definitions>>
+#endif /* _LABEL_H */
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Data Structures}
+% ----------------------------------------------------------------------------
+
+For the purpose of storing all labels in one namespace (both explicitly defined labels and the labels demarcating {\PAL} procedures), we create a new type.
+
+<<type definitions>>=
+typedef struct {
+  enum {
+    CMM_LABEL, CMM_PROCEDURE, CMM_CFUNCTION
+  } ty;
+  union {
+    RAddr         raddr;
+    procedure    *proc ;
+    unsigned int  cfunc_id;
+  } lbl;
+  assembly_unit *unit;
+} CMM_label;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Global Variables}
+% ----------------------------------------------------------------------------
+
+We maintain a global table to represent the namespace of exported symbols
+(could include {\PAL} symbols declared as exports as well as exported external
+symbols like properly registered C functions).
+
+<<global variable declarations>>=
+extern table exports_table;
+@ 
+
+<<global variable definitions>>=
+table exports_table;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Managing Memory for [[CMM_label]]s}
+% ----------------------------------------------------------------------------
+
+To abstract away from the details of memory management, this interface
+provides a function to create a new [[CMM_label]] and a function that frees
+all existing [[CMM_label]]s in memory.
+
+<<function prototypes>>=
+CMM_label *CMM_label_new(void);
+void       CMM_label_free_all(void);
+@ 
+
+Note that [[CMM_label_new]] returns a pointer to an \emph{uninitialized} 
+[[CMM_label]].
+
+% ----------------------------------------------------------------------------
+\subsection{Helpers}
+% ----------------------------------------------------------------------------
+
+\paragraph{Manipulating [[CMM_label]]s}
+
+We provide a few convenience macros for observing [[CMM_label]]s, regardless
+of their ``label type''.
+
+[[CMM_label_defined]] returns 0 if and only if the [[RAddr]] associated with
+the given [[CMM_label]] has yet been tied down to a location within an 
+[[RBlock]].
+[[CMM_label_raddr]] returns the [[RAddr]] associated with a [[CMM_label]] and
+[[CMM_label_location]] returns the permanent relocation associated with a
+[[CMM_label]].
+Note that [[CMM_label_raddr]] returns a valid lvalue.
+Also note that it is an unchecked runtime error to use the value returned by
+[[CMM_label_location]] if the [[RAddr]] associated with the given
+[[CMM_label]] has not yet been permanently relocated.
+
+<<faux prototypes>>=
+int         CMM_label_defined(CMM_label *lbl);
+RAddr       CMM_label_raddr(CMM_label *lbl);
+bytecodeptr CMM_label_location(CMM_label *lbl);
+@
+
+\paragraph{Finding a Label}
+
+[[get_label]] takes a [[lua_State]] and a string [[name]], expects this string
+to also be atop the Lua stack within the specified [[lua_State]], pops the 
+string off the Lua stack, and returns the [[CMM_label]] structure associated
+with the label named [[name]].
+If this label was not previously defined, [[get_label]] creates a fresh
+[[CMM_label]] and links it with the string [[name]] for future queries.
+[[CMM_label]]s created in this way are temporarily initialized as
+[[CMM_LABEL]]s.
+
+<<function prototypes>>=
+CMM_label *get_label(lua_State *L, const char *name);
+@
+
+To capture a reference to an offset from a given [[CMM_label]], we provide
+[[get_label_offset]].
+
+<<function prototypes>>=
+CMM_label *get_label_offset(CMM_label *lbl, int offset);
+@ 
+
+Once {\PAL} code has been loaded into memory, clients may use our exported
+function [[cmm_find_export]] to find the location associated with an exported
+{\PAL} label.
+A [[NULL]] pointer is returned if the given string cannot be found in the
+exported symbol table.
+
+<<function prototypes>>=
+CMM_label *cmm_find_export(const char *arg);
+@ 
+
+% ----------------------------------------------------------------------------
+\implementation{{\PAL} Labels and Namespace Management}
+% ----------------------------------------------------------------------------
+
+<<label.c>>=
+#include "label.h"
+
+#include <assert.h>
+#include <stdlib.h>
+#include "table.h"
+#include "lualink.h"
+#include "interp.h"
+
+#include <cii/arena.h>
+
+<<internal static variable definitions>>
+<<global variable definitions>>
+<<function definitions>>
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Memory Allocation}
+% ----------------------------------------------------------------------------
+
+We make use of Hanson's ``arenas'' (see \emph{C Interfaces and Implementations})
+to assist in allocating and de-allocating memory for [[CMM_label]]s.
+
+<<internal static variable definitions>>=
+static Arena_T CMM_label_arena = NULL;
+@ 
+
+<<function definitions>>=
+CMM_label *CMM_label_new(void) {
+  CMM_label *lbl;
+
+  if (CMM_label_arena == NULL) {
+    CMM_label_arena = Arena_new();
+    mem_assert(CMM_label_arena);
+  }
+
+  lbl = (CMM_label *) Arena_alloc(CMM_label_arena, sizeof(CMM_label), 
+                                  __FILE__, __LINE__);
+  mem_assert(lbl);
+
+  return lbl;
+}
+
+void CMM_label_free_all(void) {
+  if (CMM_label_arena != NULL) {
+    Arena_free(CMM_label_arena);
+    Arena_dispose(&CMM_label_arena);
+    CMM_label_arena = NULL;
+  }
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Macros}
+% ----------------------------------------------------------------------------
+
+Macro [[CMM_label_defined]] simplifies testing whether or not a given
+[[CMM_label]] has yet been defined (i.e., tied down to a location in an
+[[RBlock]]).
+
+<<macro definitions>>=
+#define CMM_label_defined(LBL)                            \
+(((LBL)->ty == CMM_PROCEDURE &&                           \
+  block_defined((LBL)->lbl.proc->raddr->label->block)) || \
+ ((LBL)->ty == CMM_LABEL     &&                           \
+  block_defined((LBL)->lbl.raddr->label->block))       || \
+ ((LBL)->ty == CMM_CFUNCTION))
+@
+
+Macro [[CMM_label_raddr]] returns the [[RAddr]] to which a [[CMM_label]] is
+tied, and [[CMM_label_location]] returns the location to which a [[CMM_label]] 
+is tied.
+Note that the value returned by this macro is a valid lvalue.
+It is an unchecked runtime error (will likely lead to segfault) to get the 
+[[CMM_label_raddr]] or [[CMM_label_location]] of a [[CMM_CFUNCTION]]-typed 
+[[CMM_label]].
+
+<<macro definitions>>=
+#define CMM_label_raddr(LBL) \
+(  (LBL)->ty == CMM_PROCEDURE    ? (LBL)->lbl.proc->raddr  \
+:  (LBL)->lbl.raddr)
+
+#define CMM_label_location(LBL) \
+((bytecodeptr) ((LBL)->ty == CMM_PROCEDURE ? location((LBL)->lbl.proc->raddr)\
+                                           : location((LBL)->lbl.raddr)))
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Functions}
+% ----------------------------------------------------------------------------
+
+[[get_label]] expects to see a string atop the Lua stack and leaves the Lua stack with one less item than it started with.
+We look to see if there is a value associated with [[name]] in the Lua label 
+table.
+If there is a value attached with [[name]] in the table, we return it.
+
+<<function definitions>>=
+CMM_label *get_label(lua_State *L, const char *name) {
+  CMM_label *lbl;
+
+  /* expects a string atop the stack ! */
+  lua_assert_isstring(L, -1, "cannot define a nameless label in C--");
+
+  <<find Lua label table>>
+
+  lua_insert(L, -2);    /* swap stack positions of key string and table */
+  lua_pushvalue(L, -1); /* make copy of key string atop stack           */
+  lua_gettable(L, -3);  /* look up string to see if is defined          */
+  if (lua_isuserdata(L, -1) && 
+      lua_tag(L, -1) == lua_CMM_label_tag && 
+      (lbl = (CMM_label *) lua_touserdata(L, -1)) != NULL)
+  {
+    lua_pop(L, 3); /* pop userdata, key string, table */
+  } else {
+    RLabel     label;
+    RAddr      addr;
+
+    <<create new [[CMM_label]] and store in label table>>
+    lua_pop(L, 1); /* pop table */
+  }
+
+  return lbl;
+}
+@
+We call [[lua_pushtable]] to help us find the label table.
+<<find Lua label table>>=
+  lua_pushtable(L, unit->label_table);
+@
+If [[name]] has no non-nil value attached to it in the table, we create a new [[RAddr]], store it in the table under the key [[name]], and return it.
+<<create new [[CMM_label]] and store in label table>>=
+    label          = label_new(name);
+    addr           = addr_new(label, 0);
+
+    lbl            = CMM_label_new();
+    lbl->ty        = CMM_LABEL;
+    lbl->lbl.raddr = addr;
+
+    lua_pop(L, 1); /* pop nil off */
+    lua_pushusertag(L, (void *) lbl, lua_CMM_label_tag);
+    lua_settable(L, -3); /* pops off pointer, key string */
+@
+
+Helper [[get_label_offset]] simply constructs a new [[RAddr]] with the given
+offset from the [[RAddr]] stored in the given [[CMM_label]].
+
+<<function definitions>>=
+CMM_label *get_label_offset(CMM_label *lbl, int offset) {
+  RAddr      old = CMM_label_raddr(lbl);
+  CMM_label *new;
+
+  cmm_assert(old != NULL && old->label != NULL,
+             "cannot get_label_offset from undeclared label");
+
+  new            = CMM_label_new();
+  new->ty        = CMM_LABEL;
+  new->lbl.raddr = addr_new(old->label, 0);
+
+  return new;
+}
+@ 
+
+\paragraph{Exported Functions}
+
+Exported function [[cmm_find_export]] finds a pointer to the location in
+program memory associated with the exported {\PAL} symbol [[arg]].
+We find the [[arg]] label by making a query to the Lua label table and making
+sure that the [[RAddr]] associated with the label has a valid permanent
+address.
+
+WARNING FIX [[unit]] is currently set here; this could break something.
+
+<<function definitions>>=
+CMM_label *cmm_find_export(const char *arg) {
+  lua_State *L = exports_table.L;
+  CMM_label *lbl;
+  RAddr      raddr;
+
+  lua_pushtable(L, exports_table);
+  lua_pushstring(L, arg);
+  lua_gettable(L, -2);
+
+  if (!lua_isuserdata(L, -1) ||
+      lua_tag(L, -1) != lua_CMM_label_tag ||
+      (lbl = lua_touserdata(L, -1)) == NULL ||
+      !CMM_label_defined(lbl))
+  {
+    lua_pop(L, 2);  /* pop bogus value, table */
+    return NULL;    /* signify failure */
+  }
+
+  lua_pop(L, 2);    /* pop label, table */
+
+  raddr = CMM_label_raddr(lbl);
+  assert(location_known(raddr));
+  assert(location(raddr) != 0);
+
+  /* FIX consider removing this */
+  unit = lbl->unit;
+
+  return lbl;
+}
+@ 

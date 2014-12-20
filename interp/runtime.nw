@@ -1,0 +1,759 @@
+\ifx\nointro\undefined
+\section{Introduction}
+
+\ifx\nointro\undefined
+This document contains the interface and implementation of the {\PAL} run-time system, as explained in CVS revision 1.60 of the {\PAL} Reference Manual.
+\fi
+Please see the manual for detailed information about the functions contained herein.
+\fi
+
+% ----------------------------------------------------------------------------
+\interface{[[runtime]] : {\PAL} Runtime System}
+% ----------------------------------------------------------------------------
+
+% ----------------------------------------------------------------------------
+\subsection{Types}
+% ----------------------------------------------------------------------------
+
+<<faux type declarations>>=
+typedef Cmm_Codeptr;
+typedef Cmm_Dataptr;
+typedef Cmm_Word;
+
+typedef Cmm_Activation;
+typedef Cmm_Cont;
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Creating and Running a Thread}
+% ----------------------------------------------------------------------------
+
+[[Cmm_CreateThread]] returns a {\PAL} continuation that will execute the {\PAL} call [[f(x)]], when run.
+[[Cmm_RunThread]] commences execution on a {\PAL} continuation (a suspended {\PAL} computation) as returned from [[Cmm_CreateThread]] or from 
+[[Cmm_GetUnwindCont]].
+
+<<function prototypes>>=
+Cmm_Cont        Cmm_CreateThread(Cmm_Codeptr f, Cmm_Dataptr x, void *s,
+                                 unsigned n, void **limit_cookie);
+Cmm_Cont        Cmm_RunThread   (Cmm_Cont *k);
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Walking the Stack}
+% ----------------------------------------------------------------------------
+
+<<function prototypes>>=
+Cmm_Activation  Cmm_YoungestActivation(const Cmm_Cont *k);
+int             Cmm_isOldestActivation(const Cmm_Activation *a);
+Cmm_Activation  Cmm_NextActivation(const Cmm_Activation *a);
+Cmm_Activation  Cmm_NextActivationUnsafe(const Cmm_Activation *a);
+int             Cmm_ChangeActivation(Cmm_Activation *a);
+void           *Cmm_FindLocalVar(const Cmm_Activation *a, unsigned n);
+unsigned        Cmm_LocalVarCount(const Cmm_Activation *a);
+void           *Cmm_FindDeadLocalVar(const Cmm_Activation *a, unsigned n);
+void           *Cmm_FindStackLabel(const Cmm_Activation *a, unsigned n);
+Cmm_Dataptr     Cmm_GetDescriptor(const Cmm_Activation *a, Cmm_Word token);
+Cmm_Cont        Cmm_GetUnwindCont(const Cmm_Activation *a, Cmm_Word index);
+Cmm_Cont        Cmm_MakeReturnContinuation(Cmm_Cont* k);
+typedef void Cmm_Reloc;
+void Cmm_CopyFrames(Cmm_Cont* c, int num_frames, void *newstack, unsigned n,
+                    void **limitp, Cmm_Reloc **relocp);
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{The Global Registers}
+% ----------------------------------------------------------------------------
+
+\emph{Note that we do not export [[%GlobalSize]] to {\PAL} for now.}
+
+<<faux {\PAL} prototypes>>=
+SaveGlobals( bits32 gp );
+RestoreGlobals( bits32 gp );
+%GlobalSize
+@ 
+
+<<function prototypes>>=
+void           *Cmm_FindGlobalVar(void *gp, int n);
+unsigned        Cmm_GlobalCount  (void);
+unsigned        Cmm_GlobalSize   (void);
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Controlling the Interpreter}
+% ----------------------------------------------------------------------------
+
+The runtime system exports two functions that allow the interpreter to be started up and shut down.
+[[Cmm_open]] must only be called once (unless [[Cmm_close]] was called since it was last called), and must be called before any other interpreter-related functions are called.
+[[Cmm_close]] should be called once, but not until after the interpreter has finished its work, and only after [[Cmm_open]] has been called.
+
+<<function prototypes>>=
+int  Cmm_open(int valstack_size, int argspace_size);
+void Cmm_close(void);
+@ 
+
+% ----------------------------------------------------------------------------
+\implementation{{\PAL} Interpreter Runtime System}
+% ----------------------------------------------------------------------------
+
+The header file for the {\PAL} runtime system is contained within [[runtime.h]].
+
+<<runtime.h>>=
+#ifndef _RUNTIME_H
+#define _RUNTIME_H
+
+#include "label.h"
+#include "interp.h"
+#include "thread.h"
+
+<<type definitions>>
+
+<<function prototypes>>
+
+#endif /* _RUNTIME_H */
+@ 
+
+We import a few global values from various modules of the interpreter; 
+namely, the number of globals in the loaded {\PAL} code, the array in which the {\PAL} global values are actually stored, and the Lua tags we use to store [[span]] values and [[CMM_label]]s in Lua tables.
+
+<<faux declarations for external definitions>>=
+extern int    num_globals;
+extern value *globals;
+extern int    lua_CMM_span_value_tag;
+extern int    lua_CMM_label_tag;
+@
+
+The implementation of the {\PAL} runtime system is contained within [[runtime.c]].
+
+<<runtime.c>>=
+#include "runtime.h"
+#include "underflowhandler.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include "interp.h"
+#include "value.h"
+#include "activation.h"
+#include "lualink.h"
+#include "ccall.h"
+#include "span.h"
+
+<<internal function prototypes>>
+
+<<thread functions>>
+<<stack-walking functions>>
+<<global register functions>>
+<<controlling the interpreter>>
+
+<<internal helpers>>
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Types}
+% ----------------------------------------------------------------------------
+
+The types used in the runtime system's interface are all [[typedef]]'d in reality.
+We actually use a [[CMM_label]] to represent a code pointer so that we can easily pass more information than simply a program counter (e.g., we can also pass around [[procedure]] records).
+
+<<type definitions>>=
+typedef CMM_label   *Cmm_Codeptr;
+@ 
+
+[[Cmm_Dataptr]] and [[Cmm_Activation]] are simply renamed (and capitalized) versions of their counterparts ([[dataptr]] and [[activation]]).
+
+<<type definitions>>=
+typedef dataptr      Cmm_Dataptr;
+typedef activation   Cmm_Activation;
+@ 
+
+A [[Cmm_Cont]] is simply a pointer to a [[continuation]] (which in turn
+is a pair of values: a stack pointer and a code pointer).
+
+<<type definitions>>=
+typedef continuation Cmm_Cont;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Creating and Running a Thread}
+% ----------------------------------------------------------------------------
+
+The work of creating a thread is farmed out to [[init_thread]], as defined in [[thread.nw]]; and the work of running a thread is taken care of by similarly defined [[run_interp]].
+\emph{FIX: for the moment, it is unclear what exactly [[Cmm_RunThread]] should return, if anything at all.}
+
+We also use some partially-static boot-up code to be able to run initial
+{\PAL} procedure [[f]] with argument [[x]].
+Unfortunately, for the moment, this means that if one were to inspect a
+new thread that has yet to be run, he would be surprised to find the thread
+suspended at this strange boot-up procedure and not at the procedure he
+wrote.
+
+<<thread functions>>=
+Cmm_Cont Cmm_CreateThread(Cmm_Codeptr f, Cmm_Dataptr x, void *s, unsigned n,
+                          void **limit_cookie) {
+  static unsigned  boot_id  = 0;
+  int              rc;
+  thread          *t;
+  CMM_label       *lbl_proc,
+                  *lbl_f,
+                  *lbl_x;
+  continuation     k;
+
+  char            *byteorder_string = (DEF_BYTE_ORDER == BIG ? "'BIG'" 
+                                                             : "'LITTLE'");
+
+  /* FIX -- MACHINE SPECIFIC */
+  char *bootstring = (char *) malloc(sizeof(char) * 1024);
+  sprintf(bootstring, "CMM.imports({'%s'})\n"
+
+                      "CMM.exports({'_boot_proc_%u',"
+                                   "'_boot_x_%u',"
+                                   "'_boot_f_%u'})\n"
+
+                      "CMM.section('_boot_section_%u')\n"
+                      "CMM.align(%d)\n"
+                      "CMM.define_label('_boot_x_%u')\n"
+                      "CMM.skip(%d)\n"
+
+                      "CMM.define_label('_boot_f_%u')\n"
+                      "CMM.skip(%d)\n"
+                      "CMM.procedure('_boot_proc_%u',1,0, {})\n"
+                      "CMM.push_symbol('_boot_x_%u')\n"
+
+                      "CMM.fetch(%d,%s,%d)\n"
+                      "CMM.store_arg(0)\n"
+                      "CMM.push_symbol('_boot_f_%u')\n"
+
+                      "CMM.fetch(%d,%s,%d)\n"
+
+                      "CMM.call({}, {}, {}, 0)\n"
+                      "CMM.cmm_return(0, 0)\n"
+                      "CMM.end_section()\n",
+
+                      CMM_label_raddr(((CMM_label *) f))->label->name, 
+                      boot_id, boot_id, boot_id,
+                      boot_id, DEF_ALIGN, boot_id, sizeof(value), 
+                      boot_id, sizeof(value), boot_id, boot_id,
+                      8*sizeof(value *), byteorder_string, DEF_ALIGN, boot_id,
+                      8*sizeof(void  *), byteorder_string, DEF_ALIGN);
+
+  boot_id++;
+
+  rc = load_assembly_unit(bootstring, SRC_STRING);
+  if (rc) {
+    fprintf(stderr, "error: could not boot up thread\n");
+    exit(1);
+  }
+
+  sprintf(bootstring, "_boot_proc_%u", boot_id - 1);
+  lbl_proc = cmm_find_export(bootstring);
+
+  sprintf(bootstring, "_boot_x_%u", boot_id - 1);
+  lbl_x    = cmm_find_export(bootstring);
+
+  sprintf(bootstring, "_boot_f_%u", boot_id - 1);
+  lbl_f    = cmm_find_export(bootstring);
+
+  free(bootstring);
+  assert(lbl_proc != NULL && lbl_x != NULL && lbl_f != NULL);
+
+  /* initialize thread */
+  k = init_thread(lbl_proc, s, n);
+  t = find_thread_c(&k);
+
+  *limit_cookie = t->stack_limit;
+
+  /* initialize f and x placeholders in loaded bootstring unit */
+  assert(location_known(CMM_label_raddr((CMM_label *) lbl_proc)));
+  assert(location_known(CMM_label_raddr((CMM_label *) lbl_f)));
+  assert(location_known(CMM_label_raddr((CMM_label *) lbl_x)));
+  {
+    void  **f_loc = ((void **) CMM_label_location(lbl_f));
+    value  *x_loc = ((value *) CMM_label_location(lbl_x));
+    
+    *f_loc = (void *) f;
+    if (x != NULL) {
+      *x_loc = *((value *) x);
+    }
+  }
+
+  return k;
+}
+
+Cmm_Cont Cmm_RunThread (Cmm_Cont *k) {
+  /* make sure k is a valid continuation */
+  check_cont(k);
+
+  run_interp(k);
+
+  /* FIX this function should not return! */
+  {
+    continuation k;
+    k.sp = NULL;
+    k.code = NULL;
+
+    return k;
+  }
+}
+
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Walking the Stack}
+% ----------------------------------------------------------------------------
+
+Walking the stack is very easy, given our representation of activation stacks.
+Implementing most of these stack-walking functions is as simple as pointer arithmetic based on what we know of a thread's stack layout (see the [[thread]]
+module for details).
+
+[[Cmm_YoungestActivation]] simply returns the newest activation record on
+the thread's stack (it should be located at [[t->stack_free - sizeof(activation)]]).
+It needs to work with both faux-continuations and real ones captured within
+{\PAL} code.
+<<stack-walking functions>>=
+Cmm_Activation Cmm_YoungestActivation(const Cmm_Cont *k) {
+  actptr *ap;
+  size_t  distance;
+
+  /* make sure k is a valid continuation */
+  check_cont(k);
+
+  distance = (size_t)(round_up((dataptr)NULL + sizeof(actptr *)));
+  ap = (actptr *) ((dataptr)(k->sp) - distance);
+  return *(*ap);
+}
+@ 
+
+[[Cmm_isOldestActivation]] looks if the local variable space associated with 
+the given activation is at the beginning of the thread's stack (is located
+at [[t->stack_base]]).
+<<stack-walking functions>>=
+int Cmm_isOldestActivation(const Cmm_Activation *a) {
+  return (a->caller->caller == NULL);
+}
+@
+
+[[Cmm_NextActivationUnsafe]] simply returns a pointer to the activation that
+is located just before the given activation's associated local variable space
+(at [[a->locals - sizeof(activation)]]).
+Note that this function does not in any way actually pop activations off
+the stack; it merely observes the next youngest activation.
+Unlike NextActivation, this will go all the way to the oldest activation.
+<<stack-walking functions>>=
+Cmm_Activation Cmm_NextActivationUnsafe(const Cmm_Activation *a) {
+  if (a->caller == NULL) {
+    fprintf(stderr, "[runtime sys.] already at oldest activation in thread\n");
+    runtime_sys_err();
+  }
+
+  return *(a->caller);
+}
+@ 
+[[Cmm_NextActivation]] simply returns a pointer to the activation that
+is located just before the given activation's associated local variable space
+(at [[a->locals - sizeof(activation)]]).
+Note that this function does not in any way actually pop activations off
+the stack; it merely observes the next youngest activation.
+<<stack-walking functions>>=
+Cmm_Activation Cmm_NextActivation(const Cmm_Activation *a) {
+  if (Cmm_isOldestActivation(a)) {
+    fprintf(stderr, "[runtime sys.] already at oldest activation in thread\n");
+    runtime_sys_err();
+  }
+
+  return *(a->caller);
+}
+@
+ 
+
+[[Cmm_ChangeActivation]] does not prune the stack either, but instead 
+conditionally changes a given activation handle--depending on whether we
+have walked off the stack or not.
+<<stack-walking functions>>=
+int Cmm_ChangeActivation(Cmm_Activation *a) {
+  if (a->caller->caller == NULL)
+    return 0;
+  else {
+    (*a) = *(a->caller);
+    return 1;
+  }
+}
+@ 
+
+[[Cmm_FindLocalVar]] returns a pointer to local variable number [[n]] in the
+given activation.
+<<stack-walking functions>>=
+void *Cmm_FindLocalVar(const Cmm_Activation *a, unsigned n) {
+  return (void *) (a->locals + n);
+}
+@ 
+
+[[Cmm_LocalVarCount]] returns the number of local variables in the given
+activation.
+<<stack-walking functions>>=
+unsigned Cmm_LocalVarCount(const Cmm_Activation *a) {
+  return (unsigned) (a->locals_end - a->locals);
+}
+@ 
+
+It is, for the moment, unclear whether or not this will do the trick for
+finding a ``dead local variable.''
+We look at the activation [[a]], which might be dead.
+If its [[locals]] pointer appears to be valid, we dereference it--offset by
+[[n]]; otherwise, we return [[NULL]].
+<<stack-walking functions>>=
+void *Cmm_FindDeadLocalVar(const Cmm_Activation *a, unsigned n) {
+  thread *t = find_thread(a->u);
+
+  if ((void *) a->locals >= t->stack_base
+      && (void *) a->locals < t->stack_limit)
+  {
+    return (void *) (a->locals + n);
+  } else {
+    return NULL;
+  }
+}
+@
+
+Given a continuation [[k]], [[Cmm_MakeReturnContinuation]] gives the continuation
+that says what happens after the function containing [[k]] returns.  This is not
+well-defined if the function can return to more than one continuation.
+
+<<stack-walking functions>>=
+Cmm_Cont Cmm_MakeReturnContinuation(Cmm_Cont* k) {
+  Cmm_Cont toret;
+  activation a;
+  
+  a = Cmm_YoungestActivation(k);
+  toret.sp = a.caller->stackdata;
+  toret.code = a.caller->pc;
+  
+  return toret;
+}
+
+
+@
+[[Cmm_CopyFrames]] copies frames from youngest to oldest on a stack.
+
+<<stack-walking functions>>=
+
+void Cmm_CopyFrames(Cmm_Cont* c, int num_frames, void *newstack, unsigned n,
+                    void **limitp, Cmm_Reloc **relocp)
+{
+  static bool underflow_handler_inited = 0;
+  static CMM_label *lbl_proc;
+
+  void* stack_limit;
+  Cmm_Activation* src; 
+  Cmm_Activation* dst;
+  Cmm_Activation* dst_caller;
+  Cmm_Activation oldest; /* Oldest frame to copy */
+  int i, j;
+  thread* t;
+  Cmm_Cont underflow_cont; 
+  Cmm_Cont* relocated_c;
+  
+  /* If we haven't compiled the underflow handler, we need to do that. */
+  if (!underflow_handler_inited) {
+    load_assembly_unit(Cmm_underflow_handler, SRC_STRING);
+    lbl_proc = cmm_find_export("_Cmm_underflow_handler");
+    assert(lbl_proc != NULL);
+    underflow_handler_inited = 1;
+  }
+
+  /* Find the oldest frame to copy. */
+  oldest = Cmm_YoungestActivation(c);
+  for(j = 1; j < num_frames && !Cmm_isOldestActivation(&oldest); j++) {
+    assert(Cmm_ChangeActivation(&oldest));
+  }
+
+  /* Here, we insert the stub at the bottom of the new stack.  We have a
+   * special case; if we copy the oldest activation, then we also copy
+   * the stub at the bottom. */
+  underflow_cont = init_thread(lbl_proc, newstack, n);
+  t = find_thread_c(&underflow_cont);
+  if (Cmm_isOldestActivation(&oldest)) {
+    dst_caller = NULL;
+    oldest = Cmm_NextActivationUnsafe(&oldest);  /* Copy the stub also. */
+    num_frames++;
+  } else {
+    Cmm_Cont* target_k;
+
+    dst_caller = actptr_from_sp(underflow_cont.sp); /* caller is the stub */
+
+    /* Set the return continuation. */
+    target_k = (Cmm_Cont*)dst_caller->stackdata;
+    target_k->code = oldest.caller->pc;
+    target_k->sp = oldest.caller->stackdata;
+  }
+  stack_limit = t->stack_limit;
+
+  /* Now, actually copy the frames. */
+  src = &oldest;
+  for(j = 0; j < num_frames; j++) {
+    if (NULL !=dst_caller) {
+      dst = Cmm_AllocFrameNext(Cmm_LocalVarCount(src), src->stackdata_end - src->stackdata, dst_caller->stackdata, stack_limit);
+    } else {
+      dst = Cmm_AllocFrameFirst(Cmm_LocalVarCount(src), src->stackdata_end - src->stackdata, t->stack_base, stack_limit);
+    }
+
+    /* copy stack data */
+    assert(dst->stackdata_end - dst->stackdata == src->stackdata_end - src->stackdata);
+    memcpy(dst->stackdata, src->stackdata, dst->stackdata_end - dst->stackdata);
+    
+    /* If c is a continuation in this stackdata, then we relocate it? */
+    /*
+    if (c >= src->stackdata && c < src->stackdata_end) {
+      relocated_c = copy->stackdata + (c - src->stackdata);
+    }*/
+      
+    
+    dst->pc            = src->pc;
+    dst->kappa         = src->kappa;
+    dst->u             = new_uid(t); /* can't dst a unique frame identifier.*/
+    dst->caller        = dst_caller;
+    dst->name          = src->name;
+    dst->proc          = src->proc;
+
+    /* copy local variables. */
+    for(i = 0; i < Cmm_LocalVarCount(src); i++) {
+      int* d = Cmm_FindLocalVar(dst, i);
+      int* s = Cmm_FindLocalVar(src, i);
+      assert(NULL != s);
+      assert(NULL != d);
+      *d = *s;
+      /*     Cmm_LocalVarWritten(dst, i); */
+    }
+
+    dst->callee = NULL;
+    if (dst_caller) {
+      dst_caller->callee = dst;
+    }
+    
+    dst_caller = dst;
+    src = src->callee;
+  }
+
+  
+  /* Modify the stack pointer of the continuation to point to the new stack. */
+  c->sp   = (void *) dst->stackdata;
+}
+@
+
+[[Cmm_FindStackLabel]] should return a pointer to the location in memory
+associated with the given activation's [[n]]th stackdata label.
+
+<<stack-walking functions>>=
+void *Cmm_FindStackLabel(const Cmm_Activation *a, unsigned n) {
+  table t = a->proc->stackdata_labels;
+  lua_State *L = t.L;
+  int nlabels;
+  unsigned offset;
+
+  /* look in table */
+  lua_pushtable(L, t);
+  nlabels = lua_getn(L, -1);
+  if (n >= nlabels) {
+    fprintf(stderr, "Cmm_FindStackLabel received too big of an 'n' for "
+                    "activation 'a' of procedure [%s]\n", a->name);
+    runtime_sys_err();
+  }
+
+  /* grab offset and pop Lua stack elements */
+  lua_rawgeti(L, -1, n+1);
+  lua_assert_isnumber(L, -1, "runtime system encountered bogus stackdata "
+                             "label offsets");
+  offset = (unsigned) lua_tonumber(L, -1);
+  lua_pop(L, 2); /* pop offset and table */
+
+  return (void *) ((dataptr)(a->stackdata) + offset);
+}
+@ 
+
+[[Cmm_GetDescriptor]] must look up the given [[token]] in the Lua span table of the given activation's thread; moreover, it must look for the innermost (table entry with greatest index) value associated with the token.
+Fortunately, the [[span]] module exports [[span_find_value]] to take care of 
+the job.
+<<stack-walking functions>>=
+Cmm_Dataptr Cmm_GetDescriptor(const Cmm_Activation *a, Cmm_Word token) {
+  return (Cmm_Dataptr) span_find_value((unsigned) a->pc, (unsigned) token);
+}
+@ 
+
+[[Cmm_GetUnwindCont]] returns a [[Cmm_Cont]]
+that encapsulates the [[index]]th unwind continuation of the specified
+activation ([[a]]), where an [[index]] value of [[0]] retrieves the first
+unwind continuation noted at [[a]]'s call site.
+Note that it is an unchecked, runtime error to attempt to cut to a previously
+saved [[Cmm_Cont]] that points to an activation that is (1) in the same thread
+as [[a]] and (2) is younger than [[a]], after the [[Cmm_Cont]] returned by
+[[Cmm_GetUnwindCont]] is cut to.
+\emph{Also note that the [[thread]] structure representing the thread in which [[a]] sits may not properly be freed, especially if [[Cmm_GetUnwindCont]] is used at some point.}
+<<stack-walking functions>>=
+Cmm_Cont Cmm_GetUnwindCont(const Cmm_Activation *a, Cmm_Word index) {
+  continuation k;
+  size_t       distance;
+  lua_State   *L      = lua_interpreter;
+  bytecodeptr  newpc;
+
+  if (Cmm_isOldestActivation(a)) {
+	fprintf(stderr, "cannot unwind below oldest activation on stack\n");
+    runtime_sys_err();
+  }
+
+  {
+    annotations    *ann = a->kappa;
+    CMM_label      *lbl;
+
+    lua_pushtable(L, ann->also_unwinds_to);
+    lua_rawgeti(L, -1, (int) (index + 1));
+    if (!lua_isuserdata(L, -1) ||
+        lua_tag(L, -1) != lua_CMM_label_tag ||
+        (lbl = lua_touserdata(L, -1)) == NULL)
+    {
+      lua_pop(L, 2); /* pop bogus value, table */
+      fprintf(stderr, "invalid unwind index %d given to Cmm_GetUnwindCont\n",
+                      (int) index);
+      runtime_sys_err();
+    }
+
+    lua_pop(L, 2);
+    newpc = CMM_label_location(lbl);
+  }
+
+  /* build continuation and return it */
+  /* RRO: we calculate 'distance' elsewhere too; we should put it one place */
+  distance = (size_t)(round_up((dataptr)NULL + sizeof(actptr *)));
+  k.code = newpc;
+  k.sp   = a->stackdata;
+
+  return k;
+}
+@
+
+% ----------------------------------------------------------------------------
+\subsection{The Global Registers}
+% ----------------------------------------------------------------------------
+
+We have full access to the global variables, so these three functions for accesing the global registers are easy to implement in their present form.
+We import [[int num_globals]] and the actual [[globals]] array from 
+the [[interp]] module.
+
+<<global register functions>>=
+void *Cmm_FindGlobalVar(void *gp, int n) {
+  if (n >= Cmm_GlobalCount() || n < 0) {
+    fprintf(stderr, "globals subscript out of range in Cmm_FindGlobalVar\n");
+    runtime_sys_err();
+  }
+
+  return (void *) (((value *) globals) + n);
+}
+unsigned Cmm_GlobalCount(void) {
+  return (num_globals < 0 ? 0 : (unsigned) num_globals);
+}
+unsigned Cmm_GlobalSize(void) {
+  return Cmm_GlobalCount() * sizeof(value);
+}
+@
+
+Although the next two functions are not explicitly provided as C functions in the interface to the runtime system, we use them to help export their functionality to {\PAL}.
+
+<<function prototypes>>=
+void Cmm_SaveGlobals_helper(unsigned gpu);
+void Cmm_RestoreGlobals_helper(unsigned gpu);
+@ 
+
+Standard function [[memcpy]] copies the entire [[globals]] array into the
+space located at the provided location ([[gpu]]).
+It is an unchecked runtime error for [[gpu]] to point to space that has not
+first been properly allocated by the runtime system's client.
+
+<<global register functions>>= 
+void Cmm_SaveGlobals_helper(unsigned gpu) {
+  void *gp = (void *) gpu;
+
+  if (num_globals <= 0) return;
+
+  if (gp == NULL) {
+    fprintf(stderr, "SaveGlobals given NULL pointer\n");
+    runtime_sys_err();
+  } else
+    gp = memcpy(gp, globals, Cmm_GlobalSize());
+}
+
+void Cmm_RestoreGlobals_helper(unsigned gpu) {
+  void *gp = (void *) gpu;
+
+  if (num_globals <= 0) return;
+
+  if (gp == NULL) {
+    fprintf(stderr, "RestoreGlobals given NULL pointer");
+    runtime_sys_err();
+  } else
+    globals = memcpy(globals, gp, Cmm_GlobalSize());
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Controlling the Interpreter}
+% ----------------------------------------------------------------------------
+
+So we can better control how the runtime system fits in with the interpreter, we wrap the interpreter's [[cmm_interp_open]] and [[cmm_interp_close]] functions.
+For one thing, this allows us to register select C functions in the runtime system with the interpreter (to be called from {\PAL}), while keeping the interpreter's implementation otherwise ignorant of the {\PAL} runtime system.
+
+<<controlling the interpreter>>=
+int Cmm_open(int valstack_size, int argspace_size) {
+  int rc = cmm_interp_open(valstack_size, argspace_size);
+
+  if (rc != 0) { return rc; }
+
+  /* register any necessary C functions with C-- */
+  register_c_func("SaveGlobals",    (void(*)(void)) Cmm_SaveGlobals_helper,
+                  "unsigned:void");
+  register_c_func("RestoreGlobals", (void(*)(void)) Cmm_RestoreGlobals_helper, 
+                  "unsigned:void");
+ 
+  <<load in the standard basis and store error code in [[rc]]>>
+
+  return rc;
+}  
+@ 
+
+We use a standard basis mainly to allow some old test code to work fine without
+being updated.
+
+<<load in the standard basis and store error code in [[rc]]>>=
+  {
+    char *standard_basis = "function CMM.c_call(s)    \n"
+                           "  CMM.push_symbol(s)      \n"
+                           "  CMM.call({}, {}, {}, 0) \n"
+                           "end                       \n";
+
+    rc = load_assembly_unit(standard_basis, SRC_STRING);
+  }
+@ 
+
+<<controlling the interpreter>>=
+void Cmm_close(void) {
+  cmm_interp_close();
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Error Handling}
+% ----------------------------------------------------------------------------
+
+If an error is encountered in one of the runtime system's functions, a call
+is made to private internal helper [[runtime_sys_err]].
+
+<<internal function prototypes>>=
+static void runtime_sys_err(void);
+@ 
+
+Callers of this function should expect it \emph{not} to return and thus
+print out any useful messages before calling it.
+
+<<internal helpers>>=
+static void runtime_sys_err(void) {
+  fprintf(stderr, "error: C-- runtime system error; cannot continue\n");
+  exit(1);
+}
+@ 
+

@@ -1,0 +1,320 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vi users, do your worst on this line!
+
+\section{Virtual frame pointer}
+
+This file contains some notes about a virtual frame pointer.
+One day it may contain a substitution algorithm.
+
+The problem we're trying to solve is how to deal with a stack pointer
+that moves around.
+\begin{itemize}
+\item
+In the presence of tail calls, a stack pointer may have at least three
+values: the value on entry, the value on exit, and the value between
+prolog and epilog.
+\item
+Depending on calling convention, the stack pointer may be moved by a
+callee.
+\item
+On some targets, it may be pleasant to use push or pop instructions to
+save or restore nonvolatile registers.
+\end{itemize}
+If the stack pointer moves, it is difficult to use it to address the
+activation record.  This note suggests a solution by means of a
+\emph{virtual frame pointer}.
+
+A virtual frame pointer is an immutable run-time value used to address
+locations on the stack.
+For simplicity, we say that the value of the virtual frame pointer is
+the value the stack pointer had at procedure entry.
+
+To use a virtual frame pointer effectively, we require certain
+conventions:
+\begin{itemize}
+\item
+All addressing expressions referring to data on the stack are written
+in the form $\mathtt{Fetch}(\vfp)+k$, where $k$~is a (possibly late) compile-time
+constant.\footnote
+{From here on, we omit the \texttt{Fetch}.}
+In particular, an addressing expression returned by the block
+abstraction is of
+the form \mbox{$\vfp+k$}.
+The stack pointer is never used in an addressing expression.
+\item
+The \vfp\ is immutable, so it never appears in an lvalue context.
+\item
+We normally set $\sp$ by an assignment of the form
+\mbox{$\sp \gets \vfp + k$}, but we might also adjust the stack pointer by an
+assignment of the form 
+\mbox{$\sp \gets \sp + k$}.
+\end{itemize}
+
+At procedure entry, the calling convention dictates where the stack
+pointer is relative to the overflow incoming parameters (and possibly
+return address).
+This is probably at the extreme young end of the stack (high or low
+depending on the direction of stack growth).
+In any case, the calling convention should provide not only the block
+and the locations of parameters but the location of the stack pointer.
+This location is, of course, where the virtual frame pointer points.
+
+To enter the procedure, we need to allocate its activation record and
+to move all the parameters, the return 
+address, and the callee-saves registers into their ``private''
+locations, where they reside for the duration of the procedure.
+\begin{enumerate}
+\item
+Find the extreme young end of the stack frame and call that
+location~$y$.
+Invent a fresh, late compile-time constant $n$~to stand for the frame
+size, and write the equation $y=\vfp-n$.
+\item
+Emit the instruction $\sp \gets \vfp-n$.
+\item
+Emit a big shuffle as a single RTL.
+This shuffle does all the moves noted above.
+It's the code expander's job to eliminate redundant moves and do the
+remaining moves in the right order.
+It's the job of 
+the code that chooses stack slots for variables and callee-saves
+registers to maximize the number of redundant moves.
+\end{enumerate}
+This prolog is very simple, but it may be hard to discover push
+instructions.
+On a machine that favors push instructions (such as the $x$86), 
+we might want a somewhat different prolog.
+
+The epilog works similarly, by issuing a big shuffle for the
+nonvolatile registers and the return value.
+
+After the stack is frozen, we can compute for each node~$n$ the equation
+\mbox{$\vfp = \sp+k_n$}, where  $k_n$~may be different at each node.
+This equation holds on any edge flowing into~$n$:
+consistency is required at each join point.
+We compute $k_n$ as a forward dataflow problem.
+We know that $\vfp$~is immutable, and that on entry $\vfp=\sp$.
+We can therefore start at the entry node and propagate information
+forward.
+\begin{itemize}
+\item
+If we encounter a node that doesn't touch \sp, nothing happens.
+\item
+If we know $\vfp=\sp+k$ and we
+ encounter a node with \mbox{$\sp \gets \sp+k'$}, 
+then after that node \mbox{$\vfp=\sp+(k-k')$}.
+\item
+If we know $\vfp=\sp+k$ and we
+ encounter a node with \mbox{$\sp \gets \vfp+k'$}, 
+then after that node $\vfp=\sp-k'$.
+\item
+If we encounter any other sort of node, the compiler is broken, and we
+halt with an assertion failure.
+\end{itemize}
+We also need to check the equations for consistency at each join point
+in the control-flow graph.
+
+After we have $\vfp=\sp+k_n$ on entry to each node, we can substitute
+appropriately for $\vfp$ and simplify.
+One hopes this step creates no additional work in the code expander.
+(In real life, we can probably combine the substitution and the
+computation. The code will appear in this file.) 
+
+
+Other notes:
+\begin{itemize} 
+\item 
+It is OK to add a possibly redundant assignment to \sp\ on an edge
+flowing out of a call site.
+If the call does change the stack pointer, it will be reset as needed.
+If the call does not change the stack pointer, the redundant
+assignment can be optimized away.
+\end{itemize}
+<<vfp.mli>>=
+val mk_space : Rtl.width       -> Space.t
+val mk       : Rtl.width       -> Rtl.exp
+val is_vfp   : Rtl.Private.loc -> bool
+val replace_with : sp:Rtl.loc -> Zipcfg.graph -> Zipcfg.graph * bool
+@ 
+<<vfp.ml>>=
+module D  = Dataflow
+module G  = Zipcfg
+module GR = Zipcfg.Rep
+module P  = Property
+module R  = Rtl
+module RP = Rtl.Private
+module RU = Rtlutil
+module Dn = Rtl.Dn
+module Up = Rtl.Up
+
+let impossf fmt = Printf.kprintf Impossible.impossible fmt
+
+let mk w = Rtl.fetch (Rtl.reg (('V', Rtl.Identity, Cell.of_size w), 0, Rtl.C 1)) w
+let is_vfp = function
+  | RP.Reg (('V', _, _), 0, _) -> true
+  | _ -> false
+@ 
+We replace $\vfp$ by $\sp+k$ using the identity
+$\vfp = \sp + (\vfp - \sp)$.
+<<vfp.ml>>=
+let unknown = max_int
+let matcher = { P.embed = (fun a -> P.Vfp a);
+                P.project = (function P.Vfp a -> Some a | _ -> None);
+                P.is = (function P.Vfp a -> true | _ -> false);
+              }
+
+let prop = Unique.Prop.prop matcher
+
+let fact sp = {
+  D.fact_name = "vfp location";
+  D.init_info = (sp, unknown);
+  D.add_info =
+    (fun (vfp, k as a) (vfp', k' as a') ->
+      let () = Debug.eprintf "vfp" "updating vfp dataflow fact\n" in
+      if k = k' then a
+      else if k = unknown then a'
+      else if k' = unknown then a
+      else (* accept inconsistency at exit and entry points to cut and unwind contn's *)
+        if false (* G.kind node =*= G.Exit || G.is_non_local_join node *) then a
+        else impossf "inconsistent stack-pointer location: %d and %d" k k');
+  D.changed = (fun ~old:(_, k) ~new':(_, k') -> k <> k');
+  D.prop = prop;
+}
+@ 
+<<vfp.ml>>=
+let replace_with ~sp =
+  let w = RU.Width.loc sp in
+  let spval = R.fetch sp w in
+  let sp = Dn.loc sp in
+  let sp_plus = RU.addk w spval in
+  let sp_plus k = Dn.exp (sp_plus k) in
+  <<supporting functions>> 
+  let fact = fact (Dn.exp spval) in
+  let middle_out (vfp, k) m txlim =
+    <<definition of [[simp]], which is verbose>>
+    let i = GR.mid_instr m in
+    let down = Dn.rtl i in
+    if RU.Exists.Loc.rtl is_vfp down then
+      let simp = match m with GR.Stack_adjust _ -> simp | _ -> Simplify.rtl in
+      let rtl = simp (replace_vfp vfp i) in
+      D.Rewrite (G.single_middle (G.new_rtlm rtl m))
+    else
+      D.Dataflow (note_sp_changes down vfp k) in
+
+  let last_outs (vfp, k) l txlim =
+    let upd vfp rtl = Simplify.rtl (replace_vfp vfp rtl) in
+    let set_succs (vfp, k as a) =
+      let upd_cedges ces =
+        let upd ce = note_sp_changes (Dn.rtl ce.G.assertion) vfp k in
+        D.Dataflow (fun set -> List.iter (fun ce -> set (fst ce.G.node) (upd ce))
+                                         ces) in
+      match l with
+      | GR.Cut  (_, ces, _) -> upd_cedges ces
+      | GR.Call c           -> upd_cedges c.GR.cal_contedges
+      | _ -> D.Dataflow (fun set -> GR.iter_succs (fun u -> set u a) l) in
+    let rewrite_assertions l fail =
+      let upd_cedges vfp k cedges succ =
+        if List.exists (fun ce -> RU.Exists.Loc.rtl is_vfp (Dn.rtl ce.G.assertion))
+                       cedges then
+          succ (List.map (fun ce -> {ce with G.assertion = upd vfp ce.G.assertion})
+                         cedges)
+        else fail () in
+      match l with
+      | GR.Cut (i, ces, r) ->
+          let upd ces = D.Rewrite (G.single_last (GR.Cut (i, ces, r))) in
+          upd_cedges vfp k ces upd
+      | GR.Call c ->
+          let upd ces =
+            D.Rewrite (G.single_last (GR.Call { c with GR.cal_contedges = ces })) in
+          let vfp, k = note_sp_changes (Dn.rtl (GR.last_instr l)) vfp k in
+          upd_cedges vfp k c.GR.cal_contedges upd
+      | _ -> fail () in
+    let i = GR.last_instr l in
+    let down = Dn.rtl (GR.last_instr l) in
+    let propagate () = match l with
+      | GR.Cut _ ->  set_succs (vfp, k)
+      | _        ->  set_succs (note_sp_changes down vfp k) in
+    if RU.Exists.Loc.rtl is_vfp down then
+      let l = G.new_rtll (upd vfp i) l in
+      rewrite_assertions l (fun () -> D.Rewrite (G.single_last l))
+    else rewrite_assertions l propagate in
+  let repl =
+    { D.F.name = "replace vfp";
+      D.F.middle_out = middle_out; D.F.last_outs = last_outs; } in
+  D.F.rewrite (fact, repl) ~entry_fact:(Dn.exp spval, 0)
+@ 
+<<definition of [[simp]], which is verbose>>=
+let simp rtl =
+  let str = Rtlutil.ToString.rtl in
+  let rtl' = Simplify.Unsafe.rtl rtl in
+  Debug.eprintf "vfp"
+    "Simplified stack adjustment from %s to %s\n" (str rtl) (str rtl');
+  rtl' in
+<<vfp.ml>>=
+let () = Debug.register "vfp" "stack adjustments for virtual frame pointer"
+@ 
+<<supporting functions>>=
+let replace_vfp value =
+  let is_vfp = function
+    | RP.Fetch (v, _) -> is_vfp v
+    | _ -> false in
+  RU.Subst.exp ~guard:is_vfp ~map:(fun _ -> value) in
+@ 
+All we ever have to cope with is $\sp \gets \sp \pm k'$.
+We have
+{\newcommand\post[1]{\bar{#1}}%
+\begin{eqnarray}
+\vfp &=& \sp + k\\
+\post\sp &=& \sp + k'\\
+\vfp &=& \post\sp + \post k\\
+\end{eqnarray}
+We solve for $\post k = k - k'$.}
+<<supporting functions>>=
+let rec note_sp_changes rtl vfp k =
+  if RU.Exists.Loc.rtl (RU.Eq.loc sp) rtl then
+    let k' = find_k'_added_to_sp rtl in
+    let post_k = k - k' in
+    sp_plus post_k, post_k
+  else
+    vfp, k
+and find_k'_added_to_sp (RP.Rtl ges) =
+  let rec find found k' = function
+    | [] -> k' (* could be zero if only assignment is guarded *)
+    | (RP.Const (RP.Bool b), RP.Store (sp', e, w)) :: ges when RU.Eq.loc sp sp' ->
+        if not b then
+          find found k' ges
+        else if found then
+          Impossible.impossible "multiple assignments to stack pointer"
+        else
+          (match e with
+          | RP.App (("add", [_]), [RP.Fetch(sp', _); RP.Const (RP.Bits k')])
+            when RU.Eq.loc sp' sp -> find true (Bits.S.to_int k') ges
+          | RP.App (("add", [_]), [RP.Const (RP.Bits k'); RP.Fetch(sp', _)])
+            when RU.Eq.loc sp' sp -> find true (Bits.S.to_int k') ges
+          | RP.App (("sub", [_]), [RP.Fetch(sp', _); RP.Const (RP.Bits k')])
+            when RU.Eq.loc sp' sp -> find true (- (Bits.S.to_int k')) ges
+          | RP.Fetch (sp', _)
+            when RU.Eq.loc sp' sp -> find true 0 ges
+		  |	_ -> Printf.printf "illegal sp assignment: sp := %s\n" (RU.ToString.exp (Up.exp e)) ; 0)
+(* RRO temp
+          | _ -> Impossible.impossible ("sp assigned other than sp + k: " ^
+                                        RU.ToString.exp (Up.exp e)))
+*)
+    | (g, RP.Store (sp', e, w)) :: ges when RU.Eq.loc sp sp' ->
+        Impossible.impossible ("assigned sp with nontrivial guard " ^
+                               Rtlutil.ToString.exp (Rtl.Up.exp g))
+    | (g, RP.Kill sp') :: ges when RU.Eq.loc sp sp' -> 
+        Impossible.impossible "killed sp"
+    | _ :: ges -> find found k' ges in
+  find false 0 ges in
+@ 
+<<vfp.ml>>=
+let mk_space w = 
+    { Space.space = ('V', Rtl.Identity, Cell.of_size w)
+    ; Space.doc = "holds the virtual frame pointer"
+    ; Space.indexwidth = w
+    ; Space.indexlimit = None
+    ; Space.widths = [w]
+    ; Space.classification = Space.Fixed
+    }
+@ 

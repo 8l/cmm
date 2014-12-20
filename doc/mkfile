@@ -1,0 +1,99 @@
+#
+# Manual pages, developer documentation, general musings
+#
+
+TOP     = ..
+
+<$TOP/config/config.mk
+<$TOP/config/latex.mk
+<$TOP/config/noweb.mk
+
+
+PS =            cfg.ps better.ps working.ps newtarget.ps modules.ps \
+                backend.ps refactor.ps qc--.ps qc--internals.ps	qc--interp.ps \
+		release.ps index.ps
+
+# ------------------------------------------------------------------ 
+# High level targets
+# ------------------------------------------------------------------ 
+
+all:V:          man ps-$config_has_latex
+ps-true:V: $PS
+
+ps-false:VQ:
+	# do nothing
+
+man:V: qc--.man
+
+update:V:       man release-$config_has_latex
+	cp qc--.1           $TOP/man/man1
+	cp qc--.1           $TOP/man/man1/qc--.opt.1
+	cp qc--internals.1  $TOP/man/man1
+	cp qc--interp.1     $TOP/man/man1
+
+release-true:V: release.ps
+release-false:VQ:
+	# do nothing
+
+update.opt:V:   update
+
+install:V: man install-release-$config_has_latex $install_man1
+	cp qc--.1          $install_man1/qc--.1
+	cp qc--.1          $install_man1/qc--.opt.1
+	cp qc--internals.1 $install_man1/qc--internals.1
+	cp qc--interp.1    $install_man1/qc--interp.1
+
+install-release-true:V: release.ps $install_doc
+	cp release.ps      $install_doc/release.ps
+
+install-release-false:VQ:
+	# do nothing
+
+install.opt:V: install
+
+clean:V:
+	rm -f *.dvi *.aux *.log *.toc [a-qs-z]*.ps refactor.ps
+	rm -f cfg.tex modules.ps*
+	rm -f stack.tex stack.inc index.tex index.inc
+	rm -f refactor.tex refactor.inc
+	rm -f qc--.pdf
+	rm -f qc--.man
+
+clean.opt:VQ:  
+	echo "nothing to do for $target"
+
+clobber:V:      clean                
+
+depend:VQ:
+	: "nothing to do for $target"
+
+# ------------------------------------------------------------------ 
+# The details
+# ------------------------------------------------------------------ 
+
+cfg.tex:D: cfg.nw
+	$NOWEAVE -delay $prereq > $target 
+refactor.tex:D: refactor.nw
+	$NOWEAVE -delay $prereq > $target 
+
+modules.ps:     modules.txt
+	a2ps -B -9 -r -f 12 -o $target modules.txt
+
+qc--.ps:        qc--.1
+	groff -man -Tps qc--.1 > $target 
+
+qc--internals.ps:   qc--internals.1
+	groff -man -Tps qc--internals.1 > $target 
+
+qc--interp.ps:  qc--interp.1
+	groff -man -Tps qc--interp.1 > $target
+
+# The qc--.man file is included as a string into the qc-- binary
+# and accessible from Lua as This.manual.
+
+qc--.man:D:     qc--.1
+	GROFF_NO_SGR=1 nroff -man -Tascii qc--.1 | ul -t dump > $target                
+
+release.tex:D: release.nw
+	noweave -delay $prereq > $target
+<$TOP/config/install.mk

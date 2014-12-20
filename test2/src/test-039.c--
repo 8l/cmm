@@ -1,0 +1,89 @@
+
+// execute the commands below to use this file as a test case
+//
+
+target byteorder little;
+
+
+section "text" 
+{
+
+    export sp1;
+    sp1 (bits32 n)
+    {
+        bits32 s,p;
+        if n == 0 {
+           return (0,1);
+        } else {
+            s, p = sp1(n-1);
+            return (s+n, p*n);
+        }
+    }
+            
+    export sp2;
+    sp2 (bits32 n)
+    {
+        jump sp2_help(n,1,1);
+    }
+
+    sp2_help (bits32 n, bits32 s, bits32 p)
+    {
+        if n==1 {
+            return (s,p);
+        } else {
+            jump sp2_help(n-1, s+n, p*n);
+        }
+        
+    }
+
+    export sp3;
+    sp3 (bits32 n)
+    {
+        bits32 s, p;
+        s = 1; p = 1;
+
+        loop:
+        if n == 1 {
+            return (s, p);
+        } else {
+            s = s+n;
+            p = p*n;
+            n = n-1;
+            goto loop;
+        }
+    }
+
+
+  sptest1 ("address" bits32 spfun, "address" bits32 name, bits32 n) {
+    bits32 s, p;
+    s, p = spfun (n);
+    foreign "C" printf ("address" fmt, "address" name, n, s, p);
+    return;
+  }
+
+  sptest (bits32 n) {
+    sptest1(sp1, sp1lbl, n);
+    sptest1(sp2, sp2lbl, n);
+    sptest1(sp3, sp3lbl, n);
+    return;
+  }
+
+  foreign "C" main (bits32 argc, "address" bits32 argv) {
+    sptest(1);
+    sptest(4); 
+    sptest(10);
+    foreign "C" return(0);
+  }
+
+}
+
+export main;
+import printf;
+
+section "data" {
+  sp1lbl: bits8[] "sp1\0";
+  sp2lbl: bits8[] "sp2\0";
+  sp3lbl: bits8[] "sp3\0";
+  
+  fmt: bits8[] "%s(%d) == (%d, %d)\n\0";
+}

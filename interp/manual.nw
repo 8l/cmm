@@ -1,0 +1,355 @@
+\ifx\nointro\undefined
+This document contains information about the interpreter.
+\fi
+
+% ----------------------------------------------------------------------------
+\section{The Quick~{\PAL} Interpreter Assembly Language}
+% ----------------------------------------------------------------------------
+
+The Quick~{\PAL} interpreter reads source code in a Lua-based assembly
+language.
+This assembly language contains much the same structure as C code.
+For example, the code below is some {\PAL} code that prints the value [[10]], 
+computes [[10 * 10]], prints this value, and then returns to the system:
+
+\begin{verbatim}
+target byteorder little
+       memsize   8
+
+export main;
+import bits32 print_int;
+
+section "text" {
+  square(bits32 x) {
+    return (%mul_trunc(x, x));
+  }
+
+  main() {
+    bits32 n;
+    bits32 result;
+
+    n = 10::bits32;
+    foreign "C" print_int(n);
+
+    result = square(n);
+    foreign "C" print_int(n);
+
+    return;
+  }
+}
+\end{verbatim}
+
+The above code, when properly translated, would result in the following Lua
+assembly code:
+
+\begin{verbatim}
+CMM.byteorder("LITTLE")
+CMM.memsize(8)
+
+CMM.exports({ "main" })
+CMM.imports({ "print_int" })
+
+CMM.section("text")
+   CMM.procedure("square", 1, 0, {})
+      CMM.fetch_arg(0)
+      CMM.store_local(0)
+
+      CMM.fetch_local(0)
+      CMM.fetch_local(0)
+      CMM.apply_operator("mul_trunc", "bits32,bits32:bits32")
+      CMM.store_arg(0)
+      CMM.cmm_return(0, 0)
+   CMM.end_procedure()
+
+   CMM.procedure("main", 2, 0, {})
+      CMM.push_literal("0xa", 32)
+      CMM.store_local(0)
+
+      CMM.fetch_local(0)
+      CMM.store_arg(0)
+      CMM.push_symbol("print_int")
+      CMM.call({}, {}, {}, 0)
+
+      CMM.fetch_local(0)
+      CMM.store_arg(0)
+      CMM.push_symbol("square")
+      CMM.call({}, {}, {}, 0)
+
+      CMM.fetch_arg(0)
+      CMM.store_local(1)
+
+      CMM.fetch_local(1)
+      CMM.store_arg(0)
+      CMM.push_symbol("print_int")
+      CMM.call({}, {}, {}, 0)
+
+      CMM.cmm_return(0, 0)
+   CMM.end_procedure()
+CMM.end_section()
+\end{verbatim}
+
+% ----------------------------------------------------------------------------
+\subsection{Source Code Functions}
+% ----------------------------------------------------------------------------
+
+The Quick~{\PAL} Interpreter reads in Lua source code that may make use of
+standard Lua functions as well as the following {\PAL} related functions:\\ 
+
+\def\oldmanentry#1#2#3#4{{\Tt{CMM.#1}\nwendquote} & $($#2$)$ & #3 \\\hline}
+
+\def\manentry#1#2#3#4{%
+{\Tt{\large{CMM.#1}}\nwendquote} & $($#2$)$ & #3 \\\hline%
+\multicolumn{3}{|l|}{\emph{e.g.:} {\Tt{\emph{\small{CMM.#1(#4)}}}\nwendquote}}%
+\\\hline\hline}
+
+\def\manheader{\textbf{Lua Function} & \textbf{Arguments} & %
+\textbf{Description} \\\hline\hline}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}%
+\begin{tabularx}{\linewidth}{|lY|Y|}\hline
+
+\manheader
+
+\manentry{comment}{\ldots}
+{Takes an arbitrary number of arguments and does nothing.}
+{"comment\_here", 10, nil}
+
+\manentry{new\_assembly\_unit}{}
+{Denotes the beginning of a separate assembly unit that should be loaded into
+a separate namespace.}
+{}
+
+% --
+
+\manentry{section}{$string$ [[name]]}
+{Begins the definition of a section named [[name]].}
+{"text"}
+
+\manentry{end\_section}{}
+{Marks the end of the current section.}
+{}
+
+\manentry{define\_label}{$string$ [[name]]}
+{Defines the label [[name]] at the current location in the bytecode stream.}
+{"label1"}
+
+\manentry{procedure}
+{$string$ [[name]]$, number$ [[numLocals]]$, number$ [[stackdataSize]]$, table$ [[stackdataLabels]]}
+{Defines the procedure [[name]] with a number of local variables equal to [[numLocals]] and stack-data of size [[stackdataSize]] (in bytes) at the present location. [[stackdataLabels]] lists offsets of labels into the stack-data.}
+{"main", 2, 8, \{\}}
+
+\manentry{end\_procedure}{}
+{Marks the end of the current procedure.}
+{}
+
+\manentry{continuation}{$string$ [[name]]}
+{Defines the continuation [[name]].}
+{"cont1"}
+
+\end{tabularx}
+
+\begin{tabularx}{\linewidth}{|lY|Y|}\hline
+
+\manentry{begin\_span}
+{$number$ [[token]]$, string$ [[value]]$, number$ [[offset]]}
+{Begins the definition of the [[token]] span.  Note that [[token]] must be a positive integer and [[value]] must be a {\PAL} label (where [[offset]] is an offset from this label).}
+{1, "label1"}
+
+\manentry{end\_span}{$number$ [[token]]}
+{Marks the end of the [[token]] span.}
+{1}
+
+\manentry{imports}{$stringTable$ [[imports]]}
+{Imports the externally defined labels stored as strings in numerically-indexed table [[imports]].  Must occur in assembly unit before all symbol definitions.}
+{\{ "malloc", "printf" \}}
+
+\manentry{exports}{$stringTable$ [[exports]]}
+{Exports from this assembly unit the labels stored as strings in numerically-indexed table [[exports]].  Must occur in assembly unit before all symbol definitions.}
+{\{ "main" \}}
+
+\manentry{memsize}{$number$ [[memsize]]}
+{Specifies the size of the smallest addressable piece of memory on the target architecture.}
+{8}
+
+\manentry{ptrsize}{$number$ [[ptrsize]]}
+{Specifies the size of a pointer on the target architecture.}
+{32}
+
+\manentry{byteorder}{$string$ [[byteorder]]}
+{Specifies the byte-order of the target architecture (is either [["LITTLE"]], [["BIG"]], or [["NATIVE"]]).}
+{"LITTLE"}
+
+\manentry{globals}{$number$ [[num_globals]]}
+{Specifies the number of global variables used in this assembly unit.}
+{4}
+
+% --
+
+\manentry{align}{$number$ [[align]]}
+{Aligns instructions/data that follow this call on an [[align]] [[memsize]] boundary.}
+{8}
+
+\manentry{skip}{$number$ [[n]]}
+{Skips (increases emitting location counter) by [[n]] [[memsize]] units.}
+{4}
+
+\end{tabularx}
+
+\begin{tabularx}{\linewidth}{|lY|Y|}\hline
+
+\manentry{data}{$number$ [[size]]$, table$ [[init]]}
+{Reserves space for data of bit-width [[size]]; if [[init]] is a non-nil table, then its numerically-indexed elements (which are each of size [[size]]) are stored in memory at the current location.}
+{32, \{ "0x3a4", "0x0" \}}
+
+\manentry{emit\_raddr}{$string$ [[s]]$, number$ [[offset]]}
+{Emits the address of symbol [[s]], offset by [[offset]] [[memsize]] units.}
+{"label1"}
+
+\manentry{push\_literal}{$string$ [[value]]$, number$ [[width]]}
+{Pushes literal [[value]] of width [[width]] onto the value stack.}
+{"0x10", 16}
+
+\manentry{push\_symbol}{$string$ [[label]]}
+{Pushes the value of [[label]] onto the value stack.}
+{"label1"}
+
+\manentry{fetch\_sp}{}
+{Pushes a pointer to the current activation's stackdata space onto the value stack.}
+{}
+
+\manentry{fetch}
+{$number$ [[size]]$, string$ [[byte_order]]$, number$ [[align]]}
+{Pops an address off the value stack and fetches [[size]] bits from that address in memory space, using [[byte_order]] byte-order and [[align]] alignment.  If [[align]] $= 0$, the machine's default alignment is used.}
+{32, "BIG", 4}
+
+\manentry{fetch\_local}{$number$ [[index]]}
+{Fetches local variable [[index]] and pushes it onto the value stack.}
+{2}
+
+\manentry{fetch\_global}{$number$ [[index]]}
+{Fetches global variable [[index]] and pushes it onto the value stack.}
+{1}
+
+\end{tabularx}
+
+\begin{tabularx}{\linewidth}{|lY|Y|}\hline
+
+\manentry{store}
+{$number$ [[size]]$, number$ [[byte_order]]$, number$ [[align]]}
+{Pops a value and an address off the value stack, and then stores that value at that address in memory space, using [[byte_order]] byte-order and [[align]] alignment.  If [[align]] $= 0$, the machine's default alignment is used.}
+{8, "NATIVE", 0}
+
+\manentry{store\_local}{$number$ [[index]]}
+{Pops a value off the value stack and stores it in local variable [[index]].}
+{1}
+
+\manentry{store\_global}{$number$ [[index]]}
+{Pops a value off the value stack and stores it in global variable [[index]].}
+{2}
+
+\manentry{gstore}
+{$number$ [[size]]$, number$ [[byte_order]]$, number$ [[align]]}
+{Pops a value, an address, and a boolean off the value stack; if the boolean is true, the value is stored at that address in memory space, using [[byte_order]] byte-order and [[align]] alignment. If [[align]] $= 0$, the machine's default alignment is used.}
+{16, "LITTLE", 1}
+
+\manentry{gstore\_local}{$number$ [[index]]}
+{Pops a value and a boolean off the value stack; if the boolean is true, the value is stored in local variable [[index]].}
+{4}
+
+\manentry{gstore\_global}{$number$ [[index]]}
+{Pops a value and a boolean off the value stack; if the boolean is true, the value is stored in global variable [[index]].}
+{4}
+
+\end{tabularx}
+
+\begin{tabularx}{\linewidth}{|lY|Y|}\hline
+
+\manentry{store\_arg}{$number$ [[index]]}
+{Pops a value off the value stack and stores it in argument space at index [[index]].}
+{3}
+
+\manentry{fetch\_arg}{$number$ [[index]]}
+{Fetches value in argument space at index [[index]] and pushes it onto the value stack.}
+{7}
+
+% --
+
+\manentry{apply\_operator}{$string$ [[stem_name]]$, string$ [[bit-widths]]}
+{Applies operator [[stem_name]] to some nonnegative number of values atop the value stack (popping any such values off), and pushes the result onto the stack; [[bit-widths]] is a string-based type signature for the operator (e.g., [["bits32,bits16:bits8"]]).}
+{"divu", "bits32,bits32:bits32"}
+
+\manentry{fetch\_rounding}{}
+{Pushes onto the value stack the 2-bit value representing the current hardware floating-point rounding mode.}
+{}
+
+\manentry{store\_rounding}{}
+{Pops a 2-bit value off the value stack and sets the current hardware
+floating-point rounding mode to this value.}
+{}
+
+\manentry{goto}{}
+{Pops an address off the value stack and sets the program counter to the address.}
+{}
+
+\manentry{cbrancht}{$string$ [[destLabel]]}
+{Pops a boolean off the value stack; if the boolean is true, the program counter is set to the address of label [[destLabel]].  Otherwise, control flow falls through.}
+{"label1"}
+
+\end{tabularx}
+
+\begin{tabularx}{\linewidth}{|lY|Y|}\hline
+
+\manentry{cbranchf}{$string$ [[destLabel]]}
+{Pops a boolean off the value stack; if the boolean is false, the program counter is set to the address of label [[destLabel]].  Otherwise, control flow falls through.}
+{"label1"}
+
+\manentry{branchtf}{$string$ [[labelT]]$, $ [[labelF]]}
+{Pops a boolean off the value stack; the program counter is set to the address of label [[labelT]] if the boolean is true, and to the address of label [[labelF]] if the boolean is false.}
+{"label1", "label2"}
+
+\manentry{call}
+{$stringTable$ $\kappa_{[[cuts]]}, stringTable$ $\kappa_{[[unwinds]]}, stringTable$ $\kappa_{[[returns]]}, number$ [[aborts]]}
+{Pops an address off the value stack and makes a call to the procedure located at the address, with the given call-site annotations.
+Annotations are ignored if procedure is a foreign C procedure; C procedures must have previously been registered with the interpreter using exported function [[register_c_func]].}
+{\{ "cut\_cont", "another" \}, \{\}, \{\}, 1}
+\manentry{cmm\_tail\_call}{}
+{Pops an address off the value stack and makes a tail call to the {\PAL} procedure located at the address.}
+{}
+
+\manentry{cmm\_return}{$number$ [[index]]$, number$ [[count]]}
+{Returns to alternate return [[index]] of the the current activation's caller, which has [[count]] return sites.}
+{0, 0}
+
+\manentry{cut}{}
+{Pops an address off the value stack and cuts to the continuation located at the address.}
+{}
+
+\end{tabularx}
+
+% ----------------------------------------------------------------------------
+\section{Inspection Functions for Lua}
+% ----------------------------------------------------------------------------
+
+To allow a user of the interpreter to inspect some details of the interpreter's
+internals, we provide a Lua-based inspection facility.
+
+The following Lua functions are currently exported to Lua source code run
+through the interpreter:\\
+
+\def\inspectentry#1#2#3{%
+{\Tt{\large{CMM.inspect.#1}}\nwendquote} & $($#2$)$ & #3 \\\hline\hline}
+
+\def\inspectheader{\textbf{Lua Function} & \textbf{Arguments} & %
+\textbf{Description} \\\hline\hline}
+
+\begin{tabularx}{\linewidth}{|lY|Y|}\hline
+
+\inspectheader
+
+\inspectentry{dump\_operators}{}
+{Writes to [[stdout]] an alphabetically sorted list of all {\PAL} operators registered (and thus available for use) in the interpreter, as well as a comprehensive list of all types at which these operators are instantiated.}
+
+\inspectentry{dump\_ccall}{}
+{Writes to [[stdout]] a list of all C function type signatures registered with the interpreter's C calling mechanism, as well as a list of all C functions that have been thus far registered with the interpreter's C calling mechanism.}
+
+\end{tabularx}

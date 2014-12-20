@@ -1,0 +1,338 @@
+                         Quick C-- Test Suite
+                         ~~~~~~~~~~~~~~~~~~~~
+
+This directory contains the regression test suite for qc--. Tests are
+configured using .tst files and run using the testdrv.lua driver for qc--.
+
+Using the LUA test driver for qc--
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To run the test file, name.tst, type:
+
+  mk name.tst
+
+This will build the test driver and execute it with the name.tst
+configuration file. The mkfile assumes that ../bin/qc-- is the binary
+you want to test with, make sure you have run a `mk update` in the src
+directory before testing.
+
+To run the driver manually:
+
+  ../bin/qc-- testdrv.lua name.tst
+
+The test driver will run through each source files listed in name.tst
+and compare the compilers output to the expected output. For each
+error detected a line will be printed that can then be executed to get
+more information on the error. For example:
+
+> mk example.tst
+../bin/qc-- testdrv.lua example.tst
+../bin/qc-- -v testdrv.lua example.tst add.c--.test      # FAILED { .s } differ
+../bin/qc-- -v testdrv.lua example.tst bits-bug.c--.test # FAILED { .s } differ
+../bin/qc-- -v testdrv.lua example.tst cut.c--.test      # FAILED { .s } differ
+../bin/qc-- -v testdrv.lua example.tst hello.c--.test    # FAILED { .s1 } differ
+4 errors detected.
+
+Executing the given lines will give detailed information, and also
+provide a command line that can be used to update the differing files.
+In the case of hello.c-- this would be:
+
+> ../bin/qc-- testdrv.lua example.tst hello.c--.record
+x86/hello.s     has not changed
+x86/hello.s1    has changed             !! updating !!
+x86/hello.s2    has not changed
+x86/hello.1     has not changed
+x86/hello.2     has not changed
+
+If a test case works normally but fails with optimization turned on,
+one can isolate the exact breaking transformation with <name>.iso, e.g.,
+
+  qc--.opt testdrv.lua Backend.x86.improve=Optimize.improve lcc.x86.tst wf1.iso
+
+For more information on the format of the test configuration files,
+see testdrv.nw.
+
+
+Test Configuration Files
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Test cases are configured in test configuration files with the
+extension "tst". Each test file is a lua source file that defines a
+number of lua values. Any values or functions defined by the qc--
+compiler can be manipulated along with the following test driver
+specific values:
+
+  Test.verbose - turn on detailed output (same as -v flag).
+  Test.asmdir  - directory containing expected assembly-output files.
+  Test.outdir  - directory containing expected stdout, stderr, etc files.
+                 (defaults to 'output') 
+  Test.source  - directory containing source files.
+  Test.files   - list of source files to test.
+  Test.update  - force differing files to be updated.
+  Test.keep    - keep all temporary files generated during testing
+
+  Test.color   - force use of graph-coloring register allocator, and
+                 when assembling foo.c--, compare with foo-color.s.
+                 (Ignored by dummy tests.)
+
+Test.files is a table containing information about each test case.  A
+`test case' consists of multiple `source files', which are linked
+together and then run.  The first source file should always be the one
+containing the main() function; this convention will ensure that the
+C-- globals work out right.  The test driver supports the common case
+in which a test case has a single source file.  Each entry in
+Test.files can be either the name of a source file, for this common
+case, or a table containing detailed information about the test
+case. Any fields not provided will be given reasonable default values.
+A list of the available fields and their default values is given
+below.
+
+field  default    description
+--------------------------------------------------------------------
+name     basename   name for this test case
+runnable "true"     "true" if test case produces runnable program
+source   N/A        source file or list of source files (required field)
+argv     ""         additional arguments used in command string (one per test)
+stdin    /dev/null  standard input file (one per test)
+stdout   <name>.1   expected standard output file (one per test)
+stderr   <name>.2   standard error file (one per test)
+asm      <name>.s   list of assembly output files (one per source file)
+asmout   <name>.s1  list of expected compiler standard output files (one per source)
+asmerr   <name>.s2  list of expected compiler standard error files (one per source)
+outdir   "output"   directory containing stdout, stderr, asmout, and asmerr
+other    nil        additional sources to link with.
+force    nil        run this test even if all .s files looked good
+
+All of the table entries are optional except for source. If the name
+field is omitted, then it will be assigned to the basename of the
+first source file. If the source file is called "/a/b/c/test.c", then the
+default name field will be "test". If a filename contains a '/' then
+it will be treated a a path relative to the current directory. If the
+filename does not contain a '/', then the file is assumed to be in the
+Test.source directory if it is a source file or a standard input file.
+Otherwise, the file is assumed to be in the Test.asmdir directory if a
+.s file, and the Test.outdir directory otherwise..
+
+The code the assigns defaults is in function Test.complete_test_table.
+Here is an example of how defaults are assigned:
+
+ Test.source = "src"
+ Test.asmdir = "x86"
+ Test.outdir = "output"
+ Test.files = {
+  { name   = nil         ---->  "test"
+  , source = "test.c"    ---->  { "src/test.c" }
+  , stdin  = nil         ---->  "src/test.0"
+  , stdout = "../out"    ---->  "./../out"
+  , stderr = nil         ---->  "x86/test.2"
+  , asm    = "ppc/tst.s" ---->  { "./ppc/tst.s" }
+  , asmout = "test2.s1   ---->  { "x86/test2.s1" }
+  , asmerr = "/dev/null" ---->  "/dev/null"
+  }
+ }
+
+Test configuration files may contain custom error handlers for
+specific files or file types. When an error is detected, the test
+driver will first look for an error handler associated with the file
+that has caused the error. If one is not found, then a handler
+associated with the file extension is executed. The test driver
+provides default error handlers for all of the known extensions. The
+example below adds a special error handler for the assembly output of
+the add.c-- source file.
+
+ function Test.on_error["add.s"](expected, output)
+   print("error in add.c--")
+   -- call default handler for .s files
+   Test.on_error[".s"](expected, output)
+ end
+
+
+Using a Test File Generator
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Test cases may be generated by using a test case generator program. In
+order to use a test generator, specify a source file with the name of
+the test case generator and with the extension "gen". When a source
+file with the "gen" extension is found, the test generator will be run
+to generate the test case. The test generator must produce a valid C--
+file on standard output. Additional arguments can be supplied through
+the args field. The name field can be used to name the output files
+for each generated test case. Consider as an example a test generator
+named "opgen" that takes a single integer parameter.
+
+This configuration file:
+
+  Test.source  = "."
+  Test.asmdir = Test.asmdir or "x86"
+  Test.files =
+   { { name = "ops100" , source = "opgen.gen", args = "100" }
+   , { name = "ops200" , source = "opgen.gen", args = "200" }
+   }
+
+will run the opgen command with the parameter 100 and compare all
+outputs to the files with basename ops100. Then, it will run the opgen
+program with the parameter 200 and compare the results to the files
+with basename ops200.
+
+
+Comparing code-size results
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For any test file, you can get the test driver to count the number of
+lines of assembly code emitted.  (This option turns off the emission
+of the run-time system's initialized data.)  This is useful primarily
+for comparing different versions of the compiler.  For example, the
+following run shows that the simple peephole optimizer trims the code
+size by about a third on the lcc test suite:
+
+  % ../bin/qc--.opt testdrv.lua lcc.x86.tst lcc.count    
+  Assembly-code counts for 15 files written to lcc.count                          
+  % ./qcp testdrv.lua lcc.x86.tst lcc-opt.count          
+  Assembly-code counts for 15 files written to lcc-opt.count                      
+  % lua40 compare.lua lcc.count lcc-opt.count 
+                              lcc lcc-opt
+  lcc/fields.c--              535    368   68%
+  lcc/switch.c--             1564   1241   79%
+  lcc/incr.c--                239    108   45%
+  lcc/wf1.c--                 816    549   67%
+  lcc/sort.c--                595    414   69%
+  lcc/init.c--                475    385   81%
+  lcc/spill.c--               384    263   68%
+  lcc/array.c--               507    409   80%
+  lcc/8q.c--                  350    285   81%
+  lcc/limits.c--              537    406   75%
+  lcc/cvt.c--                1653    833   50%
+  lcc/front.c--               497    336   67%
+  lcc/struct.c--             1163    633   54%
+  lcc/cf.c--                  324    233   71%
+  TOTALS                     9639   6463   67%
+
+
+
+Frequently asked questions
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Q: When I create a new test case, how do I add it to the test suite?
+
+A: First, add the c-- source files to the src directory along with any
+inputs you would like to pass to the program. If the new test is
+called "test" then you would add test.c-- and test.0 to the src
+directory. Then, select one or more test files to add your test to.
+Currently, there are test files for each backend, and one for the
+Tiger frontend. If the new test is applicable to all back-ends, then
+it should be added to all of the backend test files. If it is a test
+of the frontend, then it can be added to the dummy backend only. Once,
+the new test has been entered into the test file, record the outputs
+with the following command:
+
+> ../bin/qc-- testdrv.lua <test file>.tst test.c--.record
+
+This will create files with the extensions 1, 2, s, s1, and s2. Look
+over these files and submit them to the CVS repository.
+
+Q: What if I want to update a bunch of tests all at the same time?
+
+A: You can update all of the tests in a test file by setting a lua
+variable on the command line. Be aware that the test driver will not
+check to see if the tests pass, it will simply update the output
+files. You should double check the outputs using CVS before
+submitting.
+
+> ../bin/qc-- testdrv.lua <test fil>.tst Test.update=1
+
+This command will automatically update all of the output files that
+differ in the given test configuration file.  NOTE WELL that just
+putting `Test.update=1' on the mkfile line achieves nothing!
+
+Q: What existing tests are there and what do they represent?
+
+A: Currently, there is a test file for each backend, one for trusted
+tests, and one for the Tiger frontend. The backend test files are
+named "all.<backend>.tst", and should contain all tests that can be
+run against the backend. The file "trusted.tst" contains trusted
+tests. These are tests for which the output of running the compiled
+program can be used to determine if the test is passed. Trusted tests
+may generate different assembly language, but still pass if their
+outputs are the same. The "tiger.tst" file contains test from the
+tiger frontend.
+
+
+Q: Is there a special place for tests that don't run but that are
+intended to elicit error messages from the compiler?
+
+A: These tests can be added to the dummy backend.
+
+
+Q: When I change the compiler, if I expect it to produce identical
+assembly code, what should I run?
+
+A: Run "mk" in the test directory to execute all of the test files. If
+you only want to test a specific backend then you may also run, for
+instance, "mk all.x86.tst".
+
+
+Q: When I change the compiler, if I expect it to produce different
+assembly code that is semantically equivalent, what should I run? If
+the tests compile and run OK, how do I tell the system that the new
+assembly language is right?
+
+A: If you expect to produce different assembly code, then on the
+trusted tests can be used reliably. In this case run "mk trusted.tst".
+You will be notified of any non-fatal outputs that do not match, and
+you will be given command that you can run to inspect and update the
+differences.
+
+Q: What if a test requires more than one file?
+
+A: Tests that require additional files can be configured by adding the
+additional sources to the "other" field in the test case. Instead of
+simply listing the c-- source file name, you would enter a line like:
+
+  { source="test.c--" other="other.c lib.a" }
+
+The "other" line is passed directly to gcc along with the assembly
+output from the c-- sources. The above line would result in this
+invocation of gcc:
+
+  gcc -o test test.s other.c lib.a
+
+
+Q: What should I do if I want to test an alternative compiler pass,
+such as an optimization pass or replacement register allocator?
+
+A: If you're testing a new component of the compiler that will produce
+different assembly language, then you may want to set up new asmdir
+and outdir directories and record all of the outputs. If you only
+expect a few number of cases to produce different assembly, you may
+want to just set up alternate outputs for the few cases. In either
+case, a new test file will need to be setup for the tests.
+
+
+Q: How do I test the graph-coloring register allocator?
+
+A: If you want to compare with the existing register allocator, run
+your tests with the command-line assignment
+'backend.ralloc=Ralloc.color'.  Such tests should show different .s
+files but otherwise identical results.
+
+If you are working on the graph-coloring allocator itself, run your
+tests with 'Test.color=1'.  This assignment will compare your .s
+results against previous results obtained with the same allocator.
+
+
+
+Things that are here
+~~~~~~~~~~~~~~~~~~~~
+
+The files and directories living here are:  [OBSOLETE DOCO]
+
+   README      - this file
+   src/        - source files for test cases
+   x86/        - expected outputs for x86 backend
+   dummy/      - expected outputs for dummy backend
+   testdrv.nw  - lua test driver
+   mkfile      - mkfile for lua test driver and .tst files
+   *.tst       - test configuration files for testdrv.lua
+
+There used to be an old framework called testqc, but it went to the
+Big Attic in October, 2004.

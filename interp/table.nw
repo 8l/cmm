@@ -1,0 +1,136 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*- %
+
+\ifx\nointro\undefined
+This document contains the interface and implementation of tables; these ``tables'' are essentially wrappers for Lua tables.
+\fi
+
+% ----------------------------------------------------------------------------
+\interface{[[table]] : Dynamic, Associative Arrays}
+% ----------------------------------------------------------------------------
+
+We choose to use tables (dynamic, associative arrays) in our representation of various pieces of data.
+This interface allows easy manipulation of tables with Lua; additionally, the
+macros in this interface ensure that a [[table]] used in C will not be
+accidentally garbage-collected by Lua.
+
+<<table.h>>=
+#ifndef _TABLE_H
+#define _TABLE_H
+
+#include <assert.h>
+
+#include <lua.h>
+#define  LUA_LOCK 1
+
+<<type definitions>>
+<<macro definitions>>
+<<function prototypes>>
+
+#endif /* _TABLE_H */
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Data Structures}
+% ----------------------------------------------------------------------------
+
+The [[table]] data structure allows us to encapsulate all information we need to know about a given table.
+
+<<type definitions>>=
+typedef struct {
+  lua_State  *L;      /* the Lua interpreter in which this reference works */
+  int         data;   /* this is a Lua reference to a Lua table */
+} table;
+@ 
+
+These tables are actually stored using embedded Lua tables that may be manipulated using the convenience macros defined in [[table.nw]].
+References to Lua tables are handed across the C/Lua interface as [[int]]s, 
+hence the strange [[int]] member of this record type.
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Helpers}
+% ----------------------------------------------------------------------------
+
+[[fresh_table]] creates a new [[table]] structure with properly initialized data members.
+[[free_table_data]] frees the data stored in a [[table]] structure, but does \emph{not} free the argument [[table]] structure itself.
+
+[[lua_pushtable]] pushes the given table atop the Lua stack.
+[[lua_table_foreach]] applies the Lua function named in string [[str]] to
+each key-value pair in table [[t]]; it returns a Lua error code (see 
+[[lua_error_handle]] in module [[interp]] for information on handling Lua
+error codes).
+
+<<function prototypes>>=
+table fresh_table(void);
+@ 
+
+<<faux prototypes>>=
+void  free_table_data  (lua_State *L, table t);
+void  lua_pushtable    (lua_State *L, table t);
+int   lua_table_foreach(lua_State *L, table t, const char *str);
+@ 
+
+% ----------------------------------------------------------------------------
+\implementation{Dynamic, Associative Arrays}
+% ----------------------------------------------------------------------------
+
+<<table.c>>=
+#include "table.h"
+#include <assert.h>
+
+<<function definitions>>
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Functions}
+% ----------------------------------------------------------------------------
+
+[[fresh_table]] simply creates a fresh [[table]] structure, initializing its
+Lua table reference to [[LUA_NOREF]] and its [[lua_State *]] to [[NULL]].
+
+<<function definitions>>=
+table fresh_table(void) {
+  table new_table;
+
+  new_table.L    = NULL;
+  new_table.data = LUA_NOREF;
+
+  return new_table;
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Macros}
+% ----------------------------------------------------------------------------
+
+[[lua_pushtable]] looks for the table referred to by a given [[table]]
+structure; if it does not exist, the table is created in the given Lua
+interpreter.
+Either way, the table is left atop the Lua stack.
+
+Note that a [[table]] structure must be passed in, not a pointer to one.
+
+<<macro definitions>>=
+#define lua_pushtable(LS, TAB) \
+if ((TAB).data == LUA_NOREF || (TAB).data == LUA_REFNIL) { \
+  lua_newtable((LS)); \
+  (TAB).L    = (LS);  \
+  (TAB).data = lua_ref((LS), LUA_LOCK); \
+  assert((TAB).data != LUA_NOREF && (TAB).data != LUA_REFNIL); \
+} \
+assert(lua_getref((LS), (TAB).data));
+@
+
+[[free_table_data]] simply releases the lock on the given table's Lua
+representation, effectively throwing away the Lua table and allowing it to be
+garbage-collected by Lua.
+Here also, a [[table]] structure itself must be passed in, and not a
+[[table *]].
+
+<<macro definitions>>=
+#define free_table_data(L, TAB) \
+if ((TAB).data != LUA_NOREF && (TAB).data != LUA_REFNIL) { \
+  lua_unref((L), (TAB).data);  \
+  (TAB).L    = NULL;           \
+  (TAB).data = LUA_NOREF;      \
+}
+@

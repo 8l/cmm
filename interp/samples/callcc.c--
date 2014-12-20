@@ -1,0 +1,100 @@
+target byteorder little
+       memsize     8
+       wordsize    32
+       pointersize 32
+;
+
+export main;
+export stealer;
+
+import bits32 first_class_continuation;
+import bits32 cmmprint32;
+import bits32 Fe_StealMyReturnContinuation;
+import bits32 Fe_DontStealMyReturnContinuation;
+
+section "text" {
+  prscall(bits32 g, bits32 x) {
+    foreign "C" Fe_StealMyReturnContinuation(r) also cuts to r;
+    g(x);
+    Fe_DontStealMyReturnContinuation(r);
+    return;
+    continuation r():
+      return;
+  }
+
+  sum() {
+    bits32 i, acc;
+
+    bits32 cont;
+
+    cont = foreign "C" first_class_continuation( blah ) also cuts to blah;
+   // cmmprint32(cont);
+    return (cont);
+
+    continuation blah():
+  
+      acc = 0;
+  loop:
+    acc = acc + i;
+    i = i + 1;
+    if (i < 2) {
+      goto loop;
+    }
+    return(acc);
+  }
+  
+
+  fact() {
+    bits32 i, acc;
+
+    bits32 cont;
+
+    cont = foreign "C" first_class_continuation( blah ) also cuts to blah;
+   // cmmprint32(cont);
+    return (cont);
+
+    continuation blah():
+  
+    acc = 1;
+    i = 1;
+  loop2:
+    acc = acc * i;
+    i = i + 1;
+    if (i < 10) {
+      goto loop2;
+    }
+    //cmmprint32(acc);
+    cont = foreign "C" first_class_continuation( blah ) also cuts to blah;
+    //cmmprint32(cont);
+    return(cont);
+  }
+
+  main(bits32 globals) {
+   bits32 fact_cont, sum_cont, cont,i;
+
+    prscall(stealer, globals);
+    i = 0;
+    top2:
+      i = i - 1;
+      cmmprint32(i);
+      goto top2;
+
+    fact_cont = fact();
+    sum_cont = sum();
+
+    //cmmprint32(fact_cont);
+    cont = foreign "C" first_class_continuation( fact_cont );
+    //cmmprint32(cont);
+    cut to cont() also aborts;
+  }
+
+  stealer(bits32 globals) {
+    bits32 i;
+
+    i = 0;
+    top:
+      i = i + 1;
+      cmmprint32(i);
+      goto top;
+  }
+}

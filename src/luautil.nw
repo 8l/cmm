@@ -1,0 +1,323 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 et sw=4 sts=4
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+% ------------------------------------------------------------------ 
+\section{Useful Lua functions}
+% ------------------------------------------------------------------ 
+
+This module adds Lua functions into the Lua table [[Util]]. 
+
+\begin{itemize}
+\item [[Util.dosearchfile(string,table)]]
+
+The [[dosearchfile]] function obtains a search path from the environment
+variable [[QCMMLUAPATH]] and searches if for a named file. If the file
+name is absolute, it is immediately passed to [[dofile]]. Otherwise it is
+searched in the directories from the search path from left to right.
+
+Directory entries in the search path are separated by colons.  Two
+directory names in the search path are special: [[*]] and the empty
+path.  The star [[*]] stands for the [[table]] passed to
+[[dosearchfile]] and the empty path for a system specific directory. If
+the table is searched the file name is used as a key.  A matching entry
+is passed to [[dostring]] and thus executed as a Lua program. If no file
+can be found the error fallback is called and is expected to return a
+string with Lua code.
+
+\item [[Util.catch(f,...)]]
+
+The [[catch]] function takes a function and its arguments and executes
+the function catching any [[Caml]] exceptions. If no exceptions are
+caught, then [[catch f]] returns the same as [[f]]. Otherise
+[[catch]]~returns [[nil]].
+
+\item [[Util.redirect_stdout(filename)]]
+
+The [[redirect_stdout]] function redirects standard out to the file
+whose name is given in [[filename]]. Calling [[redirect_stdout]]
+without any arguments will reset standard out the its original value.
+
+\item [[Util.redirect_stderr(filename)]]
+
+See description for [[Util.redirect_stdout(filename)]] above.
+
+\item [[Util.files_nonwhite_equivalent(filename1, filename2)]]
+
+The [[files_nonwhite_equivalent]] function compares two files,
+ignoring whitespace entirely. 
+It returns [[true]] if and only 
+if the two files contain identical nonwhite characters.
+If a file cannot be opened, this function returns [[nil]].
+
+\item [[Util.file_exists(filename)]]
+Return [[true]] if and only if [[filename]] exists.
+
+
+\item [[Util.tcopy(table)]]
+
+Performs a true copy of a table (recursively copying any tables found
+as values within it.
+
+\item [[Util.tconcat(table1, table2)]]
+
+Concatenates the contents of two tables, treating them as lists.
+
+\item [[Util.set(table)]]
+
+Treats the table as a list and returns a table in which each element
+of the list appears as a key (the associated value is the list index,
+but its main property is to be non-nil).
+
+\end{itemize}
+
+We also overload the [[..]] operator (Lua string concatenation operator)
+to provide \em{very simple} list comprehensions.
+
+<<luautil.mli>>=
+module MakeLib : Lua.Lib.BARECODE
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+<<luautil.ml>>=
+module MakeLib (C: Lua.Lib.CORE) = struct
+    module V = C.V
+    let ( **-> ) = V.( **-> )
+    let ( **->> ) x y = x **-> V.result y
+
+    <<utility functions>>
+
+    let init g =
+      C.register_module "Util"
+      [ "dosearchfile",    V.efunc (V.string **-> V.option V.table **-> V.resultvs)
+                           (dosearchfile g)
+      ; "catch",           V.caml_func catch_lua
+      ; "redirect_stdout", V.efunc (V.option V.string **->> V.unit) redirect_stdout
+      ; "redirect_stderr", V.efunc (V.option V.string **->> V.unit) redirect_stderr
+      ; "file_exists",   V.efunc (V.string **->> V.bool)          file_exists
+      ; "files_nonwhite_equivalent",   V.efunc (V.string **-> V.string **->> V.bool) files_nonwhite_equivalent
+      ; "call",            V.efunc (V.value **-> V.list V.value **-> V.resultvs)
+                           (function V.Function (_, f) -> f
+                                   | v -> V.projection v "function")
+      ] g;
+end
+@
+A search path is easier to handle in \ocaml~when it is represented as a
+list of strings. The [[split]] function splits a colon-separated string
+into a list. Put this into [[Strutil]]?
+<<utility functions>>=
+let split path =
+    let sep    = ':'                in    (* path separator *)
+    let length = String.length path in
+    let rec loop start =
+        if start >= length then
+            []
+        else 
+            let next = try String.index_from path start sep with
+                       Not_found -> length
+            in           
+                String.sub path start (next-start) :: loop (next+1) 
+    in
+        loop 0 
+@ 
+The conversion of values between Lua and \ocaml~is a bit ugly. Maybe
+some expert can clean this up. Another problem was to call [[dofile]]
+and [[dostring]]. Is there a better way then [[apply]]?
+<<utility functions>>=
+let lookup   g f     = try Luahash.find g.V.globals (V.String f)
+                       with Not_found -> V.Nil
+let dofile   g file  = C.apply (lookup g "dofile")   g  file
+let dostring g str   = C.apply (lookup g "dostring") g  str
+
+let defaultdir       = Filename.concat This.install_dir "lib/qc--"
+let luapath          = "QCMMLUAPATH"
+let defaultpath      = ".::*"                  (*XXX fix XXX*)
+@
+We're given a search path and a filename.
+If we see [["*"]], we look for the filename in a table.
+If we see another name, we take it as a directory name and we look for
+the filename in that directory.
+The empty name stands for the default directory.
+<<utility functions>>=
+let dosearchfile g file boot =
+  let path = try Sys.getenv luapath with Not_found -> defaultpath in
+  let rec search = function
+    | "*" :: dirs -> 
+        (match boot with
+         | None   -> search dirs
+         | Some t ->
+             let cont =
+               try let s = Luahash.find t (V.String file) in (fun () -> dostring g [s])
+               with Not_found -> (fun () -> search dirs) in
+             cont ()   (* call to dostring must be outside of handler *)
+        )
+    | dir :: dirs -> 
+        let d = if dir =$= "" then defaultdir else dir in
+        let p = Filename.concat d file in
+        if Sys.file_exists p then dofile g [V.String p] else search dirs
+    | [] -> C.error
+              (Printf.sprintf "dosearchfile: can't find `%s' in path `%s'" file path)
+  in
+      if Filename.is_relative file then search (split path) 
+      else dofile g [V.String file]
+@ 
+Function [[catch f]] returns whatever [[f]]~returns, except if
+[[f]]~raises an exception,  it returns the empty list of results.
+If a caller wants to detect whether an exception has been raised, it's
+up to that caller to ensure that [[f]]~returns non-nil on normal
+termination.
+<<utility functions>>=
+let catch f args =
+  try f args
+  with ex ->
+    let exstr = Printexc.to_string ex in
+    Printf.eprintf "Caml exception: %s\n" exstr;
+    []
+
+let catch_lua = function
+  | V.Function (_, f) :: args -> catch f args
+  | v                 :: args -> V.projection v     "function"
+  | []                        -> V.projection V.Nil "function"
+@
+The redirect code creates a duplicate of the original file handle and
+keeps it open forever. This simplifies the code, and file handles are
+not really that precious.
+<<utility functions>>=
+module U = Unix
+let redir fh =
+  let original_fh = U.dup fh in
+  (fun file ->
+    flush_all();
+    match file with
+      Some f ->
+        let ch = open_out f in
+        U.dup2 (U.descr_of_out_channel ch) fh;
+        close_out ch
+    | None ->
+        U.dup2 original_fh fh
+  )
+      
+let redirect_stdout = redir U.stdout
+let redirect_stderr = redir U.stderr
+@
+<<utility functions>>=
+let file_exists fname = try Unix.access fname [Unix.F_OK]; true with _ -> false
+@
+Compare files ignoring whitespace. All whitespace characters are
+converted into single space character using a simple one character
+buffer.
+<<utility functions>>=
+let rec files_nonwhite_equivalent f1 f2 =
+  let finish answer = answer in
+  try
+    let ch1 = try open_in f1 with _ -> open_in "/dev/null" in
+    let finish answer = (close_in ch1; finish answer) in
+    try
+      let ch2 = try open_in f2 with _ -> open_in "/dev/null" in
+      let finish answer = (close_in ch2; finish answer) in
+      finish (compare_channels ch1 ch2)
+    with _ -> finish false
+  with _ -> finish false
+and compare_channels ch1 ch2 =          
+  try
+    let ch1 = ch1, ref 0 in
+    let ch2 = ch2, ref 0 in
+    let sp i = i == int_of_char ' '
+    and input_chr ch = int_of_char (
+      match input_char ch with
+      | ' ' | '\t' | '\n' | '\r' -> ' '
+      | c -> c) in
+    let rec get_char (ch,buf) =
+      let last = !buf in
+      let rec scan_forward () =
+        try let chr = input_chr ch in
+            if sp last && sp chr then scan_forward ()
+            else buf := chr
+        with End_of_file -> buf := -1 in
+      scan_forward (); last in
+    let rec cmp_char() =
+      let c1 = get_char ch1
+      and c2 = get_char ch2 in
+      if c1 == c2 then
+        if c1 == -1 then true
+        else cmp_char() 
+      else false in
+    cmp_char()
+  with _ -> false
+@
+The code below is actually implemented in Lua.  We stick this code into
+[[qc--.lua]] to install it.  This might change in the future if we decide
+that it would be better to implement the functions in OCaml.
+<<Lua utility functions written in Lua>>=
+Util = Util or {}
+
+function Util.tcopy (t)
+  if not (type(t) == "table") then return t end
+    
+  local new_t = {}
+  local k, v = next(t, nil)
+  while k do
+    new_t[k] = Util.tcopy(v)
+    k, v     = next(t, k)
+  end
+
+  return new_t
+end
+
+function Util.tconcat(t1, t2)
+  local i = 0
+  local t = {}
+
+  local n = 1
+  local v = t1[n]
+  while v do
+    i = i + 1
+    t[i] = v
+    n = n + 1
+    v = t1[n]
+  end
+
+  n = 1
+  v = t2[n]
+  while v do
+    i = i + 1
+    t[i] = v
+    n = n + 1
+    v = t2[n]
+  end
+  return(t)
+end
+
+function Util.concat_fallback (x, y)
+  if     (type(x) == "table" and type(y) == "nil"  ) then return x
+  elseif (type(x) == "nil"   and type(y) == "table") then return y
+  elseif (type(x) == "table" and type(y) == "table") then
+    if Register.is(x) and Register.is(y) then
+      return Register.range(x, y)
+    else
+      return Util.tconcat(x, y)
+    end
+  else return Util.old_concat_fallback(x, y)
+  end
+end
+
+Util.old_concat_fallback = setfallback("concat", Util.concat_fallback)
+@ 
+<<Lua utility functions written in Lua>>=
+function Util.set(t)
+  local u = { }
+  local i = 1
+  while t[i] do
+    u[t[i]] = i
+    i = i + 1
+  end
+  return u
+end

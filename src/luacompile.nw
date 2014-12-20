@@ -1,0 +1,994 @@
+% -*- mode: Noweb; noweb-code-mode: lua-mode -*-
+
+% ------------------------------------------------------------------ 
+\section{Lua Compiler Configuration}
+% ------------------------------------------------------------------ 
+
+The Lua code in this module configures the backend of the compiler. It
+is complementory to the \module{luadriver.nw} module, that evaluates
+command line arguments and directs the compilation process. All Lua code
+is assembled into one file [[Lua compiler configuration]] that is built
+into the compiler binary.
+
+% ------------------------------------------------------------------ 
+\subsection{Compiler Debugging}
+% ------------------------------------------------------------------ 
+
+We have some functionality that once was useful but that we do not have
+found worth to assign an officical command line flag to. All these find
+a new home in our [[Debug]] module.
+
+<<Lua compiler configuration>>=
+Debug = Debug or {}
+
+function Debug.prettyprint(file,out)
+    local linewidth = 72
+    local ast       = Driver.parse(file)
+    local doc       = Driver.pretty(ast)
+    fd              = (not out or out == "-") and Driver.stdout or open_out(out)
+    Driver.print(doc,linewidth,fd)
+    if fd ~= Driver.stdout then close_out(fd) end
+end  
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Backplane and Backplane Stages}
+% ------------------------------------------------------------------ 
+
+The backplane provides primitives to construct stages which implement
+back end phases in the compiler. For notational brevity, we introduce an
+alias here. See \module{backplane.nw} for details.
+<<Lua compiler configuration>>=
+Stages = Stages or {}
+function Stages.nullf (_, proc) return proc, nil end
+
+function Stages.assert(prop)
+  return Backplane.stage { name='assert ' .. prop, creates={prop},
+                              fn = Stages.nullf}
+end
+
+function Stages.hellof (_, proc) write('reached Stages.hello\n'); return proc, nil end
+
+Stages.hello = Backplane.stage { name='hello', fn = Stages.hellof}
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Stage Patching}
+% ------------------------------------------------------------------ 
+
+Some primitive functions that are registered need to be stages rather
+than functions. We patch the binding in the Lua interpreter here.
+<<Lua compiler configuration>>=
+function Stages.make_stage(t, short, long, B)
+  if not B then error("Stages.make_stages called without Backplane") end
+  if type(t[short]) == 'function' then
+    if type(long) == 'table' then
+      t[short] = Stages.of_table(t[short], long, B)
+    else
+      t[short] = B.stage { name=long, fn = t[short] }
+    end
+  end
+end
+
+function Stages.of_table(fn, tbl, B)
+  B = B or Backplane
+  local stage = { fn = fn }
+  <<add every key-value pair in [[tbl]] to [[stage]]>>
+  return B.stage(stage)
+end
+
+Stages.make_stage( Stages
+                 , 'replace_vfp'
+                 , {name='replace VFP', uses='no late consts' }
+                 , Backplane)
+
+function Placevar.context(placer, targetname)
+  return Stages.of_table(Placevar.contextfn(placer), 
+                         { name="context-based variable placer for " .. targetname
+                         , creates='no vars'
+                         })
+end
+@ 
+<<add every key-value pair in [[tbl]] to [[stage]]>>=
+local k, v = next(tbl, nil)
+while k do
+  stage[k] = v
+  k, v = next(tbl, k)
+end
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Stack Layout}
+% ------------------------------------------------------------------ 
+
+A stack layout function must respect the backplane protocol: such a
+function receives two values, where the second is a [[Proc.t]] value,
+and returns boolean value.
+
+The new layout supports the virtual frame pointer.
+<<Lua compiler configuration>>=
+Debug = Debug or {}
+function Debug.showblocks(blocks, keys, prefix)
+  local i = 1
+  while keys[i] do
+    local block = blocks[keys[i]]
+    if type(block) == 'table' then
+      Debug.showblocks(block, {'caller', 'callee'}, keys[i] .. '.')
+    elseif block then
+      write(format('block %17s is %2d bytes aligned %2d at %s\n',
+                   (prefix or '') .. keys[i], Block.size(block),
+		   Block.alignment(block), Block.base(block)))
+      local constraints = Block.constraints(block)
+      local j = 1
+      while constraints[j] do
+        write(format('  where %s\n', constraints[j]))
+        j = j + 1
+      end
+    else
+      write(format('no block %s?!\n', (prefix or '') .. keys[i]))
+    end
+    i = i + 1
+  end
+end
+@ 
+<<Lua compiler configuration>>=
+function Debug.showframesize(frame,proc)
+    write(format('function %17s convention %10s framesize %d\n'
+                , Stack.procname(proc)
+                , Stack.ccname(proc)
+                , Block.size(frame)
+                ))
+end
+@
+% ------------------------------------------------------------------ 
+\paragraph{Stack Layout for the Dummy Target} 
+% ------------------------------------------------------------------ 
+
+\module{dummy.nw} module
+that defines the dummy target.
+
+<<stack-frame layout functions>>=
+Dummy = {} or Dummy
+Dummy.layout = { creates='no late consts' }
+
+function Dummy.layout.fn(dummy, proc)
+    local blocks       = Stack.blocks(proc)
+    blocks.oldblocks.caller   = Block.overlap_low(32, blocks.oldblocks.caller)
+    blocks.youngblocks.caller = Block.overlap_low(32, blocks.youngblocks.caller)
+    local layout =
+        { blocks.oldblocks.caller
+        , blocks.stackdata
+        , blocks.vfp
+        , blocks.continuations
+        , Block.relative(blocks.sp, "six words", 24, 16)
+        , blocks.spills
+        , blocks.youngblocks.caller
+        , blocks.sp
+        }
+    if Debug.stack then
+        write('****** cc name = ', Stack.ccname(proc), '\n')
+        Debug.showblocks (blocks, { 'oldblocks'
+                                  , 'stackdata'
+                                  , 'vfp'
+                                  , 'continuations'
+                                  , 'spills'
+                                  , 'youngblocks'
+                                  , 'sp'
+                                  })
+    end
+    local block = Block.cat(32, layout)
+    proc = Stack.freeze(proc, block)
+    return proc, 1
+end
+@
+    
+% ------------------------------------------------------------------ 
+\paragraph{Stack Layout for the \mips}
+% ------------------------------------------------------------------ 
+
+<<stack-frame layout functions>>=
+Mips = {} or Mips
+Mips.layout = { creates='no late consts' }
+
+function Mips.layout["C"](_, proc)
+    local blocks       = Stack.blocks(proc)
+    blocks.oldblocks.callee   = Block.overlap_low(32,blocks.oldblocks.callee)
+    blocks.oldblocks.caller   = Block.overlap_low(32,blocks.oldblocks.caller)
+    blocks.youngblocks.callee = Block.overlap_low(32,blocks.youngblocks.callee)
+    blocks.youngblocks.caller = Block.overlap_low(32,blocks.youngblocks.caller)
+
+  -- Are oldparams and newparams necessary?  Everything seems to work fine
+    -- with them commented out... -RO
+
+    -- blocks.oldparams   = Block.relative(blocks.vfp, "old parameters", 16, 4)
+    -- blocks.newparams   = Block.relative(blocks.vfp, "new parameters", 16, 4)
+    local layout =
+        { blocks.oldblocks.caller
+        , blocks.oldblocks.callee
+        -- , blocks.oldparams     
+        , blocks.vfp
+        , blocks.spills
+        , blocks.continuations
+        , blocks.stackdata
+        , blocks.youngblocks.caller
+        -- , blocks.newparams     
+        , blocks.sp
+    , blocks.youngblocks.callee
+        }
+    if Debug.stack then
+        write('****** cc name = ', Stack.ccname(proc), '\n')
+        Debug.showblocks (blocks, { 'oldblocks'
+                                  , 'stackdata'
+                                  , 'vfp'
+                                  , 'continuations'
+                                  , 'spills'
+                                  , 'youngblocks'
+                                  , 'params'
+                                  , 'sp'
+                                  })
+    end
+    local block = Block.cat(32, layout)
+    block = Block.adjust(block)
+    Stack.freeze(proc, block)
+    return 1
+end
+
+function Mips.layout["C'"](_, proc)
+    local blocks       = Stack.blocks(proc)
+    blocks.oldblocks   = Block.overlap_low(32, blocks.oldblocks)  
+    blocks.youngblocks = Block.overlap_low(32, blocks.youngblocks)
+    local layout =
+        { blocks.oldblocks
+        , blocks.vfp
+        , blocks.spills
+        , blocks.continuations
+        , blocks.stackdata
+        , blocks.youngblocks    
+        , blocks.sp
+        }
+    if Debug.stack then
+        write('****** cc name = ', Stack.ccname(proc), '\n')
+        Debug.showblocks (blocks, { 'oldblocks'
+                                  , 'stackdata'
+                                  , 'vfp'
+                                  , 'continuations'
+                                  , 'spills'
+                                  , 'youngblocks'
+                                  , 'params'
+                                  , 'sp'
+                                  })
+    end
+    local block = Block.cat(32, layout)
+    block = Block.adjust(block)
+    Stack.freeze(proc, block)
+    return 1
+end
+Mips.layout["c'"] = Mips.layout["C'"] 
+
+function Mips.layout.fn(_,proc) 
+    local cc = Stack.ccname(proc)
+    if Mips.layout[cc] == nil then
+        error("no layout for convention "..cc)
+    else    
+        return Mips.layout[cc](_, proc)
+    end    
+end
+@
+
+
+@
+% ------------------------------------------------------------------ 
+\paragraph{Stack Layout for the Alpha}
+% ------------------------------------------------------------------ 
+
+The stack layout depends on the calling convention, we thus dispatch
+on it.
+
+<<Lua compiler configuration>>=
+Alpha        = {} or Alpha
+Alpha.layout = { creates='no late consts' } -- what is this for? -CL
+@
+
+The following layout assumes the stack pointer does not move,
+i.e.~argument and result overflow blocks are allocated by the caller.
+
+<<stack-frame layout functions>>=
+function Alpha.layout["C"](_, proc)
+    local blocks              = Stack.blocks(proc)
+    blocks.oldblocks.callee   = Block.overlap_low(64,blocks.oldblocks.callee)
+    blocks.oldblocks.caller   = Block.overlap_low(64,blocks.oldblocks.caller)
+    blocks.youngblocks.callee = Block.overlap_low(64,blocks.youngblocks.callee)
+    blocks.youngblocks.caller = Block.overlap_low(64,blocks.youngblocks.caller)
+    local layout =
+        { blocks.oldblocks.caller
+        , blocks.oldblocks.callee
+        , blocks.vfp
+        , blocks.spills
+        , blocks.continuations
+        , blocks.stackdata
+        , blocks.youngblocks.caller
+        , blocks.sp
+        , blocks.youngblocks.callee
+        }
+    if Debug.stack then
+        write('****** cc name = ', Stack.ccname(proc), '\n')
+        Debug.showblocks (blocks, { 'oldblocks'
+                                  , 'stackdata'
+                                  , 'vfp'
+                                  , 'continuations'
+                                  , 'spills'
+                                  , 'youngblocks'
+                                  , 'sp'
+                                  })
+    end
+    
+    local block = Block.cat(64, layout)
+    block = Block.adjust(block) -- size is multiple of 16 byte
+    Stack.freeze(proc, block)
+    return 1
+end
+@
+
+
+
+The [[cmm]] conventions are part of an experimental setup to test the
+[[callspec]] interface to define calling conventions.
+
+<<stack-frame layout functions>>=
+Alpha.layout["cmm"]  = Alpha.layout["C"]    -- defaults
+Alpha.layout["cmm0"] = Alpha.layout["C"]
+Alpha.layout["cmm1"] = Alpha.layout["C"]
+Alpha.layout["cmm2"] = Alpha.layout["C"]
+Alpha.layout["cmm3"] = Alpha.layout["C"]
+
+function Alpha.layout["cmm3"](_, proc)
+    local blocks       = Stack.blocks(proc)
+    blocks.oldblocks   = Block.overlap(64,"high", blocks.oldblocks)  
+    blocks.youngblocks = Block.overlap(64,"high", blocks.youngblocks)
+    local layout =
+        { blocks.oldblocks
+        , blocks.vfp
+        , blocks.spills
+        , blocks.continuations
+        , blocks.stackdata
+        , blocks.sp
+        , blocks.youngblocks
+        }
+    
+    if Debug.stack then
+      write( '****** cc name = '
+           , Stack.ccname(proc)
+           , '/'
+           , Stack.procname(proc)
+           , '\n'
+           )
+      Debug.showblocks (blocks, {'oldblocks'
+                                ,'vfp'
+                                ,'stackdata'
+                                ,'continuations'
+                                ,'spills'
+                                ,'sp'
+                                ,'youngblocks'
+                                })
+    end
+
+    local block = Block.cat(64, layout)
+    if Debug.stack then
+        local blocks = {frame = block}
+        Debug.showblocks(blocks, {'frame'})
+    end    
+    block = Block.adjust(block) -- size is multiple of 16 byte
+    Stack.freeze(proc, block)
+    return 1
+end
+
+function Alpha.layout.fn(_,proc) 
+    local cc = Stack.ccname(proc)
+    if Alpha.layout[cc] == nil then
+        error("no layout for convention "..cc)
+    else    
+        return Alpha.layout[cc](_, proc)
+    end    
+end
+@
+@
+
+% ------------------------------------------------------------------ 
+\paragraph{Stack Layout for the Ia64}
+% ------------------------------------------------------------------ 
+
+<<stack-frame layout functions>>=
+Ia64 = Ia64 or {}
+Ia64.layout = { creates='no late consts' }
+
+function Ia64.layout.fn(value,proc) --- dispatch on cc name
+  return Ia64.layout[Stack.ccname(proc)](value, proc)
+end
+
+function Ia64.layout["C"](_,proc) --- really for a C convention only
+    local blocks = Stack.blocks(proc)
+    blocks.oldblocks.callee   = Block.overlap_high(64, blocks.oldblocks.callee)
+    blocks.oldblocks.caller   = Block.overlap_low (64, blocks.oldblocks.caller)
+    blocks.youngblocks.callee = Block.overlap_high(64, blocks.youngblocks.callee)
+    blocks.youngblocks.caller = Block.overlap_low (64, blocks.youngblocks.caller)
+    local layout = 
+                { blocks.oldblocks.caller       -- <-- high addresses
+                , blocks.oldblocks.callee
+                , blocks.vfp
+                , blocks.stackdata
+                , blocks.continuations
+                , blocks.spills
+                , blocks.youngblocks.caller
+                , blocks.sp                     -- <-- low addresses 
+                , blocks.youngblocks.callee
+                }
+    local block = Block.cat(64, layout)
+    Stack.freeze(proc,block)
+    return 1
+end    
+@
+
+% ------------------------------------------------------------------ 
+\paragraph{Stack Layout for the SPARC}
+% ------------------------------------------------------------------ 
+
+<<stack-frame layout functions>>=
+Sparc = Sparc or {}
+Sparc.layout = { creates='no late consts' }
+
+function Sparc.layout.fn(value,proc) --- dispatch on cc name
+  return Sparc.layout[Stack.ccname(proc)](value, proc)
+end
+
+function Sparc.layout["C"](_,proc) --- really for a C convention only
+    local blocks = Stack.blocks(proc)
+    blocks.oldblocks.callee   = Block.overlap_high(32, blocks.oldblocks.callee)
+    blocks.oldblocks.caller   = Block.overlap_low (32, blocks.oldblocks.caller)
+    blocks.youngblocks.callee = Block.overlap_high(32, blocks.youngblocks.callee)
+    blocks.youngblocks.caller = Block.overlap_low (32, blocks.youngblocks.caller)
+
+    -- the linkage area is complicated
+    -- 23 words of this space are simply required by the sparc convention.
+    -- we start with space for the register window to be saved and then
+    -- have room for 6 outgoing parameters, etc.
+    -- however, we also need some scratch space dedicated for moving
+    -- values through memory.  unfortunately there is not float to int
+    -- or int to float register move, so it needs the memory.  furthermore,
+    -- double precision floats require doubleword aligned memory stores and
+    -- loads, so...
+    -- also we have to make sure, somehow, that the size of the stack that
+    -- we allocate is a multiple of 8 (I think).
+
+    -- old sp = fp
+    -- automatic blah blah blah
+    -- temporaries and saved floats
+    -- sp + (23 * 4) : outgoing parameters past the sixth, if any
+    -- sp + (17 * 4) : 6 words for callee
+    -- sp + (16 * 4) : hidden parameter (where callee stores aggregate return)
+    -- sp            : 16 words for OS to save register window
+    --
+
+    local linkage =
+      { caller = Block.relative(blocks.vfp, "caller's linkage area", 23*4, 16)
+      , callee = Block.relative(blocks.sp , "our linkage area"     , 23*4, 16)
+      }
+    local old_end = Block.cat(32, { blocks.oldblocks.caller
+                                  , linkage.caller
+                                  , blocks.vfp
+                                  , blocks.oldblocks.callee
+                                  })
+    local young_end = Block.cat(32, { blocks.youngblocks.caller
+                                    , linkage.callee
+                                    , blocks.sp
+                                    , blocks.youngblocks.callee
+                                    })
+    local layout = { old_end
+                   , blocks.stackdata
+                   , blocks.continuations
+                   , blocks.spills
+                   , young_end
+                   }
+    if Debug.stack then
+      write('======= using stack layout for C/notail =======\n')
+      write('****** cc name = ', Stack.ccname(proc), '\n')
+      Debug.showblocks (blocks, {'oldblocks', 'vfp',
+                                 'stackdata', 'continuations', 'spills',
+                                 'youngblocks', 'sp'})
+    end
+    local block = Block.cat(32, layout)
+    if Debug.stack then
+      Debug.showblocks({frame=block}, {'frame'})
+    end
+    if Debug.framesize then Debug.showframesize(block,proc) end
+    Stack.freeze(proc,block)
+    return 1
+end
+
+Sparc.layout["C--"]    = Sparc.layout["C"]
+Sparc.layout["notail"] = Sparc.layout["C"]
+@
+
+% ------------------------------------------------------------------ 
+\paragraph{Stack Layout for the Interpreter}
+% ------------------------------------------------------------------ 
+
+<<stack-frame layout functions>>=
+Interp = Interp or {}
+function Interp.layout(_, proc)
+    local blocks = Stack.blocks(proc)
+    local layout =
+        { blocks.continuations
+        , blocks.stackdata
+        , blocks.vfp
+        , blocks.sp
+        , blocks.spills
+        , Block.overlap_low (32, blocks.oldblocks.caller)
+        , Block.overlap_low (32, blocks.oldblocks.callee)
+        , Block.overlap_high(32, blocks.youngblocks.caller)
+        , Block.overlap_high(32, blocks.youngblocks.callee)
+        }
+    local block = Block.cat(32, layout)
+    proc = Stack.freeze(proc, block)
+    return proc, 1
+end
+@
+
+% ------------------------------------------------------------------ 
+\paragraph{Stack Layouts Elsewhere}
+% ------------------------------------------------------------------ 
+ 
+<<Lua compiler configuration>>=
+<<stack-frame layout functions>>
+<<PPC stack layout in Lua>>
+@ 
+
+% ------------------------------------------------------------------ 
+\subsection{Optimizer}
+% ------------------------------------------------------------------ 
+
+For the translation of a procedure all back-end related actions, like
+register allocation or variable assignment, are controlled by an
+optimizer. The optimizer has a sequence of stages the procedure passes
+through.
+
+So far, we just have one standard optimizer that receives the current
+backend and an assembler.
+
+<<Lua compiler configuration>>=
+Opt = Opt and error('Opt not empty') or {}
+
+function verbose(s, a, b, c, d, e, f, g, h)
+  if Options.verbose > 0 then
+    write(s,a or '',b or '',c or '',d or '',e or '',f or '',g or '',h or '')
+  end
+end
+
+function Opt.verb(stage) -- needs more work (want verbosity for each stage)
+  if not stage or Options.verbose == 0 then
+    return stage
+  else
+    return stage -- actually want timed, noisy version of stage announcing stage.name
+  end
+end  
+
+-- We capture the time at start up and provide a function to return the elapased time.
+start_time = Caml.time()
+function timeDiff()
+  return (Caml.time() - start_time)
+end
+
+-- A pseudo-macro that defines a function that returns the elapsed time,
+-- with the argument used in the output strings.
+-- The result of this macro: the defined function.
+function time(name)
+  local f = "function " .. name .. "_timer(_, proc)\n" ..
+            "  print('" .. name .. ": ' .. timeDiff())\n" ..
+            "  return proc, nil\n" ..
+            "end"
+  dostring(f)
+  -- Returning the newly defined function... ugh...
+  return (dostring("return " .. name .. "_timer"))
+end
+
+Opt.standard_phases =
+  { 'intwiden', 'placevars', 'floatwiden', Optimize.simplify_exps, 'preopt', 'pic'
+  , 'expand', 'improve', 'liveness', 'ralloc', 'freeze', 'rmvfp', '*assemble'
+  , '*emit_data'
+  }
+
+function Opt.standard(backend, asm, B)
+  if not B then error("Opt.standard called without backplane argument") end
+  Stages.null = B.stage {name="empty stage", fn=Stages.nullf}
+  local assemble  = Driver.proc_assembler(asm) 
+  local emit_data = nil
+  print_cfg = B.stage {name="print cfg", fn=Debug.printcfg}
+  local phasenames = backend.phases or Opt.standard_phases
+  local i, phase, phases = 1, phasenames[1], { }
+  while phase do
+    if type(phase) ~= 'string' then
+      tinsert(phases, phase)
+    elseif strfind(phase, '^%*') then
+      if phase == '*assemble' then
+        tinsert(phases,
+                B.stage { name="assemble procedure", fn = Driver.proc_assembler(asm) })
+        --tinsert(phases, time("assemble"))
+      elseif phase == '*emit_data' then
+        if backend.emit_data then
+          tinsert(phases,
+                  Opt.verb(B.stage { name = "emit_data", fn = backend.emit_data(asm)}))
+          --tinsert(phases, time("emit_data"))
+        end
+      end
+    else
+      if backend[phase] then
+        tinsert(phases, Opt.verb(backend[phase]))
+        --tinsert(phases, time(phase))
+      end
+    end
+    i = i + 1
+    phase = phasenames[i]
+  end
+  return B.seq (phases)
+end
+
+Liveness.liveness =
+  Backplane.stage { name='liveness', creates='liveness', fn = Liveness.livenessfn }
+
+Backplane.register ('no dead assignments', {
+  'The program does not contain any dead assignments.',
+  'That is, the result of every instruction is used somewhere.',
+})
+
+Backplane.register ('proper pic', {
+  'All RTLs will result in position independent instructions.',
+  'What is this second line for.',
+})
+
+Optimize.dead = 
+  Backplane.stage { name='dead', creates={'no dead assignments'},
+                       fn = Optimize.deadfn }
+@
+% ------------------------------------------------------------------ 
+\subsection{Graph-Coloring Register Allocator}
+% ------------------------------------------------------------------ 
+
+Defined in file \texttt{colorgraph.nw}.
+<<Lua compiler configuration>>=
+<<Lua startup code for [[Colorgraph]] module>>
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Register Allocators}
+% ------------------------------------------------------------------ 
+
+All register allocators are made available in the table [[Ralloc]].
+<<Lua compiler configuration>>=
+Ralloc           = Ralloc and error('Ralloc not empty') or {}
+Ralloc.color     = ColorGraph.color
+Ralloc.dls       = DLS.dls
+@
+% ------------------------------------------------------------------ 
+\subsection{Compiler}
+% ------------------------------------------------------------------ 
+
+The [[Compile.file]] function takes the file name for a {\PAL} source
+file, a backend, and the name of the (assembly) file to produce and
+compiles the file.
+
+There is some inconsistency how we deal with files. The [[Driver.parse]]
+function takes a file name, while an assembler expects a file
+descriptor.
+<<Lua compiler configuration>>=
+Compile = Compile and error('Compile not empty') or {}
+
+function Compile.file(backend, emitglobals, file, out)
+    local fd  = (not out or out == "-") and Driver.stdout or open_out(out)
+    local ast = Driver.parse(file)
+    local asm = backend.asm(fd) 
+    local opt = { apply  = Compile.run_optimizer
+                , action = Opt.standard(backend, asm, Backplane) 
+                , B = Backplane
+                }
+    if Debug.driver then
+      Inspect.show('target = ', backend.target) write('\n')
+      Inspect.show('opt = ', opt) write('\n')
+      Inspect.show('emitglobals = ', emitglobals) write('\n')
+      Inspect.show('ast = ', ast) write('\n')
+      Inspect.show('asm = ', asm) write('\n')
+      Inspect.show('Options = ', Options) write('\n')
+    end
+
+    Driver.compile(backend.target, opt, emitglobals, ast, asm,
+                   Options.validate, Options.swap)
+    if backend.emit then backend.emit(asm) end
+    if fd ~= Driver.stdout then close_out(fd) end -- close fd
+end    
+@ 
+To run the optimizer, [[Compile.run_optimizer]] takes the table above
+and a procedure, then runs the given [[self.action]] in the
+optimization backplane.
+<<Lua compiler configuration>>=
+function Compile.run_optimizer(self,proc)
+  -- write(_STDERR, 'hello: Compile.run_optimizer\n') 
+    local B = self.B or error("missing backplane")
+--    write('got B\n')
+--    verbose('running Compile.run_optimizer with backplane ', tostring(B),
+--            ' and proc ', tostring(proc), '\n')
+--    verbose('action is ', tostring(self.action), '\n')
+--    verbose('type of proc is ', type(proc), '\n')
+
+    -- disastrous lua bug: local proc,changed = B.run(Stages.hello, proc)
+    B.run(self.action, proc)
+end    
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Backends}
+% ------------------------------------------------------------------ 
+
+A backend value describes everything the compiler needs to know to
+produce code for a particular target. Many values in the description of
+a backend are primitives, and thus cannot be simply constructed in Lua.
+
+The [[compile]] entry selects the function that actually compiles a
+file. Thus, just setting [[backplane]] to the desired value will thus be
+enough to setup the compiler.
+
+<<Lua compiler configuration>>=
+Backend = Backend and error('Backend not empty') or {}
+
+-- make a backend for the new backplane
+function Backend.make(b)
+  return
+    { target     = b.target     or error('target not specified')
+    , intwiden   = b.intwiden   or nil
+    , placevars  = b.placevars  or nil
+    , floatwiden = b.floatwiden or nil
+    , expand     = b.expand     or nil
+    , liveness   = b.liveness   or nil
+    , ralloc     = b.ralloc     or nil
+    , freeze     = b.freeze     or Dummy.layout
+    , rmvfp      = b.rmvfp      or nil
+    , asm        = b.asm        or Asm.cmm
+    , emit       = b.emit       or Driver.assemble
+    , emit_data  = b.emit_data  or nil
+    , compile    = Compile.file
+    }   
+end
+
+--
+-- Dummy backends
+--
+
+Backend.dummy32l        = Backend.make  { target = Targets.dummy32l 
+                                        , rmvfp  = Backplane.seq
+						      { Stages.replace_vfp,
+						        Optimize.remove_nops }
+                                        }
+Backend.dummy32b        = Backend.make  { target = Targets.dummy32b 
+                                        , rmvfp  = Backplane.seq
+						      { Stages.replace_vfp,
+						        Optimize.remove_nops }
+                                        }
+Backend.dummy           = Backend.dummy32l  -- alias
+
+--
+-- Interpreter backends, for new and old backplane
+--
+
+Backend.interp          = Backend.make  { target = Targets.interp
+                                        , placevars = Placevar.replace_globals
+                                        , asm    = Asm.interp32l 
+                                        , freeze = Interp.layout
+                                        }
+Backend.debug_interp    = Backend.make  { target = Targets.interp
+                                        , asm    = Asm.cmm
+                                        , freeze = Interp.layout
+                                        }
+Backend.interp.compile = Compile.file
+Backend.debug_interp.compile = Compile.file
+
+--
+-- x86 backends
+--
+
+Backend.x86 =
+  { target    = Targets.x86
+  , phases = { 'intwiden', 'placevars', 'floatwiden',
+               Optimize.simplify_exps, 'preopt',
+               'expand', 'improve', 'liveness', 'ralloc', 'freeze', 'rmvfp',
+               '*assemble', '*emit_data' }
+  , intwiden  = Backplane.seq
+                   { Widen.update_gamma_counts,
+                     Widen.create_gamma,
+                     Widen.widenlocs,
+                     Widen.dpwiden }
+  , placevars = Placevar.context(Placevar.x86, "x86")
+  , floatwiden = Backplane.seq
+                   { Widen.x86_floats,
+                     Widen.store_const(32),
+                     Stages.assert('proper widths') }
+  , preopt    = Optimize.remove_nops
+--  , pic       = Backplane.seq { Pic.x86, Stages.assert('proper pic') }
+--  , validate  = Backplane.seq { Typecheck.proc }
+  , expand    = Expander.x86
+  , liveness  = Liveness.liveness
+  , improve   = Backplane.seq { Optimize.validate }
+        -- would like to run Typecheck.proc here, but it does not
+        -- yet know about machine-dependent operators
+  , ralloc    = Ralloc.dls
+  , freeze    = X86.layout
+  , rmvfp     = Backplane.seq
+		   { Stages.replace_vfp,
+		     Optimize.remove_nops }
+  , asm       = Asm.x86
+  , emit      = Driver.assemble
+  , emit_data = Runtime.emit_data
+  , compile   = Compile.file
+  }   
+
+Optimize.improve =
+  Backplane.seq { 
+    -- Typecheck.proc,
+    Optimize.remove_nops, 
+    Optimize.validate, 
+    Optimize.peephole, 
+--    Backplane.stage {name="print cfg", fn=Debug.printcfg},
+    Optimize.deadfn,
+----    Backplane.fix (
+----      Backplane.seq { Backplane.ignore (Liveness.liveness), Optimize.dead }),
+    Optimize.validate }
+
+Optimize.oimprove =
+  Backplane.seq { 
+    Optimize.remove_nops, 
+    Optimize.validate, 
+    Optimize.peephole, 
+    Optimize.validate }
+
+
+_ = [[
+
+--
+-- MIPS (32 bit, little endian)
+--
+
+Backend.mips =     
+  { target     = Targets.mips
+  , floatwiden = Stages.assert('proper widths')
+  , placevars  = Placevar.context(Placevar.mips, "mips")
+  , expand     = Expander.mips
+  , liveness   = Liveness.liveness
+  , ralloc     = Ralloc.dls
+  , freeze     = Mips.layout
+  , rmvfp      = Backplane.seq
+		    { Stages.replace_vfp,
+		      Optimize.remove_nops }
+  , asm        = Asm.mips
+  , emit       = Driver.assemble
+  , emit_data  = Runtime.emit_data
+  , compile    = Compile.file
+  }   
+
+--
+-- Alpha (64 bit, little endian)
+--
+
+Backend.alpha =     
+  { target     = Targets.alpha
+  , floatwiden = Stages.assert('proper widths')
+  , placevars  = Placevar.context(Placevar.x86, "x86") -- wrong!
+  , expand     = Expander.alpha
+  , liveness   = Liveness.liveness
+  , ralloc     = Ralloc.dls
+  , freeze     = Alpha.layout
+  , rmvfp      = Backplane.seq
+		    { Stages.replace_vfp,
+		      Optimize.remove_nops }
+  , asm        = Asm.alpha
+  , emit       = Driver.assemble
+  , emit_data  = Runtime.emit_data
+  , compile    = Compile.file
+  }   
+
+]]
+
+--
+-- PPC Backend (32 bit, big endian)
+--
+Backend.ppc =
+  { target     = Targets.ppc
+  , placevars  = Placevar.context(Placevar.ppc, "ppc")
+  , floatwiden = Backplane.seq
+                   { Widen.ppc_floats,
+                     Stages.assert('proper widths') }
+  , preopt     = Optimize.remove_nops
+  , pic        = Backplane.seq { Pic.ppc, Stages.assert('proper pic') }
+  , expand     = Expander.ppc
+  , liveness   = Liveness.liveness
+  , ralloc     = Ralloc.dls
+  , freeze     = PPC.layout
+  , rmvfp      = Backplane.seq
+		    { Stages.replace_vfp
+		    , Optimize.remove_nops }
+  , asm        = Asm.ppc
+  , emit       = Driver.assemble
+  , emit_data  = Runtime.emit_data
+  , compile    = Compile.file
+  }   
+
+_ = [[
+
+--
+-- Ia64 Backend (64 bit, little-endian)
+--
+Backend.ia64 =
+  { target     = Targets.ia64
+  , placevars  = Placevar.context(Placevar.ia64, "ia64")
+  , floatwiden = Stages.assert('proper widths')
+  , preopt     = Optimize.remove_nops
+  , expand     = Expander.ia64
+  , liveness   = Liveness.liveness
+  , ralloc     = Ralloc.dls
+  , freeze     = Ia64.layout
+  , rmvfp      = Backplane.seq
+		    { Stages.replace_vfp,
+		      Optimize.remove_nops }
+  , asm        = Asm.ia64
+  , emit       = Driver.assemble
+  , emit_data  = Runtime.emit_data
+  , compile    = Compile.file
+  }
+
+--
+-- Sparc-(V8?) Backend (32 bit, big-endian)
+--
+Backend.sparc =
+  { target     = Targets.sparc
+  , placevars  = Placevar.context(Placevar.sparc, "sparc")
+  , floatwiden = Stages.assert('proper widths')
+  , preopt     = Optimize.remove_nops
+  , expand     = Expander.sparc
+  , liveness   = Liveness.liveness
+  , ralloc     = Ralloc.dls
+  , freeze     = Sparc.layout
+  , rmvfp      = Backplane.seq
+		    { Stages.replace_vfp,
+		      Optimize.remove_nops }
+  , asm        = Asm.sparc
+  , emit       = Driver.assemble
+  , emit_data  = Runtime.emit_data
+  , compile    = Compile.file
+  }
+]]
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Calling Convention Automata}
+% ------------------------------------------------------------------ 
+
+We specify calling convention automata in Lua.  We define here some functions
+that pretty much all backends will need in their CC specifications.
+The actual automata are found in the source files implementing the backends
+even though they all come together in [[qc--.lua]].
+
+<<Lua compiler configuration>>=
+<<calling convention utilities>>
+
+<<x86 calling convention automata in Lua>>
+_ = [[
+<<Alpha calling convention automata in Lua>>
+<<MIPS calling convention automata in Lua>>
+]]
+<<PPC calling convention automata in Lua>>
+_ = [[
+<<IA64 calling convention automata in Lua>>
+<<SPARC calling convention automata in Lua>>
+]]
+@ 
+<<calling convention utilities>>=
+Util = Util or {}
+function Util.round_up_mult (multof, k)
+  return multof * floor((k + (multof - 1)) / multof)
+end
+@ 

@@ -1,0 +1,131 @@
+# ------------------------------------------------------------------ 
+# $Id: mkfile,v 1.25 2005-01-17 19:20:56 nr Exp $ 
+# ------------------------------------------------------------------ 
+
+NAME = rtllib 
+TOP  = ..
+<      $TOP/config/config.mk
+
+# ------------------------------------------------------------------ 
+# paths
+# ------------------------------------------------------------------ 
+
+LIBCMA  = ${B}$NAME.cma      # bytecode library
+LIBCMXA = ${B}$NAME.cmxa     # native library
+
+INTERP = evaluating
+DEPEND = ${B}DEPEND.$INTERP  # store depend information here
+
+LIBDIR =    ../lib
+
+# ------------------------------------------------------------------ 
+# (high level) virtual targets
+# ------------------------------------------------------------------ 
+
+NW   = `echo *.nw`
+HTML = ${NW:=%.nw=%.html}
+INC  = ${NW:=%.nw=%.inc}
+
+all:V:          $LIBCMA
+all.opt:V:      $LIBCMXA
+dvi:V:          $INC
+html:V:         $HTML
+depend:V:       $DEPEND
+
+# update and update.opt targets
+<$TOP/config/libupdate.mk
+update:V: libupdate
+        cp ${B}uint64p.o ${B}../lib
+
+update.opt:V: libupdate.opt
+
+# ------------------------------------------------------------------ 
+# cleanup
+# ------------------------------------------------------------------ 
+
+clean.opt:V:
+	rm -f $B*.cmx $B*.cmxa $B*.o $B*.a
+
+clean:V: clean.opt
+	rm -f $B*.cmi $B*.cmo $B*.cma
+
+clobber:V: dep-clobber clean
+	rm -f *.aux *.log *.dvi *.toc *.html *.inc *.ps
+	rm -f $B*.ml $B*.ml[ily] $B*.output $B*.c
+
+# ------------------------------------------------------------------ 
+# rules and tools for OCaml
+# ------------------------------------------------------------------ 
+
+<$TOP/config/ocaml.mk
+<$TOP/config/noweb.mk
+<$TOP/config/c.mk
+
+# compiler flags used by the rules just included
+
+OCAMLC_FLAGS = $OCAMLC_FLAGS -I $LIBDIR
+OCAMLO_FLAGS = $OCAMLO_FLAGS -I $LIBDIR
+
+# ------------------------------------------------------------------ 
+# important file sets
+# ------------------------------------------------------------------ 
+
+# link-order
+ML  =		impossible.ml   \
+		debug.ml        \
+		unsupported.ml   \
+		symbol.ml       \
+                uint64.ml       \
+                base.ml         \
+                bits.ml         \
+		cell.ml		\
+                register.ml     \
+                rtl.ml          \
+                reloc.ml        \
+
+# alphabetical                
+MLI =           base.mli        \
+                bits.mli        \
+		cell.mli	\
+		debug.mli	\
+                impossible.mli  \
+                register.mli    \
+                reloc.mli       \
+                rtl.mli         \
+                symbol.mli      \
+                uint64.mli      \
+		unsupported.mli  \
+
+
+ML  = ${ML:%.ml=$B%.ml}
+MLI = ${MLI:%.mli=$B%.mli}
+CMO = ${ML:%.ml=%.cmo}
+CMX = ${ML:%.ml=%.cmx}
+OBJ = ${B}uint64p.o
+
+SCAN = $ML $MLI
+<$TOP/config/depend.mk
+
+# ------------------------------------------------------------------ 
+# build the libraries
+# ------------------------------------------------------------------ 
+
+$LIBCMA:  dep-chk $CMO $OBJ
+	$OCAMLC $OCAMLC_FLAGS -a -o $target $CMO
+
+$LIBCMXA: dep-chk $CMX $OBJ
+	$OCAMLO $OCAMLO_FLAGS -a -o $target $CMX
+
+# ------------------------------------------------------------------ 
+# extra rules for cases not covered by noweb.mk
+# ------------------------------------------------------------------ 
+
+${B}uint64p.c:D:      uint64.nw
+	$NOTANGLE -L -Ruint64p.c $prereq > $target
+
+${B}uint64p.o: ${B}uint64p.c
+	($config_test ! -z "$B" && cd $B; $OCAMLC -c $prereq)
+
+uint64.inc:D:     uint64.nw
+	$NOWEAVE -delay -autodefs c -index $prereq > $target
+

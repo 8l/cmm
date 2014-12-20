@@ -1,0 +1,182 @@
+
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+% l2h substitution dots ...
+% l2h substitution ast AST
+% l2h substitution rtl RTL
+% l2h substitution ir IR
+% l2h substitution noweb NOWEB
+% l2h substitution qcc QC--
+% l2h substitution C C--
+% l2h substitution PAL C--
+% l2h substitution pal C--
+% l2h substitution asdl ASDL
+% l2h substitution ocaml OCaml
+% l2h substitution forall forall
+% l2h macro module 1 <a href="#$1.html"><tt>#1.nw</tt></a>
+
+% l2h substitution mapsto ->
+% l2h substitution cup +
+% l2h substitution not not
+% l2h substitution gets <-
+% l2h substitution dom dom
+
+
+
+% ------------------------------------------------------------------ 
+\section{Name Mangling}
+% ------------------------------------------------------------------ 
+
+An assembler of signature [[Asm.S]] accepts any name to register a
+symbol for. If the name does not comply with the syntax the assembler is
+interfacing to it must transform a given name to make it comply. This
+module offers a framework for such name mangling.
+
+From the outside, a [[mangler]] is simple:  is takes a name and returns
+a name.  Because a [[mangler]] remembers the mapping for past names, the
+same name is always mapped to the same symbol.  Otherwise it takes care
+of the specific needs of the assembler at hand.
+
+<<mangle.mli>>=
+type t = string -> string
+@
+
+The characteristics of symbols of an assembler are captured by a
+[[spec]] value.  In implements a number of tactics to create new names
+from names:
+
+<<mangle.mli>>=
+type spec   = { preprocess:  string -> string
+              ; replace:     char -> char
+              ; reserved:    string list
+              ; avoid:       string -> string
+              }
+@
+
+\begin{enumerate}
+\item A name is first [[preprocess]]'ed in some unspecified way. This might
+      include limiting its length, or removing some prefix.
+
+\item In the resulting name illegal characters are [[replaced]] by
+      legal characters. 
+
+\item If the resulting name is a [[reserved]] name this collision is
+      resolved by passing it repeatedly to [[avoid]]. 
+\end{enumerate}
+
+We create a new mangler by supplying a specification [[spec]] to [[mk]]:
+
+<<mangle.mli>>=
+val mk:         spec -> t     (* create a mangler *)
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+The implementation is fairly imperative, although this is mostly
+hidden to clients (except for the memory of used mappings).  But first
+things first:  here are the types and modules declared in the
+interface, which provide no surprises.
+
+<<mangle.ml>>=
+type strset         = Strutil.Set.t
+type strmap         = (string,string) Hashtbl.t
+
+type t              = string -> string
+type spec           = { preprocess:  string -> string
+                      ; replace:     char -> char
+                      ; reserved:    string list
+                      ; avoid:       string -> string
+                      }
+@
+
+A [[mangler]] must maintain some state: the set of used names, and the
+map of names to new names.                       
+
+<<mangle.ml>>=
+type state          = { mutable used: strset
+                      ; map:          strmap (* is also mutable *)
+                      }
+@
+
+                      
+All reseved names are simply added to the set of used names to make sure
+they are never used for a name. If a name can not be found in
+[[state.map]] it must be mangled and the new mapping together with the
+new name are recorded in the mutable state.
+
+<<mangle.ml>>=
+let mk spec =
+    let state    = { used = Strutil.Set.empty
+                   ; map  = Hashtbl.create 997 (* initial size *)
+                   } 
+    in
+    
+    let rec avoid s  =
+            if   Strutil.Set.mem s state.used 
+            then avoid (spec.avoid s)
+            else s 
+    in
+
+    let newMangle s =
+        let s'   = String.copy (spec.preprocess s) in
+        let _    = for i = 0 to (String.length s') - 1 do
+                     String.set s' i (spec.replace (String.get s' i))
+                   done in
+        let s'   = avoid s' in
+            ( state.used <- Strutil.Set.add s'   state.used
+            ; Hashtbl.add state.map s s' 
+            ; s'
+            )
+    in         
+    let mangle s = 
+        try  Hashtbl.find state.map s
+        with Not_found -> newMangle s
+    in
+        mangle
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Example}
+% ------------------------------------------------------------------ 
+
+Here is a simple [[symbol]] for testing a mangler.
+        
+<<mangle.ml unused>>=
+let simple =
+    let reserved =
+        [ "aborts"; "align"; "aligned"; "also"; "as"; "big"; "byteorder";
+        "case"; "const"; "continuation"; "cut"; "cuts"; "else"; "equal";
+        "export"; "foreign"; "goto"; "if"; "import"; "invariant"; "jump";
+        "little"; "memsize"; "pragma"; "register"; "return"; "returns";
+        "section"; "semi"; "span"; "stackdata"; "switch"; "target"; "targets";
+        "to"; "typedef"; "unicode"; "unwinds"; "float"; "charset";
+        "pointersize"; "wordsize"]
+    in
+    let id = function
+        | 'a'..'z'
+        | '0'..'9'
+        | 'A'..'Z'
+        | '.' 
+        | '_' 
+        | '$' 
+        | '@'      -> true
+        | _        -> false in
+    let replace = function
+        | x when id x -> x
+        | _           -> '@' in    
+        { preprocess = (fun x -> x)
+        ; replace    = replace
+        ; reserved   = reserved
+        ; avoid      = (fun x -> x ^ "$")
+        }
+@
+    
+                      

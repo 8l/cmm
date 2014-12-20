@@ -1,0 +1,112 @@
+# ------------------------------------------------------------------ 
+# $Id: mkfile,v 1.27 2003-07-13 20:55:49 govereau Exp $ 
+# ------------------------------------------------------------------ 
+
+NAME = cllib
+TOP  = ..
+<      $TOP/config/config.mk
+
+# ------------------------------------------------------------------ 
+# paths
+# ------------------------------------------------------------------ 
+
+LIBCMA  = ${B}$NAME.cma      # bytecode library
+LIBCMXA = ${B}$NAME.cmxa     # native library
+
+INTERP = evaluating
+DEPEND = ${B}DEPEND.$INTERP  # store depend information here
+
+# ------------------------------------------------------------------ 
+# (high level) virtual targets
+# ------------------------------------------------------------------ 
+
+NW   = `echo *.nw`
+HTML = ${NW:%.nw=%.html}
+INC  = ${NW:%.nw=%.inc}
+
+all:V:     $LIBCMA
+all.opt:V: $LIBCMXA
+dvi:V:     $INC
+html:V:    $HTML
+depend:V:  $DEPEND
+
+# update and update.opt targets
+<$TOP/config/libupdate.mk
+update:V: libupdate
+update.opt:V: libupdate.opt
+
+# ------------------------------------------------------------------ 
+# cleanup
+# ------------------------------------------------------------------ 
+
+clean.opt:V:
+	rm -f $B*.cmx $B*.cmxa $B*.o $B*.a
+
+clean:V: clean.opt
+	rm -f $B*.cmi $B*.cmo $B*.cma
+
+clobber:V: clean dep-clobber
+	rm -f *.aux *.log *.dvi *.toc *.html
+	rm -f $B*.ml $B*.ml[ily] $B*.output
+
+# ------------------------------------------------------------------ 
+# rules and tools
+# ------------------------------------------------------------------ 
+
+<$TOP/config/noweb.mk
+<$TOP/config/ocaml.mk
+
+# ------------------------------------------------------------------ 
+# important file sets
+# ------------------------------------------------------------------ 
+
+ML  =           lc.ml       \
+                rc_ast.ml   \
+                rc_parse.ml \
+                rc_scan.ml  \
+                rc.ml       \
+                pc.ml       \
+                pp.ml       \
+                rx.ml       \
+                srcmap.ml   \
+                verbose.ml
+
+MLI =           lc.mli     \
+                pc.mli     \
+                pp.mli     \
+                rc.mli     \
+                rc_ast.mli \
+                rx.mli     \
+                srcmap.mli \
+                verbose.mli
+
+ML  = ${ML:%.ml=$B%.ml}
+MLI = ${MLI:%.mli=$B%.mli}
+CMO = ${ML:%.ml=%.cmo}
+CMX = ${ML:%.ml=%.cmx}
+
+SCAN = $ML $MLI
+<$TOP/config/depend.mk
+
+# ------------------------------------------------------------------ 
+# build the libraries
+# ------------------------------------------------------------------ 
+
+$LIBCMA:  dep-chk $CMO
+	$OCAMLC $OCAMLC_FLAGS -a -o $target $CMO
+
+$LIBCMXA: dep-chk $CMX
+	$OCAMLO $OCAMLO_FLAGS -a -o $target $CMX
+
+# ------------------------------------------------------------------ 
+# extra rules for cases not covered by noweb.mk
+# ------------------------------------------------------------------ 
+
+${B}rc_parse.mly:   rc.nw
+	$NOTANGLE           -Rrc_parse.mly $prereq > $target
+${B}rc_scan.mll:    rc.nw
+	$NOTANGLE           -Rrc_scan.mll  $prereq > $target
+${B}rc_ast.mli:     rc.nw
+	$NOTANGLE -L"$LINE" -Rrc_ast.mli   $prereq > $target
+${B}rc_ast.ml:      rc.nw
+	$NOTANGLE -L"$LINE" -Rrc_ast.ml    $prereq > $target

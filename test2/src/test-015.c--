@@ -1,0 +1,23 @@
+
+// execute the commands below to use this file as a test case
+//
+
+target byteorder little;
+
+bits8 c;
+
+section "data" 
+{
+    x:
+    bits32[4]; 
+}
+
+foo () {
+    stackdata {
+        y:
+        bits32[4] { 1, 2};
+    }
+    
+}
+
+

@@ -1,0 +1,176 @@
+# :VIm ts=8 et sw=4:
+# ------------------------------------------------------------------ 
+# $Id: mkfile,v 1.26 2005-08-16 17:28:27 nr Exp $
+# ------------------------------------------------------------------ 
+
+#                           READ ME FIRST
+#
+# This mkfile can be used in two modes.  In `gen' mode, the Lambda-RTL
+# Translator is used to generate .ml and .mli files from .sled and .rtl
+# descriptions.  In `normal' mode, the .ml and .mli files are taken as
+# given, and there is no reference to Lambda-RTL.
+#
+# To use the mkfile in `gen' mode, run `mk MODE=gen'.
+#
+# To add a new target, modify MACHINEREGEX (and probably also mkfile.gen)
+
+# Currently the compilation of sparcrec.ml to native code with ocamlopt
+# fails.  
+
+MODE = normal
+NAME = gen
+TOP  = ..
+<      $TOP/config/config.mk
+
+# ------------------------------------------------------------------ 
+# paths
+# ------------------------------------------------------------------ 
+
+LIBCMA  = ${B}$NAME.cma      # bytecode library
+LIBCMXA = ${B}$NAME.cmxa     # native library
+
+INTERP = evaluating
+DEPEND = ${B}DEPEND.$INTERP  # store depend information here
+
+LIBDIR =        ../lib
+
+# extend PATH for special tools
+
+PATH   =        $PATH:/usr/share/smlnj/bin
+
+TKDIR =         /home/nr/zephyr/cvs/toolkit
+TKRTL =         $TKDIR/rtl
+SLEDLIBDIR =    $TKDIR
+RTLSPECDIR =    $TKRTL
+SLEDSPECDIR =   /home/nr/toolkit/www/specs
+LRTLHEAP =     /usr/local/smlnj/bin/.heap/lrtl.x86-linux
+
+# ------------------------------------------------------------------ 
+# (high level) virtual targets
+# ------------------------------------------------------------------ 
+
+all:V:     $LIBCMA
+all.opt:V: $LIBCMXA
+depend:V:  $DEPEND
+
+html \
+dvi  \
+test:VQ:
+	echo "nothing to be done"
+
+# update and update.opt targets
+<$TOP/config/libupdate.mk
+update:V: libupdate
+update.opt:V: libupdate.opt
+
+# ------------------------------------------------------------------ 
+# cleanup
+# ------------------------------------------------------------------ 
+
+clean.opt:V:
+	rm -f $B*.cmx $B*.cmxa $B*.o $B*.a
+
+clean:V: clean.opt
+	rm -f $B*.cmi $B*.cmo $B*.cma
+
+clobber:V: dep-clobber clean
+	rm -f *.aux *.log *.dvi *.toc *.html
+
+# ------------------------------------------------------------------ 
+# rules and tools for OCaml
+# ------------------------------------------------------------------ 
+
+<$TOP/config/noweb.mk
+<$TOP/config/ocaml.mk
+
+NOPOLY=/dev/null 
+
+MACHINEREGEX=sparc|x86i
+
+<mkfile.$MODE
+
+# compiler flags used by the rules just included
+# 
+# We compile with -nolabels until the code generators are updated
+# to generate OCaml 3.04 compliant code.
+
+OCAMLC_FLAGS =  $OCAMLC_FLAGS -I $LIBDIR -nolabels
+OCAMLO_FLAGS =  $OCAMLO_FLAGS -I $LIBDIR -nolabels
+
+# ------------------------------------------------------------------ 
+# important file sets
+# ------------------------------------------------------------------ 
+
+# currently some machine generated code does not fit to the 
+# runtime code in sledlib. Since we don't use it right now,
+# we comment those out.
+
+LOCAL =         sledlib.ml      \
+                # sparc.ml        \
+                # sparcmkasm.ml   \
+		x86i.ml		\
+		x86imkasm.ml	\
+                # sparcrec.ml   \
+                # sparcrtl.ml   \
+                ast.ml          \
+                astUtil.ml      \
+                rtlasdl.ml      \
+                rtlasdlUtil.ml  \
+
+LOCALI =        sledlib.mli     \
+                # sparc.mli       \
+                # sparcmkasm.mli  \
+		x86i.mli	\
+		x86imkasm.mli	\
+                ast.mli         \
+                astUtil.mli     \
+                rtlasdl.mli     \
+                rtlasdlUtil.mli \
+
+BAREML  =       # sparcrec.ml    
+
+sparcrec.cmi:   sparcrec.cmo
+                # do nothing; the compiler does it
+
+# regular sources
+ML  = ${LOCAL:%.ml=$B%.ml}
+MLI = ${LOCALI:%.mli=$B%.mli}
+CMO = ${ML:%.ml=%.cmo}
+CMX = ${ML:%.ml=%.cmx}
+
+SCAN = $ML $MLI
+<$TOP/config/depend.mk
+
+# ------------------------------------------------------------------ 
+# building binaries
+# ------------------------------------------------------------------ 
+
+$LIBCMA:  dep-chk $CMO
+        $OCAMLC $OCAMLC_FLAGS -a -o $target $CMO
+
+$LIBCMXA: dep-chk $CMX
+        $OCAMLO $OCAMLO_FLAGS -a -o $target $CMX
+
+# ------------------------------------------------------------------ 
+# extra rules to avoid conflicts between .nw .ml
+# ------------------------------------------------------------------ 
+
+C=${B:%/=%}
+
+$C/ast.ml: ast.ml
+	cp $prereq $target
+
+$C/ast.mli: ast.mli
+	cp $prereq $target
+
+$C/rtlasdl.ml: rtlasdl.ml
+	cp $prereq $target
+
+$C/rtlasdl.mli: rtlasdl.mli
+	cp $prereq $target
+
+$C/&.mli: &.mli
+	cp $prereq $target
+
+$C/&.ml: &.ml
+	cp $prereq $target

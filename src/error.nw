@@ -1,0 +1,440 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+% ------------------------------------------------------------------  
+\section{Error Handling}
+% ------------------------------------------------------------------ 
+
+The idea of error-handling in {\qcc} is not to stop in all cases after
+an error but to mark results as either good or bad.  Bad values can be
+used for further computation although the overall result will be bad. 
+The hope is, to detect even more errors that are \textit{not} caused
+by any previous error.  Details of this idea and the following
+implementation can be found in \textit{Eliminating Spurious Error
+Messages Using Exceptions, Polymorphism and Higher-Order Functions}
+\cite{ramsey:99:compj}.
+
+% ------------------------------------------------------------------  
+\subsection{Interface}
+% ------------------------------------------------------------------  
+
+Technically, results are wrapped in an [['a error]] type; good results
+are represented by the [[Ok]] constructor, bad results by [[Error]]. 
+A set of combinators helps to deal with this type of values. In
+addition, an exception can be raised to signal an error.
+
+<<error.mli>>=
+type 'a error       = Error                     (* bad result  *)
+                    | Ok        of 'a           (* good result *)
+
+exception ErrorExn  of string
+val error :         string -> 'a (* ErrorExn *)
+val errorf : ('a, unit, string, 'b) format4 -> 'a
+@
+
+Now that a bad result can be either signaled by returning an [[Error]]
+value, or raising the [[ErrorExn]] exception, the following policy
+helps to decide which method to use:
+
+\begin{enumerate}
+\item Good values are returned wrapped by [[Ok]].
+\item Computations that use bad values provided from the outside
+      result in bad values that are returned wrapped in [[Error]].
+\item If a computation (over good or bad values) detects a new error
+      this is reported with an exception. It is the obligation of the
+      client to catch this exception, report it, and possibly return a
+      bad value to go on.
+\end{enumerate}
+
+
+% ------------------------------------------------------------------ 
+\subsubsection{Error functions}\label{sect:error-fun}
+% ------------------------------------------------------------------ 
+
+In the original paper \textit{Eliminating Spurious Error Messages
+Using Exceptions, Polymorphism and Higher-Order Functions}
+\cite{ramsey:99:compj} higher order functions usually expect functions
+as the first argument:  [[('a -> 'b) -> 'a error -> 'b error]] and
+arguments to them at higher positions.  Moving the function argument
+to the last position like in [['a error -> ('a -> 'b)]] provides more
+syntactical freedom because the function can be easier written inline,
+covering multiple lines of source code.  For this reason function
+arguments will come last.
+
+Combinators to deal with functions that do not naturally expect 
+values of type [[error]].
+<<error.mli>>=
+val combine : 'a error error -> 'a error
+val ematch  : 'a error -> ('a -> 'b) -> 'b error
+val ematch2 : 'a error -> 'b error -> ('a -> 'b -> 'c) -> 'c error
+val ematch3 : 'a error -> 'b error -> 'c error ->
+              ('a -> 'b -> 'c -> 'd) -> 'd error
+val ematch4 : 'a error -> 'b error -> 'c error -> 'd error -> 
+              ('a -> 'b -> 'c -> 'd -> 'e) -> 'e error
+val ematch5 : 'a error -> 'b error -> 'c error -> 'd error -> 'e error ->
+              ('a -> 'b -> 'c -> 'd -> 'e -> 'f) -> 'f error
+val ematch6 : 'a error -> 'b error -> 'c error -> 'd error -> 'e error -> 'f error ->
+              ('a -> 'b -> 'c -> 'd -> 'e -> 'f -> 'g) -> 'g error
+val ematchPair  : 'a error * 'b error -> ('a * 'b -> 'c) -> 'c error
+val ematchTriple: 'a error * 'b error * 'c error -> 
+                   ('a * 'b * 'c -> 'd) -> 'd error
+val ematchQuad  : 'a error * 'b error * 'c error * 'd error -> 
+                   ('a * 'b * 'c * 'd -> 'e) -> 'e error
+val seq         : 'a error -> ('a -> 'b error) -> 'b error
+val seq2        : 'a error -> 'b error -> ('a -> 'b -> 'c error) -> 'c error
+val seqPair     : 'a error * 'b error -> ('a * 'b -> 'c error) -> 'c error
+val seq'        : 'b -> 'a error -> ('a -> 'b) -> 'b 
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Raising functions}
+% ------------------------------------------------------------------ 
+
+
+Raising combinators raise the constructors of an [[error]] value
+inside a complex value to the top-level.  A complex value is bad when
+one of its components is bad and good otherwise.  The raising
+combinators deal with the most important data types:  options, lists,
+and tuples.
+
+<<error.mli>>=
+module Raise :
+  sig
+    val option : 'a error option                -> 'a option error
+    val list   : 'a error list                  -> 'a list error
+    val pair   : 'a error * 'b error            -> ('a * 'b) error
+@
+The [[left]] and [[right]] functions consider only one component of
+a pair when raising the constructor.
+<<error.mli>>=
+    val left   : 'a error * 'b                  -> ('a * 'b) error
+    val right  : 'a * 'b error                  -> ('a * 'b) error
+    
+    val triple : 'a error * 'b error * 'c error -> ('a * 'b * 'c) error
+    val quad   : 'a error * 'b error * 'c error * 'd error 
+                  -> ('a * 'b * 'c * 'd) error
+  end
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Lowering functions}
+% ------------------------------------------------------------------ 
+
+Lowering functions take a complex [[error]] value and push the
+constructor from the top-level to the values inside the [[error]]
+value. 
+<<error.mli>>=
+module Lower :
+  sig
+    val pair   : ('a * 'b)           error -> 'a error * 'b error
+    val triple : ('a * 'b * 'c)      error -> 'a error * 'b error * 'c error
+    val quad   : ('a * 'b * 'c * 'd) error -> 'a error 
+                                            * 'b error 
+                                            * 'c error 
+                                            * 'd error
+  end
+@
+The functions of the [[Implode]] module destroy informations by
+reducing complex [['a error]] values to [[unit error]]. They come in
+handy when are there are only good and bad results. Whenever an
+any argument of a function contains an [[Error]] value the outcome is
+[[Error]] and [[Ok()]] otherwise. 
+
+The [[list]] function is similar to [[Raise.list]] as is raises the
+[[error]] type to the top level.  The [[map]] function is greedy:  it
+does not stop when it encounters the first [[Error]] but traverses the
+whole list.  The motivation is to give detect possible bad values in
+the list such that the [[ErrorExn]] can be raised for them. 
+<<error.mli>>=
+module Implode :
+  sig
+    val singleton : 'a error                                  -> unit error
+    val pair :      'a error * 'b error                       -> unit error
+    val triple :    'a error * 'b error * 'c error            -> unit error
+    val quad :      'a error * 'b error * 'c error * 'd error -> unit error
+    val list :      'a error list                             -> unit error
+    val map :       ('a -> 'b error) -> 'a list               -> unit error
+  end
+@
+
+
+% ------------------------------------------------------------------ 
+\subsubsection{Catching and Printing Errors}
+% ------------------------------------------------------------------ 
+
+At the point where an error occurs the first time the [[ErrorExn]]
+is raised.  When the exception is caught is is turned into an
+[[Error]] value and from there on the [[Error]] value is propagated. 
+Catching the exception is done with [[catch]] in the special case, and
+[[catch']] in the general case.  [[catch']] permits to specify the
+value that is returned when an exception is caught whereas [[catch]]
+always uses [[Error]] for this.
+<<error.mli>>=
+val catch   :       (string -> unit) 
+                    -> ('a -> 'b error) -> 'a -> 'b error
+val catch'  : 'b -> (string -> unit) 
+                    -> ('a -> 'b      ) -> 'a -> 'b 
+@
+
+he first argument in [[catch printer f x]] is an error reporting
+function; [[f]] is applied to [[x]] and in case of an error [[Error]]
+is returned. The first argument to [[catch']] is the value to return
+in case of an error.
+
+The [[warningPrt]] and [[errorPrt]] functions can be passed to
+[[catch]] and [[catch']] as error printing functions. However, in most
+cases specialized functions for error reporting will be used to include
+some source code locations.
+
+<<error.mli>>=
+val warningPrt : string -> unit
+val errorPrt   : string -> unit
+@
+
+The following error reporting functions take a location as their first
+argument.  Typically the location is supplied to the function like in
+[[errorPointPrt point]] and the resulting closure is passed to
+[[catch]].  This works because the error locations are attached where
+exceptions are caught and not where they are raised.
+
+<<error.mli>>=
+val errorPointPrt  : Srcmap.point -> string -> unit
+val errorRegionPrt : Srcmap.region -> string -> unit
+val errorPosPrt    : Srcmap.pos -> string -> unit
+val errorRegPrt    : Srcmap.rgn -> string -> unit
+@
+
+% ------------------------------------------------------------------  
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+<<error.ml>>=
+type 'a error       = Error                     (* bad result  *)
+                    | Ok        of 'a           (* good result *)
+
+exception ErrorExn          of string
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Raising functions}
+% ------------------------------------------------------------------ 
+
+Raising combinators raise the constructors of an [[error]] value inside
+a complex value to the top-level. A complex value is bad when one
+of its components is bad and good otherwise. The raising combinators
+deal with the most important data types: options, lists, and tuples.
+
+<<error.ml>>=
+module Raise = struct
+    <<raise module>>
+end
+@
+<<raise module>>=
+let option = function
+    | Some Error        -> Error
+    | Some (Ok x)       -> Ok (Some x)
+    | None              -> Ok (None)
+<<raise module>>=
+let list xs =
+    let rec loop acc = function
+        | []            -> Ok (List.rev acc)
+        | (Ok x)::xs    -> loop (x::acc) xs
+        | Error::xs     -> Error 
+    in      
+        loop [] xs
+
+<<raise module>>=
+let pair = function
+    | (Ok x, Ok y)          -> Ok (x,y)
+    | _                     -> Error
+        
+<<raise module>>=
+let left = function
+    | (Ok x, y)             -> Ok (x,y)
+    | _                     -> Error
+
+<<raise module>>=
+let right = function
+    | (x, Ok y)             -> Ok (x,y)
+    | _                     -> Error
+
+<<raise module>>=
+let triple = function
+    | (Ok x, Ok y, Ok z)    -> Ok (x,y,z)
+    | _                     -> Error 
+
+<<raise module>>=
+let quad = function
+    | (Ok a,Ok b,Ok c,Ok d) -> Ok (a,b,c,d)
+    | _                     -> Error
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Lowering functions}
+% ------------------------------------------------------------------ 
+
+Lowering functions take a complex [[error]] value and push the
+constructor from the top-level to the values inside the [[error]]
+value. 
+
+<<error.ml>>=
+module Lower = struct
+    <<lower module>>
+end
+@
+
+<<lower module>>=
+let pair = function
+    | Ok (x,y)              -> Ok x , Ok y
+    | Error                 -> Error, Error 
+<<lower module>>=
+let triple = function
+    | Ok (x,y,z)            -> Ok x , Ok y , Ok z
+    | Error                 -> Error, Error, Error
+<<lower module>>=
+let quad = function
+    | Ok (a,b,c,d)          -> Ok a , Ok b , Ok c , Ok d
+    | Error                 -> Error, Error, Error, Error
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Reduction functions}
+% ------------------------------------------------------------------ 
+
+Sometimes it is sufficient to distinguish between good and bad
+values. Any complex value that has a bad value in it is itself bad.
+The [[Implode]] module reduces everything to [[unit Error]] values
+which means it (carefully) destroys informations.
+
+<<error.ml>>=
+module Implode = struct
+    <<implode module>>
+end
+
+<<implode module>>=
+let singleton = function
+    | Ok _ -> Ok ()
+    | _    -> Error
+
+<<implode module>>=
+let pair = function
+    | Ok _, Ok _ -> Ok ()
+    | _          -> Error
+
+<<implode module>>=
+let triple = function
+    | Ok _, Ok _, Ok _ -> Ok ()
+    | _                -> Error
+
+<<implode module>>=
+let quad = function
+    | Ok _, Ok _, Ok _, Ok _ -> Ok ()
+    | _                      -> Error
+
+<<implode module>>=
+let rec list = function
+    | []            -> Ok ()
+    | (Ok _)::xs    -> list xs
+    | _             -> Error 
+
+<<implode module>>=
+let map f l =
+    let ok = Ok () in
+    let rec loop res = function
+        | []    -> res
+        | x::xs -> ( match res, f x with
+                   | Error, _     -> loop Error xs 
+                   |    _ , Error -> loop Error xs
+                   | _            -> loop ok    xs
+                   )
+    in
+        loop ok l 
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Error functions}
+% ------------------------------------------------------------------ 
+
+The following combinators bridge the gap between code that uses error
+propagation using the [[error]] type and code that doesn't.
+<<error.ml>>=
+let combine = function  
+    | Ok x      -> x
+    | Error     -> Error
+
+<<error.ml>>=
+let ematch x f = match x with Ok x -> Ok (f x) | Error -> Error
+let ematch2 x y f =
+  match x with Ok x -> (match y with  Ok y -> Ok (f x y) | _ -> Error) | _ -> Error
+let ematch3 x y z f     = match x with Ok x -> ematch2 y z     (f x) | Error -> Error
+let ematch4 x y z w f   = match x with Ok x -> ematch3 y z w   (f x) | Error -> Error
+let ematch5 x y z w v f = match x with Ok x -> ematch4 y z w v (f x) | Error -> Error
+let ematch6 x y z w v u f =
+  match x with Ok x -> ematch5 y z w v u (f x) | Error -> Error
+let ematchPair    x2 = ematch (Raise.pair x2)
+let ematchTriple  x3 = ematch (Raise.triple x3)
+let ematchQuad    x4 = ematch (Raise.quad x4)
+
+<<error.ml>>=
+let seq x f = match x with Ok x -> f x | Error -> Error
+let seq2 x y f =
+  match x with Ok x -> (match y with  Ok y -> f x y | _ -> Error) | _ -> Error
+let seq' default x f = match x with Ok x -> f x | Error -> default
+let seqPair x2   = seq (Raise.pair x2)
+@
+    
+% ------------------------------------------------------------------ 
+\subsubsection{Error reporting}
+% ------------------------------------------------------------------ 
+
+We provide functions to raise the error ([[ErrorExn]]) exception and
+issue warnings.
+
+<<error.ml>>=
+let catch' default printer f arg =
+    try f arg with
+    | ErrorExn(msg) -> ( printer msg 
+                       ; default
+                       )
+<<error.ml>>=
+let catch printer f arg = catch' Error printer f arg
+let error msg           = raise (ErrorExn msg)
+let errorf fmt = Printf.kprintf error fmt
+@
+
+The following functions print error and warning messages. They differ
+in the argument describing a source code position the error is
+attributed to.
+
+<<error.ml>>=
+let warningPrt msg = Printf.eprintf "Warning: %s\n" msg
+let errorPrt   msg = Printf.eprintf "Error: %s\n"   msg
+<<error.ml>>=
+let errorPointPrt  p msg = 
+    ( Printf.eprintf "%s " (Srcmap.Str.point p)
+    ; errorPrt msg
+    )
+<<error.ml>>=
+let errorRegionPrt r msg =
+    ( Printf.eprintf "%s " (Srcmap.Str.region r)
+    ; errorPrt msg
+    )
+<<error.ml>>=
+let errorPosPrt    p msg =
+    ( Printf.eprintf "Character %d " p
+    ; errorPrt msg
+    )
+<<error.ml>>=
+let errorRegPrt (l,r) msg = 
+    ( Printf.eprintf "Character %d-%d " l r
+    ; errorPrt msg
+    )
+@
+
+

@@ -1,0 +1,543 @@
+#! /usr/bin/perl -w
+# $Id: configure,v 1.40 2006-04-19 01:02:48 nr Exp $
+#
+# Run me at first install and after every "mk clobber" to configure the
+# build process for the Quick C-- compiler. The script assumes that
+# mk(1) from qc--/mk is already installed. See also the INSTALL file
+# in this directory.
+#
+# The script creates config/config.mk which you also can edit manually.
+#
+
+use File::Basename;
+
+$config_mk      = "config/config.mk";       # where output is written
+$configure_log  = "configure.log";          # log file
+%x = ();                                    # hash for what we are looking for
+
+# ------------------------------------------------------------------ 
+# What we are looking for
+# ------------------------------------------------------------------ 
+
+# The script tries to find the correct value for the following
+# variables. You can set them here directly, if the script cannot find
+# them.
+
+$x{prefix}      = "/usr/local";  # where we install
+
+$x{lua_h}       = ""   ;         # "/path/to/lua.h"
+$x{lualib_h}    = ""   ;         # "/path/to/lualib.h"    
+$x{liblua}      = ""   ;         # "/path/to/liblua.so"  
+$x{liblualib}   = ""   ;         # "/path/to/liblualib.so"
+$x{lua_inc}     = ""   ;         # -I for lua.h    "-I/usr/local/include/lua"
+$x{lua_lib}     = ""   ;         # -L for liblua.so "-L/usr/local/lib"
+$x{lua_libs}    = ""   ;         # "-llua -llualib" ld(1) flags for Lua libs
+
+# the binaries below are checked to be on $PATH. It does not make sense
+# to set them since we never use the full PATH. Extend PATH instead.
+
+$x{ocamlc}      = ""   ;         # "/path/to/binary"
+$x{ocamlo}      = ""   ;
+$x{ocamlyacc}   = ""   ;
+$x{notangle}    = ""   ;
+$x{cpif}        = ""   ;
+$x{awk}         = ""   ;
+$x{cc}          = ""   ;
+$x{mk}          = ""   ;
+$x{latex}       = ""   ;
+$x{test}        = ""   ;
+
+# these values are always tested, you cannot set them
+
+$x{lua_version} = ""   ;         # from LUA_VERSION macro
+$x{endian}      = ""   ;         # big/little
+$x{sizeof_int}  = ""   ;         # 4  
+$x{sizeof_ptr}  = ""   ;         # 4
+$x{sizeof_char} = ""   ;         # 1
+$x{stdc_version}= ""   ;         # 199409 - from     __STDC_VERSION__
+$x{stdc_iec559} = ""   ;         # defined/undefined __STDC_IEC_559__
+$x{float_impl}  = ""   ;   # iec60559/solaris/none
+$x{arch}        = ""   ;         # x86-linux  
+$x{wordsize}    = ""   ;         # 32
+$x{ocaml_version} = "" ;         # OCaml Version
+
+$x{build_interp} = ""  ;         # whether we build qc--interp
+
+# ------------------------------------------------------------------ 
+# Important Search Paths
+#
+# Adjust to help the script find header files and libraries.
+# ------------------------------------------------------------------ 
+
+@path       = split(/:/,$ENV{PATH});
+@include    = ( "/usr/include"
+              , "/usr/local/include"
+              , "/usr/include/lua40"
+              , "/usr/local/include/lua40"
+              , "/usr/local/lua/include"
+              , "/usr/include/lua"
+              , "/usr/local/gnu/include"
+              );
+@libs       = ( "/lib"
+              , "/usr/lib"
+              , "/usr/local/lib"
+              , "/usr/local/gnu/lib"
+              );
+
+# ------------------------------------------------------------------ 
+# Nothing to adjust from here down
+# ------------------------------------------------------------------ 
+
+#
+# search (file, dir, dir, dir, ..), call as search(file, @dirs) search
+# for file in dirs and return, full path, if found, and "" otherwise.
+#
+
+sub search { search_with( sub($) { return (-f shift) }, @_) }
+
+sub searchx {
+    my $f = sub($) {
+        my $x = shift;
+        if (-f $x) {
+            `$x a -nt b 2>&1 > /dev/null`;
+            my $r = $?;    # try 'man perlvar' for meaning
+            $r = $r >> 8;  # recover the exit status
+            return ($r == 0 || $r == 1);
+        }
+        return (1==2); # how do you write false in perl?
+    };
+    search_with($f, @_)
+}
+
+sub search_with {
+    my $p    = shift;
+    my $file = shift;
+   
+    printf(LOG "searching for %-20s", $file); 
+    while ($f = shift (@_)) {
+        my $x = "$f/$file";
+        if (&$p($x)) { 
+            print LOG "found $x\n"; 
+            return $x 
+        }
+    }
+    print LOG "not found\n";
+    return "";
+}
+
+
+#
+# compile and run a small C program to find out about architecture
+#
+
+sub runtest {
+    my $cc = shift(@_) || die "no C compiler available?";
+    my $args = shift(@_);
+    
+    my $cmd   = "$cc -o tst $args || exit 100";
+    my $rc    = system($cmd);
+    my $signo = $rc & 127;
+    if ($signo) { die "killed by signal $signo" }
+    if ($rc >> 8 eq 100) { 
+        print LOG <<EOF;
+    
+    Failed to run this test in config/auxdir: 
+    
+        $cmd.
+    
+    This can have several reasons:
+
+    (1) The header file lua.h was not found.
+    (2) The C compiler is not ANSI compliant.
+
+    Reason (1) is the most likely. The script tries to provide the C
+    compiler with the right -I option by searching these directories
+    for the header file:
+    
+        @include
+    
+    This might have failed because the script could not find the
+    header file. If you know you have Lua 4.0 installed, please add
+    the right directory to the variable \@include in this script and
+    run the script again. 
+    
+    If you don't have Lua 4.0 installed, please install it and try
+    again. Lua is available from http://www.lua.org/.
+
+    If your C compiler could not be found, please make sure it is on
+    your PATH. Your current PATH is:
+
+        $ENV{PATH}
+EOF
+        return "";
+    }
+    # run test and capture output
+    return `./tst`;
+}
+
+#
+# usage/help
+#
+
+sub usage {
+    print <<EOF;
+    
+    ./configure [options]
+
+    --prefix=/usr/local     install into the /usr/local hierarchy which
+                            is also the default
+    -h, --help              this summary
+
+    Various variables can be set at the top of this script, in
+    particular lists of directories that are searched.
+EOF
+
+}
+
+
+sub bye {
+    my $rc = shift @_;
+    close LOG || die "cannot close $configure_log: $!";
+    exit $rc;
+}
+
+
+sub failure {
+    print <<EOF;
+    Please see the $configure_log file for details. You have several
+    options now:
+
+    (1) Enlarge your PATH to make sure all tools are found; then run
+        this script again.
+
+    (2) Add more directories to the list of the searched directories
+        at the top of this script and run ./configure again.
+
+    (3) Create config/config.mk from config/config.mk.default and edit
+        it manually. No need to run this script again.
+EOF
+    bye 1;
+}
+
+sub success { bye 0; }
+
+# ------------------------------------------------------------------ 
+# We start from here with reading the command line
+# ------------------------------------------------------------------ 
+
+foreach (@ARGV) {
+    if       (/^--?prefix=(.*)$/)             { $x{prefix}=$1     }
+    elsif    (/^--?h(elp?)$/)                 { usage(); exit 0   }  
+    else     { usage(); exit 1 }
+}
+
+
+open (LOG, ">$configure_log") || die "cannot write configure.log: $!";
+
+# check for various executables and versions. Only update variable if
+# it is not already set.
+#
+# The compiler might know about directories that we do not check. Thus,
+# if we fail to find a library or header file, this does not mean the
+# compiler also won't find it. The SUN compiler comes to mind.
+#
+
+$x{ocamlc} = $x{ocamlc} || search("ocamlc.opt",  @path) || search("ocamlc",  @path);
+$x{ocamlo} = $x{ocamlo} || search("ocamlopt.opt",@path) || search("ocamlopt",@path);
+$x{ocamlyacc}       = $x{ocamlyacc}    || search("ocamlyacc",@path);
+$x{ocaml_version}   = $x{ocamlc}       &&(`$x{ocamlc} -v 2>&1` =~ /(\d\.\d\d)/) 
+                                       && $1;
+$x{notangle}        = $x{notangle}     || search("notangle",@path); 
+$x{cpif}            = $x{cpif}         || search("cpif", @path) || "cp";
+$x{awk}             = $x{awk}          || search("awk", @path);
+$x{test}            = $x{test}         || searchx("test", @path);
+$x{cc}              = $x{cc}           || search("gcc",@path) 
+                                       || search("cc",@path)  
+                                       || search("lcc",@path); 
+$x{mk}              = $x{mk}           || search("mk",@path); 
+$x{latex}           = $x{latex}        || search("latex",@path); 
+$x{has_latex}       = ($x{latex} ? "true" : "false");
+$x{lua_h}           = $x{lua_h}        || search("lua.h", @include);
+$x{lualib_h}        = $x{lualib_h}     || search("lualib.h", @include);
+$x{liblua}          = $x{liblua}       || search("liblua.so", @libs) 
+                                       || search("liblua40.so", @libs)
+                                       || search("liblua.a", @libs) 
+                                       || search("liblua40.a", @libs);
+$x{liblualib}       = $x{liblualib}    || search("liblualib.so", @libs) 
+                                       || search("liblualib40.so", @libs)
+                                       || search("liblualib.a", @libs) 
+                                       || search("liblualib40.a", @libs);
+
+($liblua,$path,$suffix) = fileparse($x{liblua},('\.so', '\.a'));
+$liblua =~ s/^lib/-l/;
+
+($liblualib,$path,$suffix) = fileparse($x{liblualib},('\.so', '\.a'));
+$liblualib =~ s/^lib/-l/;
+
+$x{lua_inc}         = $x{lua_inc}      || "-I" . dirname($x{lua_h});
+$x{lua_lib}         = $x{lua_lib}      || "-L" . $path;
+$x{lua_libs}        = $x{lua_libs}     || "$liblua $liblualib";
+
+# if we don't find Lua we need to let our config.c code know that
+$config_c_flags  = "";
+$x{build_interp} = "interp";
+
+if ($x{lua_h} eq '') {
+	$config_c_flags = "-DNOLUA";
+	$x{build_interp} = "";
+}
+
+
+# ------------------------------------------------------------------ 
+# Run tests. The config.c test script emits Perl code that sets
+# variables, hence the output is eval'ed.
+# ------------------------------------------------------------------ 
+
+chdir("config/auxdir") || die "cannot cd to config/auxdir: $!";
+
+$result = $x{cc} && runtest($x{cc}, "$x{lua_inc} $config_c_flags config.c");
+$result && eval($result);
+$x{wordsize} = 8 * $x{sizeof_ptr};
+$x{arch}=`./arch-os`;
+$x{arch} && chop($x{arch});
+
+if ($x{stdc_iec550}) {
+    $x{float_impl} = "iec60559";
+} else {
+    $x{float_impl} = "none";
+    $x{float_impl} = "solaris"  if ($x{arch} eq "sparc-solaris");
+    $x{float_impl} = "iec60559" if ($x{arch} eq "x86-linux");
+}
+
+chdir ("../..") || die "cannot cd back to top level: $!";
+
+# ------------------------------------------------------------------ 
+# Collect undefined configuration variables
+# ------------------------------------------------------------------ 
+
+$fatal = 0;
+
+@missing = ();
+foreach my $v (keys %x) {
+    if (not defined($x{$v})) { print LOG "undefined: $v\n" }
+
+    # RRO -- this is a hack below so we don't complain about not finding
+    #  build_interp and further confuse anyone using this scripts...
+    if (($x{$v} eq '') && ($v ne 'build_interp')) {
+		push(@missing,$v);
+
+        if ($v !~ /lua/ && $v ne "latex") { $fatal = 1; }
+	}
+}
+
+# ------------------------------------------------------------------ 
+# report
+# ------------------------------------------------------------------ 
+
+print LOG <<EOF;    
+
+    Here is what $0 has found:
+    
+    OCAML
+    ------------------------------------------------------------------ 
+    OCaml Version:  $x{ocaml_version}
+    ocamlc:         $x{ocamlc}
+    ocamlopt:       $x{ocamlo}
+    ocamlyacc:      $x{ocamlyacc}
+    
+    NOWEB and tools
+    ------------------------------------------------------------------ 
+    notangle:       $x{notangle}
+    cpif:           $x{cpif}
+    awk:            $x{awk}
+    mk:             $x{mk}
+    
+    C Compiler
+    ------------------------------------------------------------------ 
+    cc:             $x{cc}
+    C Standard:     $x{stdc_version}
+    IEC 60559       $x{stdc_iec559}
+    
+    
+    Documentation
+    ------------------------------------------------------------------ 
+    LaTeX:          $x{latex}
+    
+    Lua
+    ------------------------------------------------------------------ 
+    Lua Version:    $x{lua_version}
+    lua.h:          $x{lua_h}
+    lualib.h:       $x{lualib_h}
+    liblua:         $x{liblua}
+    liblualib:      $x{liblualib}
+    Lua -I          $x{lua_inc}
+    Lua -L          $x{lua_lib}
+    ld(1) flags:    $x{lua_lib} $x{lua_libs}
+    
+    Architecture
+    ------------------------------------------------------------------ 
+    Architecture:   $x{arch}
+    Word size:      $x{wordsize}
+    Endianness:     $x{endian}
+    Sizes:          int:$x{sizeof_int} int*:$x{sizeof_ptr} char:$x{sizeof_char}
+
+    Installation
+    ------------------------------------------------------------------
+    Install to:     $x{prefix}
+
+EOF
+
+if (@missing) {
+    print <<EOF;
+    The configure script failed to infer the value for the following
+    variables: 
+    
+        @missing
+
+EOF
+    if ($fatal) { failure(); }
+}
+    
+
+# ------------------------------------------------------------------ 
+# Check Versions
+# ------------------------------------------------------------------ 
+
+
+if ($x{ocaml_version} !~ /3\.0[89]/) {
+    print <<EOF;
+
+    Configuration failed.
+    
+    You need OCaml 3.0[89] to compile Quick C--, but we found 
+    $x{ocaml_version}. 
+EOF
+    failure();
+}
+
+if (!$x{lua_version} || !$x{lua_h} || !$x{liblua} || !$x{liblualib}) {
+	print <<EOF;
+    You need an installation of Lua to compile qc--interp.  Disabling
+    compilation of qc--interp.
+
+EOF
+    $x{build_interp} = "";
+} elsif ($x{lua_version} !~ /4\./) {
+    print <<EOF;
+
+    You need an installation of Lua 4.x, but we found $x{lua_version}.
+    Disabling compilation of qc--interp.
+
+EOF
+    $x{build_interp} = "";
+}
+   
+# ------------------------------------------------------------------ 
+# Emit configuration variables in Mk syntax
+# ------------------------------------------------------------------ 
+
+my @export = ( "arch"
+             , "wordsize"
+             , "endian"
+             , "float_impl",
+             , "has_latex",
+             , "cc"
+             , "stdc_version"
+             , "stdc_iec559"
+             , "lua_inc"
+             , "lua_lib"
+             , "lua_libs"
+             , "prefix"
+             , "build_interp"
+             , "test"
+             );
+
+my @export_upper_base = ( "ocamlc", "ocamlo" );
+             
+open(OUT,"> $config_mk") || die "cannot open $config_mk";
+print OUT <<EOF;
+#
+# configuration file, created by configure script in top level directory
+#
+# config_arch                 = x86-linux
+# Architecture and OS, used to select the default backends
+#
+# config_endian               = little
+# Also used to select default backends. Alternativ is "big"
+#
+# config_cc                   = /usr/bin/gcc
+# C compiler, mainly for compilation of interpreter
+#
+# config_stdc_version         = 199409
+# __STDC__VERSION__ macro value. The interpreter uses C99 features
+# if available
+#
+# config_stdc_iec559          = 1
+# __STDC_IEC559__ macro value. Used to detect C99 features for the 
+# interpreter.
+#
+# config_lua_inc              = -I/usr/include/lua40
+# Flag passed to cc(1) to find lua.h include file
+#
+# config_lua_lib              = -L/usr/lib/
+# Flag passed to cc(1) to find Lua libraries.
+#
+# config_lua_libs             = -llua40 -llualib40
+# Flags passed to cc(1) to link in Lua libraries.
+#
+# config_prefix               = /usr/local
+# Hierarchy for install target in top-level mkfile
+#
+EOF
+             
+foreach $v (@export) {
+    printf OUT ("config_%-20s = %s\n", $v, $x{$v});
+}
+
+foreach $v (@export_upper_base) {
+    printf OUT ("%-20s = %s\n", uc $v, basename($x{$v}));
+}
+
+print OUT <<EOF;
+
+#
+# Locations for installed files
+#
+
+install_bin                 = \$config_prefix/bin
+install_lib                 = \$config_prefix/lib/qc--
+install_lua                 = \$config_prefix/lib/qc--
+install_inc                 = \$config_prefix/include/qc--
+install_doc                 = \$config_prefix/doc/qc--
+install_man1                = \$config_prefix/man/man1
+
+# Build directory
+BT="."
+
+# do not edit
+HERE = `basename \$PWD`
+B = `if [ "\$BT" != "." ]; then (cd \$BT; pwd | sed "s/.*/&\\/\$HERE\\//"); fi`
+
+EOF
+ 
+if ($x{'endian'} eq "big") {
+    print OUT "config_swapopt = Options.swap=1\n";
+} else {
+    print OUT "config_swapopt = Options.swap=nil\n";
+}
+
+close(OUT) || die "cannot close file $config_mk: $!";
+
+print LOG "configuration written to $config_mk\n";
+print <<EOF;
+The configuration was successful and wrote these files:
+
+    log file:       $configure_log
+    configuration:  $config_mk
+
+If this is your first build, type
+  mk timestamps
+  mk all all.opt
+
+EOF
+success();

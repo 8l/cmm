@@ -1,0 +1,187 @@
+# ------------------------------------------------------------------ 
+# $Id: mkfile,v 1.40 2005-07-01 20:29:53 nr Exp $ 
+# ------------------------------------------------------------------ 
+
+# ------------------------------------------------------------------ 
+# paths
+# ------------------------------------------------------------------ 
+
+TOP    =    ..
+INTERP =    evaluating
+
+<$TOP/config/config.mk
+
+DEPEND = ${B}DEPEND
+LIBDIR = ${B}../lib
+BINDIR = ../bin
+MANDIR = ../man
+
+# ------------------------------------------------------------------ 
+# (high level) virtual targets
+# ------------------------------------------------------------------ 
+
+HTML =          `echo *.nw       | sed 's/\.nw/.html/g;'`
+INC  =          `echo *.nw       | sed 's/\.nw/.inc/g;'`
+
+all:V:          ocamlerror      nofake grades newer man 
+all.opt:V:      ocamlerror.opt  nofake grades newer man
+
+update:V:       all 
+	cp ocamlerror     $BINDIR
+	cp ocamlerror.1   $MANDIR/man1
+	cp nofake         $BINDIR
+	cp nofake.1       $MANDIR/man1
+	cp grades         $BINDIR
+	cp grades.1       $MANDIR/man1  
+	cp newer          $BINDIR  
+
+update.opt:V:   all.opt
+	cp ocamlerror.opt $BINDIR
+	cp ocamlerror.1   $MANDIR/man1
+	cp nofake         $BINDIR
+	cp nofake.1       $MANDIR/man1
+	cp grades         $BINDIR
+	cp grades.1       $MANDIR/man1  
+	cp newer          $BINDIR  
+
+install:V: all $install_bin $install_man1
+	cp ocamlerror     $install_bin/ocamlerror
+	cp ocamlerror.1   $install_man1/ocamlerror.1
+	cp nofake         $install_bin/nofake
+	cp nofake.1       $install_man1/nofake.1
+
+install.opt:V: install all
+	cp ocamlerror.opt $install_bin/ocamlerror.opt
+
+dvi:V:          $INC
+html:V:         $HTML
+
+man:VQ:
+	# do nothing
+
+test:V:         nofake nofake.nw
+	./nofake -Rnofake nofake.nw | diff - nofake 
+
+depend:V:       $DEPEND
+
+clean.opt:V:    
+	rm -f $B*.cmx $B*.o
+	rm -f $B*.cmxa $B*.a
+
+clean:V:        clean.opt
+	rm -f $B*.cmi $B*.cmo
+	rm -f $B*.cma 
+
+clobber:V: dep-clobber clean
+	rm -f *.output
+	rm -f $B*.ml $B*.mli
+	rm -f $B*.mly $B*.mll
+	rm -f *.aux *.log *.dvi *.tex *.inc *.toc
+	rm -f *.html
+	rm -f *.h *.c
+	rm -f ocamlerror ocamlerror.opt
+	rm -f nofake 
+	rm -f grades 
+	rm -f newer
+
+# ------------------------------------------------------------------ 
+# rules and tools for OCaml
+# ------------------------------------------------------------------ 
+
+<$TOP/config/ocaml.mk
+<$TOP/config/noweb.mk
+<$TOP/config/c.mk
+<$TOP/config/man.mk
+NOPOLY=/dev/null
+
+# compiler flags used by the rules just included
+OCAMLC_FLAGS = $OCAMLC_FLAGS -I $LIBDIR
+OCAMLO_FLAGS = $OCAMLO_FLAGS -I $LIBDIR
+
+# ------------------------------------------------------------------ 
+# important file sets
+# ------------------------------------------------------------------ 
+
+ML  = ocamlscan.ml ocamlerror.ml
+ML  = ${ML:%.ml=$B%.ml}
+
+CMO = ${ML:%.ml=%.cmo}
+CMX = ${ML:%.ml=%.cmo}
+
+SCAN = $ML
+<$TOP/config/depend.mk
+
+# ------------------------------------------------------------------ 
+# building binaries
+# ------------------------------------------------------------------ 
+
+CMOLIBS = str.cma  cllib.cma
+CMXLIBS = str.cmxa cllib.cmxa
+PROF    = profiling.cmo
+
+ocamlerror:     ocamlscan.cmo ocamlerror.cmo 
+	$OCAMLC $OCAMLC_FLAGS -custom -o $target $PROF $CMOLIBS $prereq
+
+
+ocamlerror.opt: ocamlscan.cmx ocamlerror.cmx 
+	$OCAMLO $OCAMLO_FLAGS         -o $target $CMXLIBS $prereq
+
+nofake:         nofake.nw
+	$NOTANGLE -R$target $prereq > $target
+	chmod +x $target
+
+grades:         grades.nw
+	$NOTANGLE -Rgrades grades.nw > $target
+	chmod +x $target
+
+
+# ------------------------------------------------------------------ 
+# extra rules for cases not covered by noweb.mk
+# ------------------------------------------------------------------ 
+
+${B}ocamlscan.mll:D:  ocamlerror.nw
+	$NOTANGLE -R"`basename $target`" $prereq > $target
+
+newer.inc:D:      newer.nw
+	$NOWEAVE -delay -autodefs c -index $prereq > $target
+
+# we compile and link in one go. CC and CFLAGS are defined in config/c.mk
+
+newer:          newer.c
+	$CC $CFLAGS -o $target $prereq
+
+# ------------------------------------------------------------------ 
+# rules to build a distribution for the outside world
+# we have to include files that we otherwise obtain from lib/.
+# ------------------------------------------------------------------ 
+
+# 1.0 released on 5 March 2002
+
+FILE =          ocamlerror-1.1
+
+srcmap.nw:      ../cllib/srcmap.nw
+	cp $prereq $target
+
+EXPORT =        README Makefile\
+                nofake nofake.nw nofake.html nofake.1\
+                ocamlerror.nw ocamlerror.html ocamlerror.1\
+                srcmap.nw srcmap.html
+
+tidy:V:         $HTML 
+	tidy -f /dev/null -im $prereq || exit 0
+
+tar:V:          $FILE.tar.gz
+
+$FILE.tar.gz:   $EXPORT tidy mkfile
+	ln -s . $FILE
+	tar czvhf $FILE.tar.gz `ls -1 $EXPORT | sed "s|^|$FILE/|"`
+	rm -f $FILE
+
+tartest:V:      $FILE.tar.gz
+	( tar zxvf $prereq && cd $FILE && make )
+	rm -rf $FILE
+
+www:V:          $FILE.tar.gz
+	cp $prereq $HOME/../cminusminus/www/download
+
+<$TOP/config/install.mk

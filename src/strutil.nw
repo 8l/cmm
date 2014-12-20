@@ -1,0 +1,45 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+% ------------------------------------------------------------------ 
+\section{String Utilities}
+% ------------------------------------------------------------------ 
+
+Sets and Maps over strings are commonly used in the compiler. Although
+it is possible to create these data structures with one line of source
+code this is not always the best way to do it, because different
+instances are type incompatible. This module provides sets and maps over
+strings for the admittedly few cases where these maps are passed between
+modules. Neither the interface nor the implementation offers any
+surprises.
+
+<<strutil.mli>>=
+module Set: Set.S with type elt = string
+module Map: Map.S with type key = string
+
+val assoc2map: (string * 'a) list -> 'a Map.t
+val from_list: string list -> Set.t
+@
+
+% ------------------------------------------------------------------ 
+\section{Implementation}
+% ------------------------------------------------------------------ 
+
+<<strutil.ml>>=
+module Compare = struct type t = string let compare=compares end
+module Set = Set.Make(Compare)
+module Map = Map.Make(Compare)
+
+let assoc2map pairs =
+    let f map (key,value) = Map.add key value map in
+        List.fold_left f Map.empty pairs
+
+let from_list xs = List.fold_left (fun set x -> Set.add x set) Set.empty xs
+@
+

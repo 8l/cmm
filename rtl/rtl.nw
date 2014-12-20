@@ -1,0 +1,515 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 et sw=4: 
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+% ------------------------------------------------------------------ 
+\section{Register-transfer Lists (\rtl)}
+% ------------------------------------------------------------------ 
+
+Register-transfer lists capture the meaning of instructions.  They are
+used as part of the abstract representation of {\PAL}.  The meaning of a
+register-transfer list is well defined and especially independent from
+any properties of a target architecture because no hidden assumptions
+exist.
+
+
+% ------------------------------------------------------------------ 
+\subsection{Interface}
+% ------------------------------------------------------------------ 
+
+The interface is divided into three parts:  \emph{public},
+\emph{private}, and \emph{common}.  The public part provides constructor
+functions to build {\rtl}s but hides their actual implementation.  The
+private part reveals these and is intended only for parts of the back
+end that does re-writing of {\rtl}s.  Both private and public parts
+share \emph{common} types.  The public part includes function that
+converts public values into private values and thus makes their details
+accessible. 
+<<rtl.mli>>=
+<<definitions of exported, exposed types>>
+
+module Private: sig
+    <<representation exposed in the private interface>>
+end
+
+<<types and functions exported at top level>>
+@
+A value can be converted from public to private view and vice versa.
+Module [[Dn]] provides conversion from public to private view, [[Up]]
+from private to public.
+<<rtl.mli>>=
+module Dn: sig 
+    <<DN>>
+end
+
+module Up: sig 
+    <<UP>>
+end
+@
+% ------------------------------------------------------------------ 
+\subsubsection{Common Types}
+% ------------------------------------------------------------------ 
+
+All common types are types aliases that are mainly used to make the
+signatures more readable.  A [[space]] describes some kind of memory,
+like a set of registers or main memory.  The number of [[spaces]] is a
+property of a target architecture and thus can not be fixed here with
+a sum type.  The [[char]] type provides a big enough cardinality and
+is nice to print and remember.  A [[width]] is a number of bits which
+corresponds to the {\PAL} [[bits]]$k$ types. 
+<<definitions of exported, exposed types>>=
+type aggregation = Register.aggregation = 
+    | BigEndian
+    | LittleEndian
+    | Identity
+
+type space = char * aggregation * Cell.t   (* name, byte order, cell size *)
+type width = int
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Public View}
+% ------------------------------------------------------------------ 
+
+The public view provides constructor functions for {\rtl}s.  Using them
+should be the \emph{only} way to create {\rtl}s when translating from
+the abstract syntax tree.
+
+A constant expression can be a boolean value, a number of bits, or a
+link-time value, which has a name.
+To support position-independent code, the compiler must distinguish
+three kinds of link-time value: a locally defined code label, a
+locally defined data label, and an imported symbol.
+A [[fetch]] creates an expression
+that represents the value stored in a [[loc]]. Operators [[op]] can be
+applied to values and return a value.
+<<types and functions exported at top level>>=
+type exp          (* denotes a compile-time or run-time value *)
+type loc          (* mutable container of a bit vector *)
+type rtl          (* effect of a computation *)
+type opr          (* a pure function on values *)
+type assertion    (* a claim about the run-time value of an address *)
+
+val bool      : bool -> exp                    
+val bits      : Bits.bits -> width -> exp      
+val codesym   : Symbol.t -> width -> exp    (* locally defined code label (incl proc) *)
+val datasym   : Symbol.t -> width -> exp    (* locally defined data label *)
+val impsym    : Symbol.t -> width -> exp    (* imported symbol *)
+val late      : string -> width -> exp         (* late compile time constant *)
+val fetch     : loc -> width -> exp
+val app       : opr -> exp list -> exp
+
+val opr       : string -> width list -> opr
+@
+A [[loc]] may be:
+\begin{itemize}
+\item
+      A register \emph{reg}. Registers include hardware registers and
+      temporaries. The main feature of a register is, that its address
+      in an integer, rather than an expression.
+\item
+      A memory cell \emph{mem}. A memory cell is addressed by an
+      expression and can be an aggregation of hardware cells.
+\item
+       A named {\PAL} variable [[var]].
+\item
+      A \emph{slice} from a location at a known width and least-significant
+      bit.
+\end{itemize}
+An [[assertion]] is a claim about alignment or placement of an address~$a$.
+We can [[shift]] an assertion by an integer~$k$ in order to get a
+claim about the address $a+k$. 
+We can also [[shift_multiple]], which shifts an assertion by an
+unknown multiple of~$k$.
+Finally, we can ask what alignment is implied by an assertion.
+<<definitions of exported, exposed types>>=
+type count = Register.count = C of int
+<<types and functions exported at top level>>=
+val none     : assertion
+val aligned  : int -> assertion
+val shift    : int -> assertion -> assertion
+val shift_multiple : int -> assertion -> assertion
+val alignment: assertion -> int
+val mem      : assertion -> space -> count -> exp -> loc
+val reg      : Register.t -> loc
+val regx     : Register.x -> loc
+val var      : string -> index:int -> width -> loc
+val global   : string -> index:int -> width -> loc
+val slice    : width -> lsb:int -> loc -> loc
+@
+An effect alters one or more [[loc]]s.  A [[store]] puts the value of
+[[exp]] into a location; a [[kill]] invalidates a location's content.
+Effects are represented as {\rtl}s.
+<<types and functions exported at top level>>=
+val store     : loc -> exp -> width -> rtl
+val kill      : loc -> rtl
+@
+A register-transfer list {\rtl} may be guarded; to execute a guarded
+\rtl, if the guard is false, do nothing, otherwise perform the \rtl.
+A guard must be a boolean expression.  The function [[guard]] takes a
+boolean expression [[exp]] and an [[rtl]] and produces a guarded \rtl.
+
+The function [[par]] composes \rtl s in parallel.
+A parallel composition simultaneously performs the effects of all
+RTLs; that is, it evaluates all guards and right-hand sides before
+making any assignment.
+It is an \emph{unchecked run-time error} to compose in parallel two or
+more RTLs that assign to the same location; such a parallel
+composition is not meaningful.
+<<types and functions exported at top level>>=
+val guard     : exp -> rtl -> rtl
+val par       : rtl list -> rtl
+@
+For uniformity, the [[null]] {\rtl} is sometimes useful. 
+It is equivalent to [[par []]], which does nothing.
+<<types and functions exported at top level>>=
+val null      : rtl
+@
+We provide special versions of [[fetch]] and [[store]] that convert a
+slice to something without a slice.
+They use [[lobits]], [[bitExtract]], or [[bitInsert]].
+It's not clear if they're useful.
+<<types and functions exported at top level>>=
+val fetch_cvt : loc -> width -> exp
+val store_cvt : loc -> exp -> width -> rtl
+@ 
+We also, because we have it here already, export a function to compute
+the width of a location.
+<<types and functions exported at top level>>=
+val locwidth : loc -> width
+@
+% ------------------------------------------------------------------ 
+\subsubsection{Conversion between Private and Public Views}
+% ------------------------------------------------------------------ 
+
+The purpose of the private interface is to exploit the implementation
+details by pattern matching, for example. Values created by the public
+interface per se are not compatible with the private types. Conversion
+functions provide access to these values. Each function is named after
+the type it converts.
+
+It is not possible to make the conversion functions part of
+[[Private]] without putting the public interface at the same time into
+a sub-module like [[Public]]:  there is no way to refer to a type
+outside of [[Private]] from inside [[Private]] that is also declared
+inside [[Private]]. 
+<<DN>>=
+val exp:        exp         -> Private.exp
+val loc:        loc         -> Private.loc       
+val rtl:        rtl         -> Private.rtl
+val opr:        opr         -> Private.opr
+val assertion:  assertion   -> Private.assertion
+@ 
+<<UP>>=
+val exp:        Private.exp       -> exp
+val loc:        Private.loc       -> loc
+val rtl:        Private.rtl       -> rtl
+val opr:        Private.opr       -> opr
+val assertion:  Private.assertion -> assertion
+val effect :    Private.effect    -> rtl
+val const  :    Private.const     -> exp
+@
+% ------------------------------------------------------------------ 
+\subsubsection{The Private View}
+% ------------------------------------------------------------------ 
+
+The private view defines {\rtl}s in terms of data structures. Values
+defined using the public functions can be converted to their private
+representation to facilitate pattern matching over them.
+
+We want to represent assertions for specific properties but have not
+yet found a representation. Todo: replace all $-1$ values in the code
+with [[Rtl.none]]. 
+<<representation exposed in the private interface>>=
+type aligned   = int     (* alignment guaranteed *)
+type assertion = aligned (* may one day include alias info *)
+@
+An operator for values at run-time is represented by its name and a
+list of [[width]]s.  Each [[width]] corresponds to a $\forall$-bound
+variable in the type scheme of the operator's type.  From the type
+scheme and the [[width list]] a monomorphic type of the operator can
+be deduced.
+<<representation exposed in the private interface>>=
+type opr         = string * width list
+@
+Expressions provide values to be stored in [[loc]]s as well as
+addresses local to a [[space]].  An expression can access constant
+values and values fetched from memory.  A fetch from memory makes the
+[[width]] number of fetched bits explicit.  A label denotes a {\PAL}
+data- or goto-label and its type. 
+
+The width of a [[Bits]] value is stored inside the value of type
+[[Bits.bits]].
+We hope this offers the advantage that mostly the width is static (see
+the careful implementation of [[RTL.bits]]) and yet it can be easily
+grabbed by an automatically generated recognizer.
+<<representation exposed in the private interface>>=
+type const      = Bool      of bool
+                | Bits      of Bits.bits            (* literal constant *)
+                | Link      of Symbol.t * symkind * width  (* link-time constant *)
+                | Diff      of const  * const   (* difference of two constants *)
+                | Late      of string * width   (* late compile time constant *)
+and symkind = Code | Data | Imported (* three kinds of symbol, needed for PIC *)
+
+type exp        = Const     of const               
+                | Fetch     of loc * width 
+                | App       of opr * exp  list
+@
+A location describes a memory location or register on the target
+architecture or a {\PAL} register. The code generation will remove all
+{\PAL} registers and provide memory locations for them. A memory
+cell [[Mem]] lives in an address [[space]] at the address denoted by
+[[exp]]. In order to fetch [[width]] bits at once several memory
+units from the chosen [[space]] must be aggregated. For example, a 32
+bit fetch must aggregate 4 8-bit values when the memory space is made
+by 8-bit bytes. The aggregation is described by a value of the type
+[[aggregation]]. 
+<<representation exposed in the private interface>>=
+and  count     = Register.count = C of int
+and  loc       = Mem        of space 
+                            *  count
+                            *  exp 
+                            *  assertion
+                | Reg       of Register.t (* space * int * count *)         
+          
+                | Var       of string    (* name from C-- source   *)
+                            *  int       (* index for run-time API *)
+                            *  width
+                | Global    of string * int * width (* global C-- variable *)
+                | Slice     of width     (* number of bits in loc *)
+                            *  int       (* index of least-significant bit of slice *)
+                            *  loc  (* location from which slice is drawn *)
+@ Bits are numbered with the least-significant bit as bit~0.
+@
+An [[effect]] is describes an assignment of a [[width]] bits value obtained
+from an expression [[exp]], or a [[Kill]]. A killed location contains an
+undefined value.
+<<representation exposed in the private interface>>=
+type effect     = Store     of loc * exp  * width
+                | Kill      of loc
+@
+A guarded effect is pair of an expression and an effect. The effect takes
+place, if and only if the expression evaluates to [[true]].      
+<<representation exposed in the private interface>>=
+type guarded    = exp  * effect
+@
+And finally, a \emph{register-transfer list} is a list of guarded
+effects. When a {\rtl} is evaluated, first all guarding expressions
+are evaluated and then all effects of the guards that evaluated to
+true become effective simultaneously.
+<<representation exposed in the private interface>>=
+type rtl        = Rtl of guarded list
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+The interface of [[Private]] defines only data types; we re-use the
+definitions to obtain the implementation.  The same is true for common
+data types. 
+
+<<rtl.ml>>=
+<<definitions of exported, exposed types>>
+
+module Private = struct
+    <<Private>>
+end
+
+<<definitions of types and functions exported at top level>>              
+
+module Dn = struct    
+    <<Dn>>
+end
+
+module Up = struct    
+    <<Up>>
+end
+
+module Convert = Dn (* deprecated, for backward compatibility *)
+module Revert  = Up (* deprecated, for backward compatibility *) 
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{The Private View}
+% ------------------------------------------------------------------ 
+
+The implementation of the private view must repeat the type
+definitions from the interface. 
+
+<<Private>>=
+<<representation exposed in the private interface>>
+@
+        
+% ------------------------------------------------------------------ 
+\subsubsection{The Public View}
+% ------------------------------------------------------------------ 
+
+The implementation of the public view basically uses the [[Private]]
+definitions such that they become compatible.  However, this fact is
+hidden by the interface.
+
+<<definitions of types and functions exported at top level>>=
+open Private    (* never do that *)
+type exp       = Private.exp     
+type loc       = Private.loc   
+type rtl       = Private.rtl        
+type opr       = Private.opr        
+type assertion = Private.assertion  
+@
+If we switch to [[Alignment.t]], [[shift]] and [[shift_multiple]] will
+no longer be the same.
+<<definitions of types and functions exported at top level>>=
+let aligned k = k
+let alignment k = k
+let shift k' k = 
+  let rec gcd (m:int) (n:int) =
+    let rec g m n = if n = 0 then m else g n (m mod n) in
+    if  n < 0 then gcd m (- n)
+    else if m < n then gcd n m
+    else g m n in
+  gcd k k'
+let shift_multiple = shift  (* OK for this rep, which is lossy *)
+let none = aligned 1
+@
+
+Below are simple, nonetheless frequently used functions values on
+{\rtl}s.
+
+<<definitions of types and functions exported at top level>>=
+let par rtls   = Rtl (List.concat (List.map (fun (Rtl x) -> x) rtls))
+let slice width ~lsb loc = Slice (width, lsb, loc) 
+@
+
+The [[guard]] function combines every guard in the {\rtl} with the
+given expression using Boolean conjunction.  We use a fairly
+unsophisticated notion of conjunction; it doesn't even reassociate.
+%
+<<definitions of types and functions exported at top level>>=
+let conjunction = ("conjoin", [])   (* logical and *)
+let conjoin g g' = match g with
+| Const(Bool true)  -> g'
+| Const(Bool false) -> g
+| _ -> match g' with      
+       | Const(Bool true)  -> g
+       | Const(Bool false) -> g'
+       | _ -> App(conjunction, [g; g'])
+@
+<<definitions of types and functions exported at top level>>=
+let guard expr (Rtl geffects) =
+    let conjunct (guard,effect) = (conjoin expr guard, effect) in
+    Rtl (List.map conjunct geffects)  
+@
+
+
+<<definitions of types and functions exported at top level>>=
+let true'  = Const (Bool true)
+let false' = Const (Bool false)
+let bool p = if p then true' else false'
+@ 
+
+Note that the width used in a bit vector is the [[width]] argument,
+\emph{not} the width buried inside the bit vector itself.  We do things
+this way to support type-directed partial evaluation; the [[width]]
+argument is normally static. 
+
+\begin{quote}\it
+    Literals are currently stored in 64 bit wide bit vectors
+    ([[Bits.bits]]). There types, however, as noted in [[Rtl.rtl]]s
+    might be smaller.  The reason is, that the types of literals are
+    unknown during scanning and parsing. So every literal is first
+    stored in maximal bit vector and gets its type assigned later. --CL
+\end{quote}
+
+
+<<definitions of types and functions exported at top level>>=
+let bits b width            = ( assert (Bits.width b = width)
+                              ; Const (Bits b)
+                              )
+let codesym name width      = Const (Link(name,Code,width))
+let datasym name width      = Const (Link(name,Data,width))
+let impsym  name width      = Const (Link(name,Imported,width))
+let diff const1 const2      = Const (Diff(const1,const2))
+let late name width         = Const (Late(name,width))
+let fetch loc w             = Fetch(loc, w)
+let app op exprs            = App(op,exprs)
+let opr name widths         = (name,widths)
+
+(* location *)
+let mem assertion sp count expr = Mem(sp,count,expr,assertion)
+let var    name ~index width    = Var (name,index,width)
+let global name ~index width    = Global (name,index,width)
+let reg r                       = Reg r
+let regx = function
+  | Register.Reg r -> Reg r
+  | Register.Slice (w, lsb, r) -> Slice(w, lsb, Reg r)
+
+(* effect *)
+let rtl effect              = Rtl [(bool true, effect)]
+let store loc expr width    = rtl (Store(loc, expr, width))
+let kill  loc               = rtl (Kill(loc))
+let null                    = Rtl []
+@ 
+Fetch and store could convert slices, but I'm not sure if this code is
+really useful.
+<<definitions of types and functions exported at top level>>=
+let locwidth = function
+  | Mem((_,_,ms),c,_,_) -> Cell.to_width ms c
+  | Reg((_,_,ms),_,c)   -> Cell.to_width ms c
+  | Var(_,_,w)            -> w
+  | Global(_,_,w)         -> w
+  | Slice(w, _, _)        -> w 
+
+let rec fetch_cvt loc n = 
+  match loc with
+  | Slice(n', lsb, loc) ->
+      assert (n'=n);
+      let w = locwidth loc in
+      if lsb = 0 then 
+        App(("lobits", [w; n]), [fetch loc n])
+      else
+        App(("bitExtract", [w; n]), [Const (Bits (Bits.U.of_int lsb w)); fetch loc n])
+  | _ -> Fetch(loc,n)
+@ 
+<<definitions of types and functions exported at top level>>=
+let store_cvt loc expr n = 
+  match loc with
+  | Slice(n', lsb, loc) ->
+      assert (n'=n);
+      let w = locwidth loc in
+      let wide = Fetch(loc, w) in
+      let lsb = Const (Bits (Bits.U.of_int lsb w)) in
+      let wide' = App(("bitInsert", [w; n]), [lsb; wide; expr]) in
+      rtl (Store(loc, wide', w))
+  | _ -> rtl (Store(loc,expr,n))
+@
+
+All conversion functions are the identity [[id]] because public and
+private values have the same representation.
+% surprised you don't prefer  `let expr e = e' etc...  ---NR
+
+<<Dn>>=
+let id          = fun x -> x
+let exp         = id
+let loc         = id
+let rtl         = id
+let opr         = id
+let assertion   = id
+
+
+<<Up>>=
+let effect      = rtl (* from above *)
+let id          = fun x -> x
+let exp         = id
+let loc         = id
+let rtl         = id
+let opr         = id
+let assertion   = id
+let const c     = Const c
+@

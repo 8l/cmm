@@ -1,0 +1,258 @@
+# :vim ts=8 sw=4 et:
+# ------------------------------------------------------------------ 
+# $Id: mkfile,v 1.56 2004-11-02 23:59:41 nr Exp $ 
+# ------------------------------------------------------------------ 
+#
+# This directory depends on ../cllib, and specifically the targets
+# update and update.opt there.
+#
+# Before doing anything else, run a "mk depend" to build the 
+# dependency file. Otherwise the build process will get stuck!
+
+# ------------------------------------------------------------------ 
+# paths
+# ------------------------------------------------------------------ 
+
+NAME =      ocamlburg
+
+TOP    =    ..
+INTERP =    evaluating
+
+< ../config/config.mk
+DEPEND = ${B}DEPEND.$INTERP
+
+LIBDIR = ${B}../lib
+BINDIR = ../bin
+MANDIR = ../man
+
+# ------------------------------------------------------------------ 
+# (high level) virtual targets
+# ------------------------------------------------------------------ 
+
+NW   = `echo *.nw`
+HTML = ${NW:%.nw=%.html}
+DVI  = ${NW:%.nw=%.dvi}
+PS   = ${NW:%.nw=%.ps}
+
+# ------------------------------------------------------------------ 
+# files that belong to the runtime system
+# ------------------------------------------------------------------ 
+RTCMO = ${B}camlburg.cmo ${B}camlburg.cmi ${B}camlburg.mli 
+RTCMX = ${B}camlburg.cmx ${B}camlburg.cmi ${B}camlburg.mli ${B}camlburg.o
+
+# ------------------------------------------------------------------ 
+# high level (virtual) targets
+# ------------------------------------------------------------------ 
+
+all:V:          ocamlburg      runtime     man
+all.opt:V:      ocamlburg.opt  runtime.opt man 
+
+update:V:       $RTCMO all 
+	cp $RTCMO           $LIBDIR
+	cmp -s ocamlburg    $BINDIR/ocamlburg    || cp ocamlburg    $BINDIR
+	cmp -s ocamlburgfix $BINDIR/ocamlburgfix || cp ocamlburgfix $BINDIR
+	cp ocamlburg.1      $MANDIR/man1
+	cp ocamlburgfix.1   $MANDIR/man1
+
+update.opt:V:   $RTCMX all.opt 
+	cp $RTCMX       $LIBDIR
+	cmp -s ocamlburg.opt $BINDIR/ocamlburg.opt || cp ocamlburg.opt $BINDIR
+	cmp -s ocamlburgfix  $BINDIR/ocamlburgfix  || cp ocamlburgfix  $BINDIR
+	test -f $BINDIR/ocamlburg || cp ocamlburg.opt $BINDIR/ocamlburg
+	cp ocamlburg.1      $MANDIR/man1
+	cp ocamlburgfix.1   $MANDIR/man1
+
+install:V: all $install_bin $install_man1
+	cp ocamlburg      $install_bin/ocamlburg
+	cp ocamlburgfix   $install_bin/camlburgfix
+	cp ocamlburg.1    $install_man1/camlburg.1
+	cp ocamlburgfix.1 $install_man1/camlburgfix.1
+
+install.opt:V: install all.opt $install_bin
+	cp ocamlburg.opt  $install_bin/ocamlburg.opt
+	strip $install_bin/ocamlburg.opt
+
+dvi:V:          $DVI
+html:V:         $HTML
+ps:V:           $PS
+
+man:VQ:
+	# do nothing
+
+test:VQ:        sample.cmo iburg.cmo
+
+depend:V:       $DEPEND
+
+runtime:V:      $RTCMO
+runtime.opt:V:  $RTCMX
+
+clean.opt:V:
+	rm -f $B*.cmx $B*.cmxa $B*.o $B*.a
+
+clean:V: clean.opt
+	rm -f $B*.cmi $B*.cmo $B*.cma
+
+clobber:V: dep-clobber clean
+	rm -f ocamlburg ocamlburg.opt ocamlburg.tar.gz
+	rm -f nofake
+	rm -f *.ps *.pdf
+	rm -f $B*.ml $B*.ml[ily] $B*.output
+	rm -f *.aux *.log *.dvi *.tex *.inc *.toc *.html
+	rm -f pp.*
+	rm -f srcmap.*
+
+# ------------------------------------------------------------------ 
+# rules and tools for OCaml
+# ------------------------------------------------------------------ 
+
+<$TOP/config/ocaml.mk
+<$TOP/config/noweb.mk
+<$TOP/config/man.mk
+NOPOLY=/dev/null
+
+# compiler flags used by the rules just included
+OCAMLC_FLAGS = $OCAMLC_FLAGS -I $LIBDIR
+OCAMLO_FLAGS = $OCAMLO_FLAGS -I $LIBDIR
+
+# ------------------------------------------------------------------ 
+# important file sets
+# ------------------------------------------------------------------ 
+
+ML =            code.ml         \
+                mangler.ml      \
+                spec.ml         \
+                parseerror.ml   \
+                parse.ml        \
+                lex.ml          \
+                norm.ml         \
+                burg.ml         \
+                noguardscheck.ml\
+                main.ml         \
+
+
+MLI =           burg.mli        \
+                code.mli        \
+                main.mli        \
+                mangler.mli     \
+                norm.mli        \
+                parse.mli       \
+                parseerror.mli  \
+                spec.mli        \
+
+ML  = ${ML:%.ml=$B%.ml}
+MLI = ${MLI:%.mli=$B%.mli}
+
+CMO = ${ML:%.ml=%.cmo}
+CMX = ${ML:%.ml=%.cmx}
+
+SCAN = $ML $MLI ${B}camlburg.ml ${B}camlburg.mli
+<$TOP/config/depend.mk
+
+# ------------------------------------------------------------------ 
+# building binaries
+# ------------------------------------------------------------------ 
+# PROFCMO is defined in ocaml.mk for profiling support
+
+ocamlburg:      $CMO 
+	$OCAMLC $OCAMLC_FLAGS -o $target $PROFCMO cllib.cma $prereq
+
+ocamlburg.opt:  $CMX
+	$OCAMLO $OCAMLO_FLAGS -o $target cllib.cmxa $prereq
+
+# ------------------------------------------------------------------ 
+# extra rules for cases not covered by noweb.mk or to resolve
+# ambiguities
+# ------------------------------------------------------------------ 
+
+${B}lex.mll:D:        lex.nw
+	$NOTANGLE -Rlex.mll $prereq > $target
+
+${B}lex.ml: ${B}lex.mll
+	$OCAMLLEX $prereq
+
+${B}parse.mly:D:      parse.nw
+	$NOTANGLE -Rparse.mly $prereq > $target
+
+${B}parse.mli \
+${B}parse.ml: ${B}parse.mly
+	$OCAMLYACC -v $prereq
+
+${B}camlburg.o:V:
+	echo "tried to make $target"
+
+# ------------------------------------------------------------------ 
+# Examples
+# ------------------------------------------------------------------ 
+
+sample.mlb:     sample.nw
+	$NOTANGLE -L"$LINE" -R$target $prereq > $target
+
+sampleclient.ml: sample.nw
+	$NOTANGLE -L"$LINE" -R$target $prereq > $target
+
+sample.ml:      sample.mlb ocamlburg runtime
+	./ocamlburg sample.mlb > $target
+
+iburg.ml:       iburg.mlb ocamlburg runtime
+	./ocamlburg iburg.mlb > $target
+
+# ------------------------------------------------------------------ 
+# export distribution to outside world
+# ------------------------------------------------------------------ 
+
+nofake.nw:      ../tools/nofake.nw
+	cp $prereq $target
+
+pp.nw:          ../cllib/pp.nw
+	cp $prereq $target
+
+srcmap.nw:      ../cllib/srcmap.nw
+	cp $prereq $target
+
+nofake:         nofake.nw
+	$NOTANGLE -R$target $prereq > $target
+	chmod +x $target
+
+EXPORT =        README $DEPEND Makefile                           \
+                iburg.mlb                                         \
+                ocamlburg.1                                       \
+                nofake                                            \
+                ocamlburgfix ocamlburgfix.1                       \
+                burg.nw burg.html                                 \
+                camlburg.nw camlburg.html                         \
+                code.nw code.html                                 \
+                lex.nw lex.html                                   \
+                noguardscheck.nw noguardscheck.html               \
+                main.nw main.html                                 \
+                mangler.nw mangler.html                           \
+                norm.nw norm.html                                 \
+                parse.nw parse.html                               \
+                parseerror.nw parseerror.html                     \
+                pp.nw pp.html                                     \
+                sample.nw sample.html                             \
+                spec.nw spec.html                                 \
+                srcmap.nw srcmap.html                             \
+
+tidy:V:         $HTML 
+	tidy -f /dev/null -im $prereq || exit 0
+
+# 1.0 was officially released 05 March 2002 
+# 1.1 26 March 2002 - bug fix release for bug in camlburg.nw.
+# 1.2 27 March 2002 - NR suggets max_cost=2^16
+
+FILE =          ocamlburg-`date +%Y%m%d`
+
+tar:V:          ocamlburg.tar.gz 
+
+ocamlburg.tar.gz:   $EXPORT tidy mkfile
+	ln -s . $FILE
+	tar czvhf ocamlburg.tar.gz `ls -1 $EXPORT | sed "s|^|$FILE/|"`
+	rm -f $FILE
+
+tartest:V:      tar
+	tar zxvf ocamlburg.tar.gz
+	( cd $FILE && make ) && rm -rf $FILE
+
+www:V:          ocamlburg.tar.gz
+	cp $prereq $HOME/../cminusminus/www/download
+< ../config/install.mk

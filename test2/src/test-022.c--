@@ -1,0 +1,15 @@
+
+// execute the commands below to use this file as a test case
+//
+
+target byteorder little;
+
+foo() {
+    bits32 x;
+
+    if (x) {
+        ;
+    }
+        
+    return;
+}

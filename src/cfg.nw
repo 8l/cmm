@@ -1,0 +1,2192 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=2 sw=2 et: 
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+% 
+% $Id: cfg.nw,v 1.80 2006-04-10 21:28:53 nr Exp $
+
+% ------------------------------------------------------------------ 
+\section{Control-Flow Graph Revisions}
+% ------------------------------------------------------------------ 
+
+Here are some possible revisions to the flow graph.
+\begin{itemize}
+\item
+Make predecessor and successor fields mutable.
+This change gives a client substantially greater freedom to choose the
+order in which nodes are constructed.
+\item
+Introduce the idea of \emph{layout}.
+A graph \emph{has layout} if the physical order of instructions and
+labels is known.
+A graph must have layout before it is passed to an assembler.
+
+Except for branch nodes as specified below, if a node has a unique
+successor, then the node precedes its successor in the physical layout.
+\item
+Restrict types of nodes in the hopes of simplifying algorithms.
+The grossest classification is by numbers of predecessors and
+successors. 
+\begin{itemize}
+\item
+A \emph{join point} has arbitrarily many precedessors and exactly one
+successor. 
+It is associated with a list of \emph{labels} but no code.
+A join point is the only node with multiple predecessors.
+\remark{Question for Glenn: how to represent the successor list?  How
+much space do you allocate for successors whan you don't yet know how
+many there will be?}
+\item
+A \emph{straight-line code} node has exactly one predecessor and one
+successor. 
+It models computation without interesting control flow.
+\item
+A \emph{branch node} performs a goto but is intended to implement no
+other useful computation.
+It has a unique predecessor and a unique successor.
+Its successor must be a join point.
+If the graph has layout, the branch node also has a layout successor,
+which may be different from its control-flow successor.
+The RTL of a branch node is an unconditional assignment to the program
+counter. 
+\item
+A \emph{jump} node is a lot like a branch except its successor is the
+exit node
+\item
+An \emph{conditional branch} has a unique predecessor and two
+successors, which are labeled true and false.
+Each successor must be a join point.
+It contains an RTL that normally satisfies the following properties:
+\begin{itemize}
+\item
+It contains a single effect, which is a guarded assignment to the
+program counter.
+\item
+The value assigned to the program counter is the label (link-time
+constant) of the true successor.
+\end{itemize}
+If the second property is not satisfied, we say the node is
+\emph{dirty}.
+The node must be clean before it can be passed to an assembler.
+
+If the graph has layout, the layout successor of a branch node must
+be its false successor.
+
+It is legitimate at any time to perform the following changes as one
+atomic operation:
+\begin{itemize}
+\item
+Swap the true and false successors
+\item
+Negate the condition on the guard
+\item
+Replace the label in the assignment with the new true successor.
+\end{itemize}
+The [[bnegate]] operation in the postexpander interface is useful here.
+\item
+A node with multiple successors is a \emph{multiway branch}.
+It has a unique predecessor.
+There are several kinds of multiway branch.
+\begin{itemize}
+\item
+Call
+\item
+Computed goto
+\item
+\emph{Cut to}.
+Normally has a single successor (the exit) but may have multiple
+successors. 
+\end{itemize}
+\item
+THERE ARE NO DATAFLOW NODES.  INSTEAD, A NODE MAY CONTRIBUTE DEFS,
+AND KILLS TO EACH OUTEDGE, AND A NON-JOIN NODE MAY CONTRIBUTE
+USES TO ITS UNIQUE INEDGE.
+\item
+The entry node has a successor but no predecessor
+\item
+The exit node has a predecessor but no successor (or perhaps it should
+be a join point)?
+\item
+An \emph{illegal} node has no predecessors and no successors.
+It is used to initialize mutable successor and predecessor fields.
+\end{itemize}
+\item
+An infinite loop must contain an artificial edge so it can reach the
+exit.
+
+\end{itemize}
+@ 
+
+\section{Goals}
+
+This section lists our goals for the control-flow graph.  
+It is cribbed from a similar section in the documentation for Machine
+SUIF. 
+\begin{itemize}
+\item
+\emph {Analysis.}
+Many compiler analyses assume a flow graph as a basic data
+structure. 
+Such analyses include
+liveness analysis, reaching definitions,
+and dead-code identification.
+We provide the ability to traverse and observe the nodes and edges in
+the flow graph.
+\item
+\emph{Transformation.}
+We also want to support control-flow transformation, e.g., by merging
+instructions, moving code out of loops, various forms of redundancy
+elimination, and so on.
+Davidson-style code expansion may also involve rewriting Boolean
+operations into control flow.
+\item
+\emph {Simple ordering.}
+To be able to emit a program, 
+we provide minimal support for mapping the flow graph onto an ordered
+list of code, data, and labels.
+While we wouldn't mind supporting automated code layout and
+code-layout optimizations, it is not a high priority.
+Furthermore, and following Machine SUIF, we make it possible to
+manipulate a flow graph that has no layout in memory---we require only
+that a layout be established before code is emitted.
+\item
+\emph{Minimize burden on clients.}
+We minimize the number of checked and unchecked run-time errors a
+client can commit.
+This policy may make the flow graph more complex and more expensive,
+but we believe it is better that this abstraction do as much of the
+hard work as possible.
+\end{itemize}
+
+
+\section{The Control-Flow Graph}
+
+Quick~{\PAL} uses a control-flow graph to represent a procedure.
+The flow-graph abstraction is inspired by \citet{knoop:basic-block},
+who described the basic-block control-flow graph as a ``living
+dinosaur.''
+Accordingly, our flow graph does not use basic blocks; each node
+represents at most one instruction.
+
+This abstraction actually represents \emph{two} graphs: a control-flow
+graph and a physical-layout graph.
+A~\emph{control-flow edge} indicates the possibility that control may flow
+from one node to another during the dynamic execution of a program.
+A~\emph{layout edge} indicates that the code for one node
+appears before the code for another node in the image (assembly or binary)
+that is written to the output.\footnote
+{N.B.~The code for a third node may intervene.}
+When we refer to an unqualified edge, predecessor, or successor, we
+always refer to the control-flow graph, not to the layout graph.
+
+We classify a node according to the number of predecessors and
+successors it may have, and also according to the \emph{payload} it
+may carry.
+\begin{itemize}
+\item
+A \emph{join point} has arbitrarily many precedessors and exactly one
+successor. 
+Its payload is one or more \emph{labels} but no code.
+A join point is the only node with multiple predecessors.
+The layout successor a join point is its control-flow successor.
+
+\item
+An \emph{ordinary instruction} has one predecessor and one successor.
+Its payload is one instruction.
+Its layout successor is its control-flow successor.
+\item
+An \emph{assertion} is just like an ordinary instruction, except that it generates
+no code.
+Instead, it simply asserts that the effect of the instruction has
+taken place.
+Its purpose is to sit on an interprocedural control-flow edge, so we
+have a way of recording what a callee did to a stack pointer, for
+example. 
+\item
+A \emph{control-flow} instruction has one predecessor and one or more
+successors. 
+Every successor must be a join point.
+There are a variety of control-flow instructions with different
+numbers of successors and different constraints on layout.
+\begin{itemize}
+\item
+A \emph{branch node} performs a goto but is intended to implement no
+other useful computation.
+It has a unique predecessor and a unique successor.
+Its layout successor may be different from its control-flow successor.
+The standard RTL of a branch node is an unconditional assignment to the program
+counter. 
+\item
+A \emph{jump} node is a lot like a branch except its successor is the
+exit node, which is considered a join point \emph{ex officio}. 
+\item
+A \emph{conditional branch} has two
+successors, which are labeled true and false.
+It contains an RTL that normally satisfies the following properties:
+\begin{itemize}
+\item
+It contains a single effect, which is a guarded assignment to the
+program counter.
+\item
+The value assigned to the program counter is a label (link-time
+constant) associated with the join point that is the true successor.
+\end{itemize}
+If the second property is not satisfied, we say the node is
+\emph{dirty}.\footnote{We can and should prevent the node from ever
+becoming dirty.}
+The node must be clean before it can be passed to an assembler.
+
+If the graph has layout, the layout successor of a branch node must
+be its false successor.
+
+It is legitimate at any time to perform the following changes as one
+atomic operation:
+\begin{itemize}
+\item
+Swap the true and false successors
+\item
+Negate the condition on the guard
+\item
+Replace the label in the assignment with the new true successor.
+\end{itemize}
+The [[bnegate]] operation in the postexpander interface is useful here.
+\item
+A computed goto with multiple successors is a \emph{multiway branch}.
+Its layout successor is unconstrained.
+\item 
+A \emph{call} node has many successors, which are listed in this
+order:
+alternate return continuations, normal return, unwind continuations,
+cut-to continuations. 
+Its layout successor must implement the alternate return
+continuations, if any, and the successor after that must be the normal
+return continuations.
+(If there are no alternate return continuations, the direct successor
+implements the normal return continution.)
+
+If a graph has layout, the layout successor of a call node is a
+(possibly empty) table of alternate return continuations.
+This table may be a list of RTLs or a data block containing addresses.
+The layout successor of the table is the normal return continuation.
+
+HOWEVER, IGNORING THE JUMP TABLE FOR ALTERNATE RETURNS, WE LAY OUT THE
+NORMAL RETURN FIRST, THEN THE ALTERNATE RETURNS. FOR NOW, WE RELY ON THE
+ASSEMBLER TO EMIT THE JUMP TABLE IMMEDIATELY AFTER THE CALL NODE.
+
+\item
+A \emph{cut to} node
+normally has a single successor (the exit) but may have multiple
+successors. 
+Its layout successor is unconstrained. 
+\end{itemize}
+\item
+The entry node has a successor but no predecessor
+\item
+The exit node has one or more predecessors but no successor.
+It is therefore considered a kind of join point.
+\item
+An \emph{illegal} node has no predecessors and no successors.
+It is used to initialize mutable successor and predecessor fields.
+\item
+An \emph{impossible} node has two successors.
+Its ordinary successor is its layout successor.
+Its impossible successor is always the exit node.
+(It exists to facilitate solution of backward dataflow problems, such
+as liveness.)
+An infinite loop must contain an impossible node so it can reach the
+exit.
+\end{itemize}
+
+\section{Invariants}
+
+The control-flow graph maintains several invariants:
+\begin{itemize}
+\item
+ The Golden Invariant: Each successor of a fork is a join point.
+\end{itemize}
+
+\section{Interface}
+
+<<cfg.mli>>=
+<<exported signatures>>
+<<exported signatures>>=
+module type X = sig
+  type jx  (* extension at join point *)
+  type fx  (* extension at fork point *)
+  type nx  (* extension at non-fork/join nodes *)
+  val jx : unit -> jx
+  val fx : unit -> fx
+  val nx : unit -> nx
+end
+
+module type S = sig
+  module X : X
+
+  type label = string
+  type 'i cfg
+  type 'i t = 'i cfg
+  type 'i node
+  type regs  = Register.Set.t  (* sets of regs for dataflow *)
+  type xregs = Register.SetX.t (* sets of regs for dataflow *)
+  type 'i contedge = { kills:regs; defs:regs; node:'i node }
+  type kind = (* all the kinds of nodes *)
+    | Join | Instruction | StackAdjust | Branch | Cbranch | Mbranch
+    | Jump  | Call | Return | CutTo
+    | Entry | Exit | Assertion | Illegal | Impossible
+  <<graph and node observers>>
+  <<graph and node constructors>>  
+  <<graph and node mutators>>
+end
+@ 
+<<cfg.mli>>=
+module Make (X:X) : S with module X = X
+@
+\subsection{Interface summary}
+Details are given below, but here are the observers:
+<<graph and node observers>>=
+@  
+Here are the mutators:
+<<graph and node mutators>>=
+@  
+Here are the constructors:
+<<graph and node constructors>>=
+@
+\subsection{Observers}
+
+\paragraph{Observing nodes}
+We can ask what graph the node belongs to.
+<<graph and node observers>>=
+val of_node       : 'i node -> 'i cfg
+@ 
+We can ask about the kind of a node, the unique number of a node, and we can compare
+nodes for equality.
+<<graph and node observers>>=
+val kind          : 'i node -> kind
+val num           : 'i node -> int
+val eq            : 'i node -> 'i node -> bool
+@ 
+We can also ask particular predicates that relate to the kind.
+A join node includes the exit node.
+A \emph{head} node is the head of an extended basic block; it is
+either the entry node or a join node that is not the exit node.
+A non-local join node is one that can be reached only by [[cut to]] or stack
+unwinding; if the [[is_non_local_join]] predicate is true, then the [[is_join]]
+predicate must also be true.
+<<graph and node observers>>=
+val is_join           : 'i node -> bool
+val is_non_local_join : 'i node -> bool
+val is_fork           : 'i node -> bool
+val is_head           : 'i node -> bool
+@ 
+We can ask for a label, or for all the labels, on a join node.
+<<graph and node observers>>=
+val label         : 'i node -> label      (* defined on any join node except exit *)
+val labels        : 'i node -> label list (* defined on any join node except exit *)
+@ 
+We can ask for the instruction, if any.
+An assertion is treated as an ordinary instruction.
+If we ask for something \emph{executable}, we get only non-assertions.
+<<graph and node observers>>=
+val to_instr      : 'i node -> 'i option
+val to_executable : 'i node -> 'i option
+@ 
+We can ask about the unique predecessor of a non-join node.
+It is a checked run-time error to call this function on a join,
+exit, entry, or illegal node.
+Similarly, we can ask about the unique successor of a non-fork node.
+<<graph and node observers>>=
+val pred       : 'i node -> 'i node  (* defined on non-join, non-exit *)
+val succ       : 'i node -> 'i node  (* defined on non-fork *)
+@
+We can ask about the true and false successor of a conditional branch.
+It is a checked run-time error to call these functions on anything
+other than a conditional branch.
+<<graph and node observers>>=
+val tsucc      : 'i node -> 'i node  (* defined on conditional branch *)
+val fsucc      : 'i node -> 'i node  (* defined on conditional branch *)
+@
+We can ask for any successor by number, for any kind of node.
+Successors are numbered from zero, the true successor precedes the
+false successor (0~and~1), and the numbering for calls is
+complicated. 
+Function [[succ_n]] raises [[Invalid_argument]] if [[n]]~is
+negative or too large.  
+<<graph and node observers>>=
+val succ_n     : 'i node -> int -> 'i node  (* defined on any node *)
+@
+For any kind of node, we can ask for all its successors and
+predecessors.
+<<graph and node observers>>=
+val preds      : 'i node -> 'i node list  (* defined on any node *)
+val succs      : 'i node -> 'i node list  (* defined on any node *)
+@
+For a call node, we may want to know how many successor edges are alternate
+returns, cuts, or unwinds.
+Functions like [[succ_n]] returns these edges in the standard order
+(alternate returns, normal return, unwinds, and cuts).
+<<graph and node observers>>=
+val altrets    : 'i node -> int           (* defined only on call nodes *)
+val cuts_to    : 'i node -> int           (* defined only on call nodes *)
+val unwinds_to : 'i node -> int           (* defined only on call nodes *)
+@
+We can ask about the kinds of control-flow instructions.
+<<graph and node observers>>=
+val is_cti     : 'i node -> bool  (* is any control-flow 'i node *)
+val is_br      : 'i node -> bool  (* is direct branch *)
+val is_cbr     : 'i node -> bool  (* is conditional branch *)
+val is_mbr     : 'i node -> bool  (* is multiway branch *)
+val is_call    : 'i node -> bool
+val is_cut     : 'i node -> bool
+@ 
+If a graph node has spans attached, we can fetch them.
+This function is only defined on call nodes and join nodes.
+<<graph and node observers>>=
+val spans      : 'i node -> Spans.t option
+@
+We can get an extension suitable for the kind of node.
+<<graph and node observers>>=
+val jx         : 'i node -> X.jx  (* defined only on join nodes *)
+val fx         : 'i node -> X.fx  (* defined only on fork nodes *)
+val nx         : 'i node -> X.nx  (* defined only on non-fork, non-join *)
+@ 
+\paragraph{Observing the graph}
+We can get the entry and exit nodes.
+<<graph and node observers>>=
+val entry      : 'i cfg -> 'i node
+val exit       : 'i cfg -> 'i node
+@ 
+We can observe all the nodes.
+We do so by providing higher-order functions.
+These functions work by enumerating  \emph{basic blocks}.
+A basic block is a sequence of nodes beginning in a \emph{head node} (a join
+point or the entry node) and ending in a control-transfer node or the exit node.
+The basic blocks are enumerated in no particular order.
+Within a basic block, we enumerate nodes in order.
+If the client mutates the graph, we make no guarantees about what
+nodes may be visited.
+We can also fold over the nodes in the layout order using [[fold_layout]]
+and in postorder depth-first search (following successor links from the entry node),
+using [[postorder_dfs]].
+Calling [[fold_layout]] may insert unconditional branches or reverse
+conditional branches in order to satisfy layout constraints.
+Alternatively, we can fold over the reversed graph (following predecessor links from
+the exit node) using [[reverse_podfs]].
+<<graph and node observers>>=
+val iter_nodes    : ('i node -> unit)           -> 'i cfg -> unit
+val iter_heads    : ('i node -> unit)           -> 'i cfg -> unit
+val fold_nodes    : ('i node -> 'a -> 'a) -> 'a -> 'i cfg -> 'a
+val fold_heads    : ('i node -> 'a -> 'a) -> 'a -> 'i cfg -> 'a
+val fold_layout   : ('i node -> 'a -> 'a) -> 'a -> 'i cfg -> 'a
+val postorder_dfs : ('i node -> 'a -> 'a) -> 'a -> 'i cfg -> 'a
+val reverse_podfs : ('i node -> 'a -> 'a) -> 'a -> 'i cfg -> 'a
+@ 
+\paragraph{Observing data flow}
+As noted above a node can contribute defs, uses, and kills to each
+outedge, and a non-join node may contribute uses to each inedge.
+The access to this information is carefully crafted to support
+liveness analysis and to provide for efficient implementation in the
+common case where there is no dataflow.
+
+The [[union_over_outedges]] function is written in continuation-passing
+style.  The [[noflow]] continuation is used in the common case when an
+edge bears no dataflow information; the [[flow]] continuation is used
+in the general case.  Clients must guarantee that
+[[noflow n = flow {node=n; defs=empty; kills=empty}]].
+In the common case, [[union_over_edges]] simply applies [[noflow]] to
+its unique successor.
+
+Calling [[add_inedge_uses n l]] returns the union of~[[l]] with any
+uses on the inedge to~[[n]].
+It is defined on \emph{all} nodes, because there are no uses on the
+inedges of a join point.
+In the common case, it returns its second argument.
+Calling [[add_live_spans n l]] returns the union of~[[l]] with any
+registers kept live in spans.
+Spans keep register live if they may be needed to walk the stack.
+<<graph and node observers>>=
+val union_over_outedges : 
+  'i node -> noflow:('i node -> xregs) -> flow:('i contedge -> xregs) -> xregs
+val add_inedge_uses: 'i node -> xregs -> xregs
+val add_live_spans : 'i node -> xregs -> xregs
+@
+We may want to print a node for debugging purposes.
+<<graph and node observers>>=
+val print_node : Rtl.rtl node -> string
+@ 
+\subsection{Mutators}
+We can change the graph by any of the following operations:
+<<graph and node mutators>>=
+@ 
+\paragraph{Transactions}
+
+To debug an optimizer, we perform each code improvement as a
+\emph{transaction}.
+A~transaction is started by [[start_cond]] or [[start_exn]] and is
+ended by [[finish]].
+The claim is that the observable behavior of a program should be
+unchanged by a transaction.
+
+As implemented at present, the transaction mechanism does nothing
+other than provide each client (an optimization pass) a way to abort
+itself when 
+the \emph{transaction limit} is reached.
+Function [[start_cond]] tells the client to abort by returning
+[[false]];
+function [[start_exn]] tells the client to abort by raising
+[[Exhausted]].
+The idea is that a test driver can do a binary search on the limit so
+that we can identify exactly the transaction that causes a program to
+fail. 
+
+N.B.~All flow graphs in a program share a single transaction counter
+and limit. 
+Each transaction is named so that we can identify what part of the
+compiler made a faulty transaction.
+<<graph and node mutators>>=
+module Tx : sig
+  exception Exhausted
+  val start_cond : string -> bool   (* returns true iff transaction OK *)
+  val start_exn  : string -> unit   (* raises Exhausted iff transaction not OK *)
+  val finish     : unit   -> unit   (* marks end of transaction *)
+
+  val set_limit  : int -> unit      (* set the transaction limit *)
+  val used       : unit -> int      (* say how many transactions were used *)
+  val last       : unit -> string   (* string passed to the last transaction *)
+end
+@ 
+\paragraph{Altering successors}
+We alter edges either by setting successors or by splicing in graphs.
+These functions do whatever it takes to maintain invariants, which
+means they may insert conditional branches or join points.
+Function [[set_succ_n]] raises [[Invalid_argument]] if [[n]]~is
+negative or too large.  
+<<graph and node mutators>>=
+val set_succ   : 'i cfg -> 'i node -> succ:'i node -> unit (* defined on non-fork *)
+val set_tsucc  : 'i cfg -> 'i node -> succ:'i node -> unit
+  (* defined on conditional branch *)
+val set_fsucc  : 'i cfg -> 'i node -> succ:'i node -> unit
+  (* defined on conditional branch *)
+val set_succ_n : 'i cfg -> 'i node -> int -> succ:'i node -> unit
+  (* defined on any node *)
+@ 
+The special function [[invert_cbr]] swaps the true and false
+successors of a conditional branch.
+It also updates the instruction payload appropriately.
+It is a checked run-time error to use [[invert_cbr]] on any
+instruction other than a conditional branch.
+<<graph and node mutators>>=
+val invert_cbr    : 'i node -> unit              (* defined on conditional branch *)
+@
+\paragraph{Splicing in new subgraphs}
+Although setting one or more successors is general enough to implement
+any graph mutation, we provide some convenient functions for splicing in
+a single-entry, single-exit subgraph.
+Such a subgraph is represented by its [[entry]], which must have
+exactly one predecessor, and its [[exit]], which must have exactly one
+successor.
+It is permissible that the [[entry]] and [[exit]] be the same node.
+In [[splice_on_every_edge_between]], the exit node must have only a single possible
+successor (i.e. the exit node may not be a multiway branch or a conditional branch).
+<<graph and node mutators>>=
+val splice_on_every_edge_between : 'i cfg -> entry:'i node -> exit:'i node ->
+                                   pred:'i node  -> succ:'i node -> unit
+         (* [[pred]] is not multiway branch, call, or cutto *)
+val splice_before : 'i cfg -> entry:'i node -> exit:'i node -> 'i node -> unit
+         (* node is not join *)
+val splice_after  : 'i cfg -> entry:'i node -> exit:'i node -> 'i node -> unit
+         (* node is not fork *)
+@
+A node may be deleted if and only if all its predecessors are illegal.
+If a node is deleted, and its successor is
+\begin{enumerate}
+\item illegal: nothing happens
+\item join: the node is removed from the join's list of predecessors
+\item other: the node's single predecessor is set to an illegal node
+\end{enumerate}
+<<graph and node mutators>>=
+val delete        : 'i cfg -> 'i node -> unit    (* must have unique pred and succ *)
+@
+\paragraph{Altering instructions}
+If a node carries an instruction payload, this function
+updates the instruction.
+If a node carries no instruction payload, this function silently does
+nothing. 
+Changing a branch or conditional-branch instruction automatically
+changes its successors; changing a computed goto, call, cut to, or
+jump does not.
+<<graph and node mutators>>=
+val update_instr  : ('i -> 'i) -> 'i node -> unit
+@ 
+We can attach spans to a call or join node; this function is undefined on other nodes.
+<<graph and node mutators>>=
+val set_spans     : 'i node -> Spans.t -> unit
+@
+\subsection{Constructors}
+We can make a fresh graph.
+Because the graph can insert join points at will, the client must
+provide a supply of private labels.
+The supply takes as argument a string~[[s]] and returns a unique label
+that begins with~[[s]].
+Because the graph must be able to insert conditional branches at will,
+it is up  to the client to supply the appropriate function on
+instructions.
+Undoubtedly we will have to add some information about branch negation
+as well. 
+Perhaps ultimately we will use an analog of the embedding/projection
+pairs specified in the [[Target]] module.
+<<graph and node constructors>>=
+type       label_supply        = string -> string
+type 'i instruction_info = { goto    : (label, 'i) Ep.map
+                           ; branch  : (Rtl.exp * label, 'i) Ep.map
+                           ; bnegate : 'i -> 'i
+                           }
+val mk   : 'i instruction_info -> label_supply -> 'i cfg
+@ 
+We can clone the graph, simultaneously changing the representation of
+instructions. 
+N.B. the result is a ``shallow'' copy, not a ``deep'' one.
+The cloned graph may share mutable state with the original, typically
+in the extension fields.
+%%% ==> don't remove blank line following decl
+<<graph and node constructors>>=
+val copy : 'j instruction_info -> ('i -> 'j) -> 'i cfg -> 'j cfg
+@
+We can make a variety of individual nodes.
+These functions all mutate the graph, but we classify them as constructors anyway.
+<<graph and node constructors>>=
+val node_labeled           : 'i cfg -> label -> 'i node
+val non_local_join_labeled : 'i cfg -> label -> 'i node
+@ The [[node_labeled]] and [[non_local_join]] functions return join points
+bearing the given label.  If no such join point exists, one is created.
+The difference between these constructors is that code can flow into a regular join,
+whereas a non-local join may only be reached via a [[cut to]] or stack unwind.
+We may also want a join point immediately before some node. 
+The [[join_leading_to]] function returns its argument if it is a join point, returns
+the predecessor if it is a join point, or inserts and returns a join point immediately
+before the argument.
+N.B. The golden invariant ensures the second case will not go wrong.
+<<graph and node constructors>>=
+val join_leading_to : succ:'i node -> 'i node
+@
+In most cases, when we create a node we supply its successors.
+The simple instruction is, well, simple.
+A [[stack_adjust]] is just like an instruction, except that the code
+expander and stack freezer know to treat it specially.
+(Don't expand it and use the unsafe simplifier.)
+<<graph and node constructors>>=
+val instruction  : 'i cfg -> 'i -> succ:'i node -> 'i node
+val stack_adjust : 'i cfg -> 'i -> succ:'i node -> 'i node
+val assertion    : 'i cfg -> 'i -> succ:'i node -> 'i node
+@ 
+\paragraph{Control-flow nodes}
+The graph knows how to make an unconditional branch and a conditional
+branch. 
+Otherwise, it's up to the client to supply the instruction that does
+the transfer.
+<<graph and node constructors>>=
+val branch       : 'i cfg -> target:'i node -> 'i node
+val jump         : 'i cfg -> 'i -> uses:regs -> targets:string list -> 'i node
+val cbranch      : 'i cfg -> Rtl.exp -> ifso:'i node -> ifnot:'i node -> 'i node
+val mbranch      : 'i cfg -> 'i -> targets:'i node list -> 'i node
+val call         : 'i cfg -> 'i -> altrets:'i contedge list -> succ:'i node ->
+                     unwinds_to:'i contedge list -> cuts_to:'i contedge list ->
+                     aborts:bool -> uses:regs -> defs:regs -> kills:regs ->
+                     reads:string list option -> writes:string list option ->
+                     spans:Spans.t option -> 'i node
+val cut_to       : 'i cfg -> 'i -> cuts_to:'i contedge list -> aborts:bool ->
+                     uses:regs -> 'i node
+val return       : 'i cfg -> 'i -> uses:regs -> 'i node
+@ N.B. So that a [[call]] can be composed in sequence just like an
+[[instruction]], the ordinary return from a call is called [[succ]].
+@
+The weird nodes.
+<<graph and node constructors>>=
+val impossible   : 'i cfg -> succ:'i node -> 'i node
+val illegal      : 'i cfg -> 'i node  (* a node that must never be reached *)
+@
+\section{Implementation}
+<<cfg.ml>>=
+<<exported signatures>>
+module Make (X:X) : S with module X = X = struct
+  module R   = Register
+  module RS  = R.Set
+  type regs  = Register.Set.t  (* sets of regs for dataflow *)
+  type xregs = Register.SetX.t (* sets of regs for dataflow *)
+  module IS  = Set.Make (struct type t = int let compare = compare end)
+  module RSX = R.SetX
+  module SM  = Strutil.Map
+  module X   = X
+
+  type label = string
+  type label_supply = string -> label
+  type 'i instruction_info = { goto    : (label, 'i) Ep.map
+                             ; branch  : (Rtl.exp * label, 'i) Ep.map
+                             ; bnegate : 'i -> 'i
+                             }
+
+  type kind = (* all the kinds of nodes *)
+    | Join | Instruction | StackAdjust | Branch | Cbranch | Mbranch
+    | Jump  | Call | Return | CutTo
+    | Entry | Exit | Assertion | Illegal | Impossible
+  <<node type>>
+  and  'i contedge = { kills:regs; defs:regs; node:'i node }
+  and  'i cfg = { mutable entry     : 'i node
+                ; mutable exit      : 'i node (*mutable for bootstrapping cfg*)
+                ; mutable ill       : 'i node (*mutable for bootstrapping cfg*)
+                ;         inst_info : 'i instruction_info
+                ; mutable label_map : 'i node SM.t
+                ;         mk_label  : label_supply
+                }
+  type 'i t = 'i cfg
+
+  <<graph utilities>>
+  <<graph and node observers implementation>>
+  <<printing utilities>>
+  <<remove node predecessors>>
+  <<set node successors>>
+
+  <<simple node constructors>>
+  <<node constructors with interesting control flow edges>>
+  <<graph construction and copying>>
+
+  <<graph and node mutators implementation>>
+end
+@
+
+\subsection{Node Type}
+Abbreviations:
+\begin{quote} 
+\noindent
+\begin{tabular}{>{\ttfamily}ll}
+ent& Entry\\
+exi& Exit\\
+joi& Join\\
+ins& Instruction\\
+sta& Stack adjustment\\
+ass& Assertion\\
+bra& Branch\\
+cbr& Conditional branch\\
+mbr& Multiway branch (computed goto)\\
+cal& Call\\
+cut& Cut to\\
+ret& Return\\
+jum& Jump\\
+imp& Impossible\\
+ill& Illegal\\
+\end{tabular}
+\end{quote}
+
+Suffixes:
+\begin{quote} 
+\noindent
+\begin{tabular}{>{\ttfamily}ll}
+i    & Instruction\\
+num  & Unique Node Number\\
+labels & Multiple Labels\\
+contedges & Control-Flow Edges\\
+cfg  & Control-Flow Graph\\
+pred & Single Predecessor\\
+preds& Multiple Predecessors\\
+succ & Single Successor\\
+succs& Multiple Successors\\
+lpred & Layout Predecessor\\
+lsucc & Layout Successor\\
+jx    & Join Extension\\
+fx    & Fork Extension\\
+nx    & Non-Branch/Fork Extension\\
+\end{tabular}
+\end{quote}
+<<node type>>=
+type ('i, 'n)     ent = {         ent_num    : int
+                        ; mutable ent_succ   : 'n 
+                        ;         ent_nx     : X.nx
+                        }
+type ('i, 'n, 'c) exi = {         exi_num    : int
+                        ; mutable exi_cfg    : 'c
+                        ; mutable exi_labels : label list
+                        ; mutable exi_preds  : 'n list
+                        ; mutable exi_lpred  : 'n
+                        ;         exi_jx     : X.jx
+                        }
+type ('i, 'n, 'c) joi = {         joi_num    : int
+                        ;         joi_local  : bool
+                        ; mutable joi_labels : label list
+                        ; mutable joi_cfg    : 'c
+                        ; mutable joi_preds  : 'n list
+                        ; mutable joi_succ   : 'n
+                        ; mutable joi_lpred  : 'n
+                        ;         joi_jx     : X.jx
+                        ; mutable joi_spans  : Spans.t option
+                        }
+type ('i, 'n)     ins = {         ins_num    : int
+                        ; mutable ins_i      : 'i
+                        ; mutable ins_pred   : 'n
+                        ; mutable ins_succ   : 'n
+                        ;         ins_nx     : X.nx
+                        }
+type ('i, 'n)     sta = {         sta_num    : int
+                        ; mutable sta_i      : 'i
+                        ; mutable sta_pred   : 'n
+                        ; mutable sta_succ   : 'n
+                        ;         sta_nx     : X.nx
+                        }
+type ('i, 'n)     ass = {         ass_num    : int
+                        ; mutable ass_i      : 'i
+                        ; mutable ass_pred   : 'n
+                        ; mutable ass_succ   : 'n
+                        ;         ass_nx     : X.nx
+                        }
+type ('i, 'n)     bra = {         bra_num    : int
+                        ; mutable bra_i      : 'i
+                        ; mutable bra_pred   : 'n
+                        ; mutable bra_succ   : 'n
+                        ; mutable bra_lsucc  : 'n
+                        ;         bra_nx     : X.nx
+                        }
+type ('i, 'n)     cbr = {         cbr_num    : int
+                        ; mutable cbr_i      : 'i
+                        ; mutable cbr_pred   : 'n
+                        ; mutable cbr_true   : 'n
+                        ; mutable cbr_false  : 'n
+                        ;         cbr_fx     : X.fx
+                        }
+type ('i, 'n)     mbr = {         mbr_num    : int
+                        ; mutable mbr_i      : 'i
+                        ; mutable mbr_pred   : 'n
+                        ; mutable mbr_succs  : 'n array
+                        ; mutable mbr_lsucc  : 'n
+                        ;         mbr_fx     : X.fx
+                        }
+@
+
+Note that the different types of successor edges for a call node are not
+maintained because they are not distinguished in the flow-graph interface.
+If a call also aborts, the called procedure can let control flow to any
+non-local continuations.
+In this case, the exit node is a successor of the call node.
+
+<<node type>>=
+type ('i, 'n, 'e) cal = {         cal_num        : int
+                        ; mutable cal_i          : 'i
+                        ; mutable cal_pred       : 'n
+                        ; mutable cal_contedges  : 'e array
+                        ; mutable cal_lsucc      : 'n
+                        ;         cal_fx         : X.fx
+                        ; mutable cal_spans      : Spans.t option
+                        ; mutable cal_uses       : regs
+                        ;         cal_altrets    : int
+                        ;         cal_unwinds_to : int
+                        ;         cal_cuts_to    : int
+                        ;         cal_reads      : string list option
+                        ;         cal_writes     : string list option
+                        }
+type ('i, 'n, 'e) cut = {         cut_num        : int
+                        ; mutable cut_i          : 'i
+                        ; mutable cut_pred       : 'n
+                        ; mutable cut_lsucc      : 'n
+                        ; mutable cut_contedges  : 'e array
+                        ;         cut_fx         : X.fx
+                        ; mutable cut_uses       : regs
+                        }
+type ('i, 'n)     jum = {         jum_num        : int
+                        ; mutable jum_i          : 'i
+                        ; mutable jum_pred       : 'n
+                        ; mutable jum_succ       : 'n
+                        ; mutable jum_lsucc      : 'n
+                        ;         jum_nx         : X.nx
+                        ; mutable jum_uses       : regs
+                        }
+type ('i, 'n)     ret = {         ret_num        : int
+                        ; mutable ret_i          : 'i
+                        ; mutable ret_pred       : 'n
+                        ; mutable ret_succ       : 'n
+                        ; mutable ret_lsucc      : 'n
+                        ;         ret_nx         : X.nx
+                        ; mutable ret_uses       : regs
+                        }
+type ('i, 'n)     imp = {         imp_num        : int
+                        ; mutable imp_pred       : 'n
+                        ; mutable imp_succ       : 'n
+                        ; mutable imp_exit_succ  : 'n
+                        ;         imp_fx         : X.fx
+                        }
+type ('i, 'n, 'c) ill = {         ill_num        : int
+                        ;         ill_nx         : X.nx
+                        ; mutable ill_cfg        : 'c
+                        }
+
+
+type 'i node =
+  | Boot
+  | Ent of ('i, 'i node)              ent  
+  | Exi of ('i, 'i node, 'i cfg)      exi  
+  | Joi of ('i, 'i node, 'i cfg)      joi  
+  | Ins of ('i, 'i node)              ins  
+  | Sta of ('i, 'i node)              sta
+  | Ass of ('i, 'i node)              ass  
+  | Bra of ('i, 'i node)              bra  
+  | Cbr of ('i, 'i node)              cbr  
+  | Mbr of ('i, 'i node)              mbr  
+  | Cal of ('i, 'i node, 'i contedge) cal  
+  | Cut of ('i, 'i node, 'i contedge) cut  
+  | Ret of ('i, 'i node)              ret  
+  | Jum of ('i, 'i node)              jum  
+  | Imp of ('i, 'i node)              imp  
+  | Ill of ('i, 'i node, 'i cfg)      ill  
+@
+The observers are straightforward.
+<<graph and node observers implementation>>=
+let kind = kind_util
+let num = num_util
+
+let is_join node = match node with
+  | Joi _ | Exi _ -> true
+  | _             -> false
+let is_non_local_join node = match node with
+  | Joi j -> not j.joi_local
+  | _     -> false
+let is_head node = match node with
+  | Joi _ | Ent _ -> true
+  | _             -> false
+let is_fork node = match node with
+  | Cbr _ | Mbr _ | Cal _ | Cut _ | Imp _ -> true
+  | _                                     -> false
+
+let to_instr node = match node with
+  | Ins i -> Some i.ins_i
+  | Sta i -> Some i.sta_i
+  | Ass a -> Some a.ass_i
+  | Bra b -> Some b.bra_i
+  | Cbr c -> Some c.cbr_i
+  | Mbr m -> Some m.mbr_i
+  | Cal c -> Some c.cal_i
+  | Cut c -> Some c.cut_i
+  | Jum j -> Some j.jum_i
+  | Ret r -> Some r.ret_i
+  | Ent _ -> None
+  | Exi _ -> None
+  | Joi _ -> None
+  | Imp _ -> None
+  | Ill _ -> None
+  | Boot  -> undef "to_instr or to_executable" "boot"
+let to_executable node = match node with
+  | Ass _ -> None
+  | _     -> to_instr node
+@
+Join and exit nodes must have at least one label.
+No other node has a label.
+Both functions are defined only on nodes with labels.
+For now, we have added a hook to log when somebody asks for the label of an
+exit node.
+It may make sense to add an observer that returns an empty list if the node
+is not a join or exit node.
+<<graph and node observers implementation>>=
+let label node = match node with
+  | Joi j -> (try List.hd j.joi_labels
+              with Failure _ -> imposs "no labels at join")
+  | Exi e -> ( log "label called on exit node"
+             ; try List.hd e.exi_labels
+               with Failure _ -> imposs "no labels at exit"
+             )
+  | _     ->  undef "label" "non-join"
+
+let labels node = match node with
+  | Joi j -> j.joi_labels
+  | Exi e -> ( log "labels called on exit node" ; e.exi_labels )
+  | _     -> undef "labels" "non-join"
+@
+[[pred]] is defined only on a node that must have only a single predecessor.
+<<graph and node observers implementation>>=
+let pred node = match node with
+  | Ins i -> i.ins_pred
+  | Sta i -> i.sta_pred
+  | Ass a -> a.ass_pred
+  | Bra b -> b.bra_pred
+  | Cbr c -> c.cbr_pred
+  | Mbr m -> m.mbr_pred
+  | Cal c -> c.cal_pred
+  | Cut c -> c.cut_pred
+  | Jum j -> j.jum_pred
+  | Ret r -> r.ret_pred
+  | Imp i -> i.imp_pred
+  | Ent _ -> undef "pred" "entry"
+  | Joi _ -> undef "pred" "join"
+  | Exi _ -> undef "pred" "exit"
+  | Ill _ -> undef "pred" "illegal"
+  | Boot  -> undef "pred" "boot"
+@
+[[tsucc]] and [[fsucc]] are defined only on conditional-branch nodes.
+<<graph and node observers implementation>>=
+let tsucc node = match node with
+  | Cbr c -> c.cbr_true
+  | _     -> undef "tsucc" "non-cond-branch"
+let fsucc node = match node with
+  | Cbr c -> c.cbr_false
+  | _     -> undef "fsucc" "non-cond-branch"
+@
+There are two cases: nodes with a single successor and nodes with multiple
+successors.
+The single case is handled by returning the successor if $n = 0$.
+The multiple case is handled by fetching the $nth$ element from the successor
+array.
+<<graph and node observers implementation>>=
+let succ_n node n =
+  let fail ()    = raise (Invalid_argument "succ_n: illegal index") in
+  let single s n = if n = 0 then s else fail ()                     in
+  let mult a n   = try a.(n) with Invalid_argument _ -> fail ()     in
+  match node with
+  | Joi j -> single j.joi_succ n
+  | Ins i -> single i.ins_succ n
+  | Sta i -> single i.sta_succ n
+  | Ass a -> single a.ass_succ n
+  | Bra b -> single b.bra_succ n
+  | Jum j -> single j.jum_succ n
+  | Ret r -> single r.ret_succ n
+  | Ent e -> single e.ent_succ n
+  | Mbr m -> mult m.mbr_succs n
+  | Cal c -> mult (ce_getnodes c.cal_contedges) n
+  | Cut c -> mult (ce_getnodes c.cut_contedges) n
+  | Cbr c ->
+    if n = 0 then c.cbr_true
+    else if n = 1 then c.cbr_false
+    else fail ()
+  | Imp i -> 
+    if n = 0 then i.imp_succ
+    else if n = 1 then i.imp_exit_succ
+    else fail ()
+  | Exi _ -> undef "succ_n" "exit"
+  | Ill _ -> undef "succ_n" "illegal"
+  | Boot  -> undef "succ_n" "boot"
+@
+[[succ]] is defined only on non-fork nodes.
+<<graph and node observers implementation>>=
+let succ node = match node with
+  | Ins i -> i.ins_succ
+  | Sta i -> i.sta_succ
+  | Ass a -> a.ass_succ
+  | Joi j -> j.joi_succ
+  | Bra b -> b.bra_succ
+  | Jum j -> j.jum_succ
+  | Ret r -> r.ret_succ
+  | Ent e -> e.ent_succ
+  | Mbr _ -> undef_with_node (num node) "succ" "multi branch"
+  | Cbr _ -> undef_with_node (num node) "succ" "cond branch"
+  | Cal _ -> undef_with_node (num node) "succ" "call"
+  | Imp _ -> undef_with_node (num node) "succ" "impossible"
+  | Cut _ -> undef_with_node (num node) "succ" "cut"
+  | Exi _ -> undef_with_node (num node) "succ" "exit"
+  | Ill _ -> undef_with_node (num node) "succ" "illegal"
+  | Boot  -> undef_with_node (num node) "succ" "boot"
+@
+The cfg is stored in join points and illegal nodes.
+We find the cfg by following the first successor until we reach a join point
+or illegal node.
+We also keep a list of nodes ([[badlist]]) we have visited to detect loops.
+<<graph and node observers implementation>>=
+let get_cfg start_node =
+  let rec search n badlist =
+    if List.exists (eq n) badlist then
+      imposs "cycle in cfg with no join node"
+    else match n with
+        | Exi e -> e.exi_cfg
+        | Joi j -> j.joi_cfg
+        | Ill i -> i.ill_cfg
+        | n     -> search (succ_n n 0) (n::badlist) in
+  search start_node []
+let of_node = get_cfg
+@
+We avoid showing duplicates to the client.
+Duplicates are useful in the case when a multiway branch has multiple
+branches to the same successor.
+Without duplicates in the internal representation, it would be unpleasant to
+update the succ/pred list when changing a branch.
+
+Internally, we provide the [[all_incoming]] function for cases where we need to see all
+incoming edges, not just the predecessors.
+Similarly with [[all_outgoing]] for successor edges.
+<<graph and node observers implementation>>=
+let all_incoming node = match node with
+  | Ins i -> [i.ins_pred]
+  | Sta i -> [i.sta_pred]
+  | Ass a -> [a.ass_pred]
+  | Bra b -> [b.bra_pred]
+  | Cbr c -> [c.cbr_pred]
+  | Mbr m -> [m.mbr_pred]
+  | Cal c -> [c.cal_pred]
+  | Cut c -> [c.cut_pred]
+  | Jum j -> [j.jum_pred]
+  | Ret r -> [r.ret_pred]
+  | Imp i -> [i.imp_pred]
+  | Joi j -> j.joi_preds
+  | Exi e -> e.exi_preds
+  | Ent _ -> []
+  | Ill _ -> []
+  | Boot  -> undef "preds" "boot"
+
+let preds node = uniq (all_incoming node)
+
+let all_outgoing node = match node with
+  | Joi j -> [j.joi_succ]
+  | Ins i -> [i.ins_succ]
+  | Sta i -> [i.sta_succ]
+  | Ass a -> [a.ass_succ]
+  | Bra b -> [b.bra_succ]
+  | Jum j -> [j.jum_succ]
+  | Ret r -> [r.ret_succ]
+  | Ent e -> [e.ent_succ]
+  | Cbr c -> [c.cbr_false; c.cbr_true]
+  | Imp i -> [i.imp_succ; i.imp_exit_succ]
+  | Mbr m -> (Array.to_list m.mbr_succs)
+  | Cal c -> (Array.to_list (ce_getnodes c.cal_contedges))
+  | Cut c -> (Array.to_list (ce_getnodes c.cut_contedges))
+  | Exi _ -> []
+  | Ill _ -> []
+  | Boot  -> undef "succs" "boot"
+let succs node = uniq (all_outgoing node)
+@
+It may be useful to find the number of alternate returns, unwinds, or
+[[cuts_to]] edges at a call node.
+Functions like [[succ_n]] returns these edges in the standard order
+(alternate returns, normal return, unwinds, and cuts).
+<<graph and node observers implementation>>=
+let altrets node = match node with
+  | Cal c -> c.cal_altrets
+  | _     -> undef "altrets" "non-call"
+let cuts_to node = match node with
+  | Cal c -> c.cal_cuts_to
+  | _     -> undef "cuts" "non-call"
+let unwinds_to node = match node with
+  | Cal c -> c.cal_unwinds_to
+  | _     -> undef "unwinds" "non-call"
+@
+We have several observers that check the type of a node.
+The jump and return nodes are not interesting forms of control flow with
+regards to a procedure's control-flow graph.
+<<graph and node observers implementation>>=
+let is_cti node = match node with
+  | Bra _ | Cbr _ | Mbr _ | Cal _ | Cut _ -> true
+  | _                                     -> false
+let is_br node = match node with
+  | Bra _ -> true
+  | _     -> false
+let is_cbr node = match node with
+  | Cbr _ -> true
+  | _     -> false
+let is_mbr node = match node with
+  | Mbr _ -> true
+  | _     -> false
+let is_call node = match node with
+  | Cal _ -> true
+  | _     -> false
+let is_cut node = match node with
+  | Cut _ -> true
+  | _     -> false
+let spans node = match node with
+  | Cal c -> c.cal_spans
+  | Joi j -> j.joi_spans
+  | _     -> undef_with_node (num node) "spans" "non-call or non-join"
+@
+Each node has data attached to it. We hope to limit this data to join points
+someday.
+<<graph and node observers implementation>>=
+let jx node = match node with
+  | Joi j -> j.joi_jx
+  | Exi e -> e.exi_jx 
+  | _     -> undef "jx" "non-join"
+
+let fx node = match node with
+  | Cbr c -> c.cbr_fx
+  | Mbr m -> m.mbr_fx
+  | Cal c -> c.cal_fx 
+  | Cut c -> c.cut_fx
+  | Imp i -> i.imp_fx
+  | _     -> undef "fx" "non-fork"
+
+let nx node = match node with
+  | Ins i -> i.ins_nx
+  | Sta i -> i.sta_nx
+  | Ass a -> a.ass_nx
+  | Bra b -> b.bra_nx
+  | Jum j -> j.jum_nx
+  | Ret r -> r.ret_nx
+  | Ent e -> e.ent_nx
+  | Ill i -> i.ill_nx
+  | _     -> undef "nx" "fork and join"
+
+let entry cfg = cfg.entry
+let exit  cfg = cfg.exit
+@
+We have several functions to iterate or fold over the nodes of the graph.
+[[fold_heads]] folds over the entry node and the join points.
+[[fold_nodes]] folds over all the nodes in the cfg.
+<<graph and node observers implementation>>=
+let fold_heads f zero cfg = List.fold_left (fun x y -> f y x) zero (heads cfg)
+@ 
+In [[fold_nodes]], we are careful to make sure we visit every single node in the graph,
+regardless of whether it is accessible from the entry or exit nodes, via predecessors
+or successors.
+We first gather all the nodes in a set.
+Although it is redundant, we have to use a set to efficiently keep track of which nodes
+we have already visited, and keep track of the list of nodes separately.
+We cannot use the standard OCaml [[Set]] module because it would require specializing
+the type of the node.
+Gathering the set guarantees that we visit each node in the cfg without allowing the
+function [[cons]] to affect the traversal.
+<<graph and node observers implementation>>=
+<<join node set operations>>
+let fold_nodes cons nil g =
+  let cons x y = cons y x in
+  let rec vchildren children k set lst = 
+    match children with
+    | c::rst -> vnode c (vchildren rst k) set lst
+    | []     -> k set lst
+  and vnode n k set lst =
+    if IS.mem (num n) set then
+      k set lst
+    else
+      let preds = preds n in
+      let succs = succs n in
+      vchildren succs (vchildren preds k) (IS.add (num n) set) (n::lst) in
+  vnode (entry g) (fun _ lst -> List.fold_left cons nil lst)
+        IS.empty []
+let iter_nodes f = fold_nodes (fun n () -> f n) ()
+let iter_heads f = fold_heads (fun n () -> f n) ()
+@
+[[cps_postorder_dfs]] gives us a postorder dfs over the graph.
+[[vnode]] visits a node, which in turn visits each of the node's children
+before acting on the node itself.
+[[vchildren]] actually visits each of the children in turn. The visit to the
+rest of the children is passed on as a continuation.
+Tail-recursive.
+NOTE: WHEN ALL NODES ARE ACCESSIBLE BY FOLLOWING PREDS FROM THE EXIT NODE, IT
+MAY BE WORTH CONSIDERING A PREORDER DFS FROM THE EXIT NODE. POSTORDER DFS FROM
+THE ENTRY SEEMS GOOD FOR MAKING DECISIONS AT FORK NODES, WHEREAS PREORDER DFS
+FROM EXIT SEEMS GOOD FOR MAKING DECISIONS AT JOIN POINTS.
+<<graph and node observers implementation>>=
+let cps_postorder_dfs heads get_children g cons nil cont =
+  let rec vnode node cont acc visited =
+    if member node visited then
+      cont acc visited
+    else
+      vchildren node (get_children node) cont acc (add node visited)
+  and vchildren node children cont acc visited = 
+    let rec next children acc visited = match children with
+      | [] -> cont (cons node acc) visited
+      | n::rst -> vnode n (next rst) acc visited in
+    next children acc visited in
+  let rec fold_heads heads cont acc visited =
+    match heads with
+    | h::rst -> vnode h (fold_heads rst cont) acc visited
+    | []     -> cont acc visited in
+  fold_heads heads cont nil emptyset
+@
+Note that by only taking successors or predecessors, each of these traversals may miss
+some nodes in the cfg.
+<<graph and node observers implementation>>=
+let postorder_dfs cons nil g =
+  cps_postorder_dfs [entry g] succs g cons nil (fun x _ -> x)
+let reverse_podfs cons nil g =
+  cps_postorder_dfs [exit  g] preds g cons nil (fun x _ -> x)
+@
+Edges may have control flow.
+We need to be able to examine uses on inedges and defs/kills on outedges.
+NOTE: I STILL FEEL THAT USES/DEFS/KILLS SHOULD BE PLACED AT THE NODE - THE
+NODE IS RESPONSIBLE FOR THESE ACTIONS. THE EDGE DOESN'T ACTUALLY TAKE AN
+ACTION, WHICH IS WHY THE LIVE SETS MAKE SENSE ON THE EDGES.
+<<graph and node observers implementation>>=
+(* should this fn be defined on exi and ill?
+   when there are cont edges, do we still need to cover the regular edges?*)
+let (++) = RSX.union
+let union_over_outedges node ~noflow ~flow =
+  let union_contedges ce =
+    Array.fold_left (fun r s -> r ++ flow s) RSX.empty ce in
+  match node with
+  | Cal c -> union_contedges c.cal_contedges
+  | Cut c -> union_contedges c.cut_contedges
+  | Cbr c -> noflow c.cbr_true ++ noflow c.cbr_false
+  | Imp i -> noflow i.imp_succ ++ noflow i.imp_exit_succ
+  | Mbr m -> Array.fold_right (fun s -> (++) (noflow s)) m.mbr_succs RSX.empty
+  | Ins i -> noflow i.ins_succ
+  | Sta i -> noflow i.sta_succ
+  | Ass a -> noflow a.ass_succ
+  | Bra b -> noflow b.bra_succ
+  | Jum j -> noflow j.jum_succ
+  | Ret r -> noflow r.ret_succ
+  | Ent e -> noflow e.ent_succ
+  | Joi j -> noflow j.joi_succ
+  | Exi e -> RSX.empty
+  | Ill i -> RSX.empty
+  | Boot  -> imposs "union_over_outedges undefined on boot nodes"
+  
+let add_inedge_uses node regs =
+  let reg_add  = RS.fold (fun r rst -> RSX.add (R.Reg r) rst) in
+  match node with
+  | Cal c -> reg_add c.cal_uses regs
+  | Cut c -> reg_add c.cut_uses regs
+  | Jum j -> reg_add j.jum_uses regs
+  | Ret r -> reg_add r.ret_uses regs
+  | _     -> regs
+
+let add_live_spans node regs =
+  let span_add spans rst = match spans with
+    | Some ss -> Spans.fold_live_locs RSX.add ss rst
+    | None    -> rst in
+  match node with
+  | Cal c -> span_add c.cal_spans regs
+  | Joi j -> span_add j.joi_spans regs
+  | _     -> regs
+@ 
+Although only internally visible, the [[remove_pred]] function is vital.
+For join and exit nodes, we remove [[node]] from the predecessor list.
+For other nodes, we set the predecessor to the illegal node.
+<<remove node predecessors>>=
+let remove_pred cfg node ~old_succ =
+  let rec rem_1_list lst = match lst with
+    | [] -> imposs "remove_pred: predecessor to be removed not found"
+    | n::rst when eq n node -> rst
+    | n::rst -> n :: rem_1_list rst in
+  match old_succ with
+  | Joi j -> j.joi_preds <- rem_1_list j.joi_preds
+  | Exi e -> e.exi_preds <- rem_1_list e.exi_preds
+  | Ins i -> i.ins_pred  <- cfg.ill
+  | Sta i -> i.sta_pred  <- cfg.ill
+  | Bra b -> b.bra_pred  <- cfg.ill
+  | Cbr c -> c.cbr_pred  <- cfg.ill
+  | Mbr m -> m.mbr_pred  <- cfg.ill
+  | Jum j -> j.jum_pred  <- cfg.ill
+  | Cal c -> c.cal_pred  <- cfg.ill
+  | Ret r -> r.ret_pred  <- cfg.ill
+  | Cut c -> c.cut_pred  <- cfg.ill
+  | Ass a -> a.ass_pred  <- cfg.ill
+  | Imp i -> i.imp_pred  <- cfg.ill
+  | Ill _ -> ()
+  | Ent _ -> imposs "entry node was a successor"
+  | Boot  -> imposs "boot nodes should not live to remove_pred"
+@
+
+
+The set successors functions are exported through the interface and also used
+throughout the cfg implementation.
+
+[[node_labeled]] is fundamental to setting the successors, since join points
+must frequently be inserted.
+<<set node successors>>=
+let mk_join cfg labels ~preds ~lpred ~succ ~local ~spans =
+  let join = Joi { joi_num    = new_num ()
+                 ; joi_local  = local
+                 ; joi_labels = labels
+                 ; joi_cfg    = cfg
+                 ; joi_preds  = preds
+                 ; joi_succ   = succ
+                 ; joi_lpred  = lpred
+                 ; joi_jx     = X.jx ()
+                 ; joi_spans  = spans
+                 } in
+  List.iter (fun l -> cfg.label_map <- SM.add l join cfg.label_map) labels;
+  join
+
+let node_labeled cfg label =
+  try SM.find label cfg.label_map
+  with Not_found -> mk_join cfg [label] ~preds:[] ~lpred:cfg.ill ~succ:cfg.ill
+                                ~local:true ~spans:None
+let non_local_join_labeled cfg label =
+  try let n = SM.find label cfg.label_map in
+      match n with
+      | Joi j when j.joi_local ->
+          imposs "CFG: non_local_join_labeled called on local join"
+      | Joi _ -> n
+      | _     -> imposs "CFG: non-join found in label_map"
+  with Not_found -> mk_join cfg [label] ~preds:[] ~lpred:cfg.ill ~succ:cfg.ill
+                                ~local:false ~spans:None
+@
+[[join_leading_to]] returns [[succ]] or its predecessor if one is a join point;
+otherwise, it inserts a join point between [[succ]] and its predecessor.
+Since [[succ]] is not a join point, we know that [[succ]] is the sole successor of
+its predecessor (golden invariant).
+The join point is then returned.
+This function can be useful for maintaining the golden invariant.
+<<set node successors>>=
+let rec join_leading_to ~succ =
+  if is_join succ then succ
+  else
+    let cfg = get_cfg succ in
+    if is_ill succ then 
+      let join = node_labeled cfg (cfg.mk_label "join") in
+      let () = set_succ cfg join ~succ:succ in
+      join
+    else
+      let p = pred succ in (* p must not be a fork b/c succ is not a join *)
+      if is_join p then p
+      else let join = node_labeled cfg (cfg.mk_label "join") in
+           let () = if not (is_ill p) then set_succ cfg p ~succ:join in
+           let () = set_succ cfg join ~succ:succ in
+           join
+@
+[[set_succ']] takes four steps to set the successor of [[node]] to [[succ]]
+(where [[old_succ]] is [[node]]'s successor when this function is called):
+\begin{enumerate}
+\item
+  If [[succ]] is a join point or an illegal node, then it is a valid
+  successor.
+  But otherwise, if [[succ]] already has a legal successor, then we need to
+  insert a join point between [[succ]] and its predecessor, and use that join
+  point as the new successor.
+  We insert the join point by using [[join_leading_to]] in the recursive call.
+\item
+  Modify [[old_succ]] to remove [[node]] as a predecessor.
+\item
+  Modify [[succ]] to have [[node]] as a predecessor.
+\item
+  Modify [[node]] to have [[succ]] as a successor.
+\end{enumerate}
+The [[single]], [[ce_mult]], [[mult]], and [[cbr]] continuations are used to set
+the successor of [[node]], depending on whether [[node]] is a node with a
+single successor, multiple successors with control-flow edges, multiple
+successors with no such edges, or a conditional branch.
+<<set node successors>>=
+and set_succ' cfg ~single ~ce_mult ~mult ~cbr ~node ~old_succ ~succ =
+  if not (is_join succ) && not (is_ill succ) && not (is_ill (pred succ)) then
+    set_succ' cfg ~single ~ce_mult ~mult ~cbr ~node ~old_succ
+              ~succ:(join_leading_to succ)
+  else
+    begin
+      ( (<<modify the $n$th successor of [[node]] because [[node]] is no longer a predecessor>>)
+      ; let succ = (<<update [[node]]'s $n$th successor field to point to [[succ]]>>) in
+        (if not (is_ill succ)
+         then <<modify [[succ]] because [[node]] has become a predecessor>>
+        )
+      )
+    end
+@
+Call the appropriate continuation to update [[node]]'s successor.
+<<update [[node]]'s $n$th successor field to point to [[succ]]>>=
+match node with
+| Joi j -> j.joi_succ <- single succ; succ
+| Ins i -> i.ins_succ <- single succ; succ
+| Sta i -> i.sta_succ <- single succ; succ
+| Ass a -> a.ass_succ <- single succ; succ
+| Jum j -> j.jum_succ <- single succ; succ
+| Ret r -> r.ret_succ <- single succ; succ
+| Ent e -> e.ent_succ <- single succ; succ
+| Mbr m -> ignore (mult m.mbr_succs        (fun _ -> succ)); succ
+| Cal c ->
+  let succ = join_leading_to succ in
+  ignore (ce_mult c.cal_contedges (fun s -> {s with node = succ})); succ
+| Cut c -> ignore (ce_mult c.cut_contedges (fun s -> {s with node = succ})); succ
+| Bra b ->
+  let succ = join_leading_to succ in
+  ( b.bra_i <- (get_cfg node).inst_info.goto.Ep.embed (label succ)
+  ; b.bra_succ <- single succ
+  ; succ
+  )
+| Cbr c -> 
+  let succ = join_leading_to succ in
+  let cfg = get_cfg node in
+  (if cbr () then
+     c.cbr_true  <- succ
+   else
+     c.cbr_false <- succ
+  );
+  let (cond, _) = cfg.inst_info.branch.Ep.project c.cbr_i in
+  c.cbr_i <- cfg.inst_info.branch.Ep.embed (cond, label c.cbr_true);
+  succ
+| Imp i ->
+  let succ = join_leading_to succ in
+  if cbr () then i.imp_succ <- succ
+  else if is_exi succ then i.imp_exit_succ <- succ
+  else imposs "exit_succ must be an exit node";
+  succ
+| Exi _ -> undef "set_succ" "exit"
+| Ill _ -> undef "set_succ" "illegal"
+| Boot  -> undef "set_succ" "boot"
+@ 
+<<modify the $n$th successor of [[node]] because [[node]] is no longer a predecessor>>=
+remove_pred cfg node old_succ
+@
+Adding a predecessor.
+<<modify [[succ]] because [[node]] has become a predecessor>>=
+let join_pred cur_preds = match cur_preds with
+  | [Ill _] -> [node]
+  | _       -> node::cur_preds in
+match succ with
+| Ins i -> i.ins_pred  <- node
+| Sta i -> i.sta_pred  <- node
+| Ass a -> a.ass_pred  <- node
+| Bra b -> b.bra_pred  <- node
+| Jum j -> j.jum_pred  <- node
+| Ret r -> r.ret_pred  <- node
+| Imp i -> i.imp_pred  <- node
+| Cbr c -> c.cbr_pred  <- node
+| Mbr m -> m.mbr_pred  <- node
+| Cal c -> c.cal_pred  <- node
+| Cut c -> c.cut_pred  <- node
+| Exi e -> e.exi_preds <- join_pred e.exi_preds
+| Joi j -> j.joi_preds <- join_pred j.joi_preds
+| Ent e -> imposs "something tried to become a predecessor of the entry node"
+| Ill i -> imposs "client can make a pointer dangle, but believed to be handled above"
+| Boot  -> undef "add_pred" "boot"
+@
+The continuations passed to [[set_succ']] determine the domain of the
+function.
+[[set_succ_n]] ensures that a node with a single successor will only modify
+the $0th$ successor.
+Similarly, [[set_succ]] ensures that nodes with multiple successors are never
+modified.
+<<set node successors>>=
+and set_succ_n cfg node n ~succ:succ =
+  set_succ' cfg
+    ~single:(if n = 0 then (fun s -> s) else (fun s -> invalid_arg "successor index"))
+    ~ce_mult: (fun a f -> let s = a.(n) in a.(n) <- f s; s)
+    ~mult:  (fun a f -> let s = a.(n) in a.(n) <- f s; s)
+    ~cbr:   (if n = 0 then (fun () -> true) else if n = 1 then (fun () -> false)
+             else fun () -> invalid_arg "successor index")
+    ~node ~old_succ:(succ_n node n) ~succ
+and set_succ cfg node ~succ:the_succ =
+  set_succ' cfg
+    ~single: (fun s -> s)
+    ~ce_mult:   (fun a f -> undef "set_succ" "multiple node not o/w specified")
+    ~mult:   (fun a f -> undef "set_succ" "multiple node not o/w specified")
+    ~cbr:    (fun () ->  undef "set_succ" "fork")
+    ~node ~old_succ:(succ node) ~succ:the_succ
+@
+No sense wasting time going through [[set_succ']].
+<<set node successors>>=
+let set_tsucc cfg node ~succ = match node with
+  | Cbr _ -> set_succ_n cfg node 0 ~succ
+  | _     -> undef "set_tsucc" "non-cond-branch"
+let set_fsucc cfg node ~succ = match node with
+  | Cbr _ -> set_succ_n cfg node 1 ~succ
+  | _     -> undef "set_fsucc" "non-cond-branch"
+@
+Transactions are not usable as yet; some useful function has not been added to
+the interface yet.
+<<graph and node mutators implementation>>=
+module Tx = struct
+  exception Exhausted
+  type t = { mutable limit : int; mutable remaining : int; mutable last : string; }
+  let ts = { limit = max_int; remaining = max_int; last = "<none>"; }
+
+  let start_cond who =
+    if ts.remaining > 0 then
+      ( ts.remaining <- ts.remaining - 1; ts.last <- who; true )
+    else
+      false
+  
+  let start_exn who = if start_cond who then () else raise Exhausted
+
+  let finish _ = ()
+
+  let set_limit n = ts.limit <- n; ts.remaining <- n
+  let used _ = ts.limit - ts.remaining
+  let last _ = ts.last
+
+  let _ = Reinit.at (fun () -> begin ts.remaining <- ts.limit; ts.last <- "<none>" end)
+end
+@
+It may be useful to invert a conditional branch so that the false arm can
+be the layout successor of the cbr.
+The condition is inverted, as are the true branch, the false branch, and the
+instruction.
+<<graph and node mutators implementation>>=
+let invert_cbr node = match node with
+  | Cbr c ->
+    let cfg = get_cfg node in
+    let new_true = c.cbr_false in
+    ( set_fsucc cfg node ~succ:c.cbr_true
+    ; set_tsucc cfg node ~succ:new_true
+    ; c.cbr_i <- cfg.inst_info.bnegate c.cbr_i
+    )
+  | _     -> undef "invert_cbr" "non-cond-branch"
+@
+We are careful to order the mutations to avoid inserting extra join points.
+The exit node must have only a single possible successor (i.e. multiway branches and
+conditional branches may not be the exit node).
+<<graph and node mutators implementation>>=
+let splice_on_every_edge_between cfg ~entry ~exit ~pred ~succ =
+  let () = if not (List.exists (eq pred) (preds succ))
+           then (Printf.eprintf "Splicing between pred:%d succ:%d\n" (num pred) (num
+                   succ); assert false)
+           else () in
+  let () =
+    if not (List.exists (eq succ) (succs pred))
+    then imposs "splice_on_every_edge_between: succ is not a successor of pred" in
+  let update_succ () = set_succ cfg exit ~succ in
+  let update_pred () =
+    match pred with
+    | Cbr c ->
+      let entry = join_leading_to entry in
+      if eq succ c.cbr_true  then set_tsucc cfg pred entry; 
+      if eq succ c.cbr_false then set_fsucc cfg pred entry
+    | Imp i ->
+      let upd_succ n entry = if eq n succ then entry else n in
+      ( i.imp_succ      <- upd_succ i.imp_succ      entry
+      ; i.imp_exit_succ <- upd_succ i.imp_exit_succ entry
+      )
+    | Mbr m -> undef "splice_on_every_edge_between" "mbranch"
+    | Cal c -> undef "splice_on_every_edge_between" "call"
+    | Cut c -> undef "splice_on_every_edge_between" "cut-to"
+    | _     -> set_succ cfg pred ~succ:entry in
+  (update_pred (); update_succ ())
+
+let splice_before cfg ~entry ~exit node =
+  let p = pred node in
+  if Pervasives.(<>) (kind p) Illegal then set_succ cfg p ~succ:entry;
+  set_succ cfg exit ~succ:node
+
+let splice_after cfg ~entry ~exit node =
+  let succ = succ node in
+  (set_succ cfg node ~succ:entry ; set_succ cfg exit ~succ)
+
+let delete cfg node =
+  ( if   List.for_all (fun p -> kind p =*= Illegal)           (all_incoming node) 
+    then List.iter    (fun s -> remove_pred cfg node ~old_succ:s) (all_outgoing node)
+  ; if kind node =*= Join
+    then cfg.label_map <- List.fold_right SM.remove (labels node) cfg.label_map
+  )
+  
+
+let update_instr upd node = match node with
+  | Ins i -> i.ins_i <- upd i.ins_i
+  | Sta i -> i.sta_i <- upd i.sta_i
+  | Ass a -> a.ass_i <- upd a.ass_i
+  | Bra b -> b.bra_i <- upd b.bra_i
+  | Jum j -> j.jum_i <- upd j.jum_i
+  | Ret r -> r.ret_i <- upd r.ret_i
+  | Mbr m -> m.mbr_i <- upd m.mbr_i
+  | Cal c -> c.cal_i <- upd c.cal_i
+  | Cut c -> c.cut_i <- upd c.cut_i
+  | Cbr c -> c.cbr_i <- upd c.cbr_i
+  | Joi j -> ()
+  | Ent e -> ()
+  | Exi _ -> ()
+  | Imp i -> ()
+  | Ill _ -> ()
+  | Boot  -> imposs "update_instr undefined on boot nodes"
+@
+<<graph and node mutators implementation>>=
+let set_spans n spans = match n with
+  | Cal c -> c.cal_spans <- Some spans
+  | Joi j -> j.joi_spans <- Some spans
+  | _     -> undef_with_node (num n) "set_spans" "non-call or non-join"
+@
+We would like to be able to fold over the layout of the graph.
+THE CURRENT SOLUTION IS NOT NECESSARILY PERMANENT:
+We make two passes:
+\begin{enumerate}
+\item
+  The first pass establishes the layout constraints.
+  The constraints are established by ensuring that the layout successor
+  has only the given node as a predecessor. This property can be established
+  by adding an unconditional branch to the layout successor. Of course, for
+  fork points, a join point must be inserted to maintain the golden invariant.
+\item
+  Fold over the nodes, visiting the successors in such a way as to meet layout
+  constraints. Layout constraints are met by calling succs, which returns the
+  layout successor as the first successor in the list.
+\end{enumerate}
+<<graph and node mutators implementation>>=
+let fold_layout f zero cfg =
+  let multiple_preds = function  (* N.B. branch to exit is never needed *)
+    | Joi j -> (match j.joi_preds with _ :: _ :: _ -> true | _ -> false)
+    | _     -> false in
+  let ins_branch node = match node with
+    | Cbr c ->
+      if multiple_preds c.cbr_false then
+        set_fsucc cfg node ~succ:(join_leading_to (branch cfg c.cbr_false))
+    | Cal c ->
+      if multiple_preds (succ_n node 0) then
+        set_succ_n cfg node 0 ~succ:(join_leading_to (branch cfg (succ_n node 0)))
+    | Imp i ->
+      if multiple_preds i.imp_succ then
+        set_succ cfg node ~succ:(join_leading_to (branch cfg i.imp_succ))
+    | Joi _ | Ins _ | Sta _ | Ass _ | Ret _ | Ent _ ->
+      if multiple_preds (succ node) then
+        set_succ cfg node ~succ:(branch cfg (succ node))
+    | Mbr _ | Bra _ | Cut _ | Jum _ | Exi _ | Ill _ | Boot -> () in
+  let () = iter_nodes ins_branch cfg in
+  let snoc node build = fun tail -> build (f node tail) in
+  cps_postorder_dfs [entry cfg] succs cfg snoc (fun x -> x) (fun build _ -> build zero)
+@
+When we make exit nodes, we are careful to add the labels to the cfg's label
+map.
+<<graph construction and copying>>=
+let mk_entry succ =
+  Ent { ent_num  = new_num ()
+      ; ent_succ = succ
+      ; ent_nx   = X.nx ()
+      }
+let mk_exit cfg labels ~preds ~lpred =
+  let exit = Exi { exi_num    = new_num ()
+                 ; exi_cfg    = cfg
+                 ; exi_labels = labels
+                 ; exi_preds  = []
+                 ; exi_lpred  = cfg.ill
+                 ; exi_jx     = X.jx ()
+                 } in
+  List.iter (fun l -> cfg.label_map <- SM.add l exit cfg.label_map) labels;
+  exit
+@
+With recursive types, we have to bootstrap the creation of the cfg.
+<<graph construction and copying>>=
+let mk i_info label_supply =
+  let entry = match mk_entry Boot with
+              | Ent e -> e
+              | _     -> imposs "mk_entry returned non-entry node" in
+  let cfg = { entry     = Ent entry
+            ; exit      = Boot
+            ; ill       = Boot
+            ; inst_info = i_info
+            ; label_map = SM.empty
+            ; mk_label  = label_supply
+            } in
+  let ill = illegal cfg in
+  let exit = mk_exit cfg [label_supply "exit"] ~preds:[] ~lpred:ill in
+  let ()  = cfg.ill        <- ill in
+  let ()  = entry.ent_succ <- ill in
+  let ()  = cfg.exit       <- exit in
+  cfg
+@
+We visit all the nodes in the graph via postorder dfs.
+We make join points as necessary and reference them in the new cfg's label map.
+Whenever a join point is used, we look up its label in this map. If not found,
+we copy the join point from the old cfg.
+<<graph construction and copying>>=
+let copy info transform cfg =
+  assert false (* FOLLOWING NEVER TESTED; DON'T BELIEVE THE HYPE *)
+(*
+  let new_cfg = { entry     = Boot
+                ; exit      = Boot
+                ; ill       = Boot
+                ; inst_info = info
+                ; label_map = SM.empty
+                ; mk_label  = cfg.mk_label
+                } in
+  let ()  = new_cfg.ill <- illegal new_cfg in
+  let lookup join =
+    try SM.find (label join) new_cfg.label_map
+    with Not_found -> 
+      mk_join new_cfg (labels join) ~preds:[] ~lpred:new_cfg.ill
+              ~succ:new_cfg.ill ~spans:join.joi_spans in
+  let ce_lookup ce =
+    let n' = lookup ce.node in
+    {ce with node = n'} in
+  let convert_contedges contedges = Array.map ce_lookup contedges in
+  let convert node succ =
+    match node with
+    | Ins i -> instruction  new_cfg (transform i.ins_i) ~succ
+    | Sta i -> stack_adjust new_cfg (transform i.sta_i) ~succ
+    | Ass a -> assertion    new_cfg (transform a.ass_i) ~succ
+    | Bra b -> branch       new_cfg ~target:(lookup b.bra_succ)
+    | Jum j -> jump         new_cfg (transform j.jum_i) ~uses:j.jum_uses
+                                    ~targets:[]
+    | Cbr c ->
+      let (cond, _) = cfg.inst_info.branch.Ep.project c.cbr_i in
+      cbranch new_cfg cond ~ifso:(lookup c.cbr_true)
+                           ~ifnot:(lookup c.cbr_false)
+    | Ret r -> return      new_cfg (transform r.ret_i) ~uses:r.ret_uses
+    | Imp i -> impossible  new_cfg ~succ
+    | Ill i -> new_cfg.ill
+    | Mbr m ->
+      mbranch new_cfg (transform m.mbr_i)
+       ~targets:(Array.fold_right (fun t rst -> lookup t :: rst)
+                                  m.mbr_succs [])
+    | Cal c ->
+      let ce_lst = convert_contedges c.cal_contedges in
+      mk_call (transform c.cal_i) ~pred:new_cfg.ill
+              ~contedges:ce_lst ~lsucc:new_cfg.ill ~uses:c.cal_uses
+              ~altrets:c.cal_altrets ~unwinds_to:c.cal_unwinds_to
+              ~cuts_to:c.cal_cuts_to ~reads:c.cal_reads ~writes:c.cal_writes
+              ~spans:c.cal_spans
+    | Cut c ->
+      let cuts_to = Array.to_list (convert_contedges c.cut_contedges) in
+      cut_to new_cfg (transform c.cut_i) ~cuts_to ~aborts:false ~uses:c.cut_uses
+    | Joi j ->
+      let join = lookup node in
+      (set_succ join succ; join)
+    | Exi e ->
+      let exit = mk_exit new_cfg (labels cfg.exit) ~preds:[]
+                         ~lpred:new_cfg.ill in
+      (new_cfg.exit <- exit; exit)
+    | Ent e ->
+      let ent = mk_entry succ in
+      (new_cfg.entry <- ent; ent)
+    | Boot  -> undef "copy" "boot" in
+  let () = match postorder_dfs convert new_cfg.ill cfg with
+           | Ent _ -> ()
+           | _     -> imposs "postorder_dfs didn't end with entry node" in
+  new_cfg
+*)
+@
+The contedges add a little excitement, but nothing shocking.
+They are added with defs/kills to each node.
+We have to bootstrap node construction because of the way [[set_succ]] works.
+<<node constructors with interesting control flow edges>>=
+let join_leading_to_ce ce = {ce with node = join_leading_to ce.node}
+
+let mk_call i ~pred ~contedges ~lsucc ~uses ~altrets ~unwinds_to ~cuts_to
+    ~reads ~writes ~spans =
+    Cal { cal_num        = new_num ()
+        ; cal_i          = i
+        ; cal_pred       = pred
+        ; cal_contedges  = contedges
+        ; cal_lsucc      = lsucc
+        ; cal_fx         = X.fx ()
+        ; cal_spans      = spans
+        ; cal_uses       = uses
+        ; cal_altrets    = altrets
+        ; cal_unwinds_to = unwinds_to
+        ; cal_cuts_to    = cuts_to
+        ; cal_reads      = reads  
+        ; cal_writes     = writes 
+        }
+
+let call cfg i ~altrets ~succ ~unwinds_to ~cuts_to ~aborts
+               ~uses ~defs ~kills ~reads ~writes ~spans =
+  let new_cedge n = {kills = kills; defs = defs; node = n} in
+  let succ = match kind succ with
+    | Exit -> let label = Idgen.label "postcall" in
+              let join = node_labeled cfg label in
+              set_succ cfg join ~succ;
+              join
+    | _    -> join_leading_to ~succ in
+  let succ        = [new_cedge succ] in
+  let altrets     = List.map join_leading_to_ce altrets in
+  let unwinds_to  = List.map join_leading_to_ce unwinds_to in
+  let cuts_to     = List.map join_leading_to_ce cuts_to in
+  let abort       = if aborts then [new_cedge cfg.exit] else [] in
+  let edgelist    = List.flatten [succ; altrets; unwinds_to; cuts_to; abort] in
+  (*let edgelist    = List.flatten [altrets; succ; unwinds_to; cuts_to; abort] in*)
+  let illedge     = fun {kills=k; defs=d; node=n} -> {kills=k; defs=d; node=cfg.ill} in
+  let contedges   = Array.of_list (List.map illedge edgelist) in
+  let cal =
+    mk_call i ~pred:cfg.ill ~contedges ~lsucc:cfg.ill ~uses ~reads ~writes
+              ~altrets:(List.length altrets) ~unwinds_to:(List.length unwinds_to)
+              ~cuts_to:(List.length cuts_to) ~spans in
+  let ()  = Auxfuns.foldri (fun i n () -> set_succ_n cfg cal i ~succ:n.node)
+                       edgelist () in
+  cal
+
+let cut_to cfg i ~cuts_to ~aborts ~uses =
+  let cuts_to     = List.map join_leading_to_ce cuts_to in
+  let new_cedge n = {kills = RS.empty; defs = RS.empty; node = n} in
+  let aborts      = if aborts then [new_cedge cfg.exit] else [] in
+    (* UNKNOWN WHETHER EDGE TO EXIT MUST KILL NVR'S.  LET US HOPE NOT. *)
+  let edgelist    = List.flatten [cuts_to; aborts] in
+  let illedge     = fun {kills=k; defs=d; node=n} -> {kills=k; defs=d; node=cfg.ill} in
+  let cut = Cut { cut_num       = new_num ()
+                ; cut_i         = i
+                ; cut_pred      = cfg.ill
+                ; cut_lsucc     = cfg.ill
+                ; cut_contedges = Array.of_list (List.map illedge edgelist)
+                ; cut_fx        = X.fx ()
+                ; cut_uses      = uses
+                } in
+  let ()  = Auxfuns.foldri (fun i n () -> set_succ_n cfg cut i ~succ:n.node) edgelist () in
+  cut
+@
+
+<<simple node constructors>>=
+let instruction cfg i ~succ =
+  let ins = Ins { ins_num  = new_num ()
+                ; ins_i    = i
+                ; ins_pred = cfg.ill 
+                ; ins_succ = cfg.ill
+                ; ins_nx   = X.nx ()
+                } in
+  let ()  = set_succ cfg ins ~succ:succ in
+  ins
+
+let stack_adjust cfg i ~succ =
+  let sta = Sta { sta_num  = new_num ()
+                ; sta_i    = i
+                ; sta_pred = cfg.ill 
+                ; sta_succ = cfg.ill
+                ; sta_nx   = X.nx ()
+                } in
+  let ()  = set_succ cfg sta ~succ:succ in
+  sta
+
+let assertion cfg i ~succ =
+  let ass = Ass { ass_num  = new_num ()
+                ; ass_i    = i
+                ; ass_pred = cfg.ill 
+                ; ass_succ = cfg.ill
+                ; ass_nx   = X.nx ()
+                } in
+  let ()  = set_succ cfg ass ~succ:succ in
+  ass
+
+let branch cfg ~target =
+  let succ = join_leading_to ~succ:target in
+  let bra = Bra { bra_num   = new_num ()
+                ; bra_i     = cfg.inst_info.goto.Ep.embed (label succ)
+                ; bra_pred  = cfg.ill
+                ; bra_succ  = cfg.ill
+                ; bra_lsucc = succ
+                ; bra_nx    = X.nx ()
+                } in
+  let ()  = set_succ cfg bra ~succ in
+  bra
+
+(* SHOULD WE ASSERT THAT THESE TARGETS ARE JOIN POINTS? *)
+let jump cfg i ~uses ~targets =
+  let jum = Jum { jum_num   = new_num ()
+                ; jum_i     = i
+                ; jum_pred  = cfg.ill
+                ; jum_succ  = cfg.ill
+                ; jum_lsucc = cfg.ill
+                ; jum_nx    = X.nx ()
+                ; jum_uses  = uses
+                } in
+  let ()  = set_succ cfg jum ~succ:cfg.exit in
+  jum
+
+let cbranch cfg cond ~ifso ~ifnot =
+  let so_succ  = join_leading_to ~succ:ifso in
+  let not_succ = join_leading_to ~succ:ifnot in
+  let cbr = Cbr { cbr_num   = new_num ()
+                ; cbr_i     = cfg.inst_info.branch.Ep.embed
+                                    (cond, (label so_succ))
+                ; cbr_pred  = cfg.ill
+                ; cbr_true  = cfg.ill
+                ; cbr_false = cfg.ill
+                ; cbr_fx    = X.fx ()
+                } in
+  let ()  = set_tsucc cfg cbr ~succ:so_succ  in
+  let ()  = set_fsucc cfg cbr ~succ:not_succ in
+  cbr
+
+let mbranch cfg i ~targets =
+  let targets = List.map (fun succ -> join_leading_to ~succ) targets in
+  let succs   = Array.make (List.length targets) cfg.ill in
+  let mbr     = Mbr { mbr_num   = new_num ()
+                    ; mbr_i     = i
+                    ; mbr_pred  = cfg.ill
+                    ; mbr_succs = succs
+                    ; mbr_lsucc = cfg.ill
+                    ; mbr_fx    = X.fx ()
+                    } in
+  let () = Auxfuns.foldri (fun i n () -> set_succ_n cfg mbr i ~succ:n) targets () in
+  mbr
+
+let return cfg i ~uses =
+  let ret = Ret { ret_num   = new_num ()
+                ; ret_i     = i
+                ; ret_pred  = cfg.ill
+                ; ret_succ  = cfg.ill
+                ; ret_lsucc = cfg.ill
+                ; ret_nx    = X.nx ()
+                ; ret_uses  = uses
+                } in
+  let ()  = set_succ cfg ret ~succ:cfg.exit in
+  ret
+
+let impossible cfg ~succ =
+  let succ = join_leading_to succ in
+  let imp  = Imp { imp_num       = new_num ()
+                 ; imp_pred      = cfg.ill
+                 ; imp_succ      = cfg.ill
+                 ; imp_exit_succ = cfg.ill
+                 ; imp_fx        = X.fx ()
+                 } in
+  let ()   = set_succ   cfg imp   ~succ:succ     in
+  let ()   = set_succ_n cfg imp 1 ~succ:cfg.exit in
+  imp
+
+let illegal cfg = Ill { ill_num = new_num ()
+                      ; ill_nx  = X.nx ()
+                      ; ill_cfg = cfg
+                      }
+@
+We use some simple shorthands for raising exceptions.
+<<graph utilities>>=
+let imposs = Impossible.impossible
+let undef f n = imposs (Printf.sprintf "%s: undefined on %s nodes" f n)
+let undef_with_node node_num f n =
+  imposs (Printf.sprintf "%s: undefined on %s node %d" f n node_num)
+@
+Some of the utilities need to check the kind or number of a node
+(before the observers have been defined).
+<<graph utilities>>=
+let kind_util = function
+  | Joi _ -> Join
+  | Ins _ -> Instruction
+  | Sta _ -> StackAdjust
+  | Bra _ -> Branch
+  | Cbr _ -> Cbranch
+  | Mbr _ -> Mbranch
+  | Jum _ -> Jump
+  | Cal _ -> Call
+  | Ret _ -> Return
+  | Cut _ -> CutTo
+  | Ent _ -> Entry
+  | Exi _ -> Exit
+  | Ass _ -> Assertion
+  | Ill _ -> Illegal
+  | Imp _ -> Impossible
+  | Boot  -> undef "kind" "boot"
+
+let num_util node = match node with
+  | Joi j -> j.joi_num
+  | Ins i -> i.ins_num
+  | Sta s -> s.sta_num
+  | Bra b -> b.bra_num
+  | Cbr c -> c.cbr_num
+  | Mbr m -> m.mbr_num
+  | Jum j -> j.jum_num
+  | Cal c -> c.cal_num
+  | Ret r -> r.ret_num
+  | Cut c -> c.cut_num
+  | Ent e -> e.ent_num
+  | Exi e -> e.exi_num
+  | Ass a -> a.ass_num
+  | Ill i -> i.ill_num
+  | Imp i -> i.imp_num
+  | Boot  -> undef "num" "boot"
+@ The string for the type of a node improves debugging messages.
+<<graph utilities>>=
+let name = function
+  | Joi _ -> "Join"
+  | Ins _ -> "Instruction"
+  | Sta _ -> "StackAdjust"
+  | Bra _ -> "Branch"
+  | Cbr _ -> "Cbranch"
+  | Mbr _ -> "Mbranch"
+  | Jum _ -> "Jump"
+  | Cal _ -> "Call"
+  | Ret _ -> "Return"
+  | Cut _ -> "CutTo"
+  | Ent _ -> "Entry"
+  | Exi _ -> "Exit"
+  | Ass _ -> "Assertion"
+  | Ill _ -> "Illegal"
+  | Imp _ -> "Impossible"
+  | Boot  -> "Boot"
+@
+Node equality is the most important utility of all.
+We cannot safely compare nodes with [[==]], because the node type is
+an algebraic data type, and the Caml implementation is free to
+consider two nodes unequal even if they are both obtained by, e.g.,
+[[Ins r]].
+On the other hand, we cannot use~[[=]] because it is structural
+equality, and it is not guaranteed to terminate when applied to a
+structure with cycles.
+We therefore roll our own, using [[==]] only on the mutable record
+types, where we know it is safe.
+<<graph utilities>>=
+let eq node node' = match node, node' with
+  | Joi r, Joi r' -> r == r'
+  | Ins r, Ins r' -> r == r'
+  | Sta r, Sta r' -> r == r'
+  | Bra r, Bra r' -> r == r'
+  | Cbr r, Cbr r' -> r == r'
+  | Mbr r, Mbr r' -> r == r'
+  | Jum r, Jum r' -> r == r'
+  | Cal r, Cal r' -> r == r'
+  | Ret r, Ret r' -> r == r'
+  | Cut r, Cut r' -> r == r'
+  | Ent r, Ent r' -> r == r'
+  | Exi r, Exi r' -> r == r'
+  | Ass r, Ass r' -> r == r'
+  | Ill r, Ill r' -> r == r'
+  | Imp r, Imp r' -> r == r'
+  | Boot,  Boot   -> true
+  | _,     _      -> false
+@ 
+We uniquely number each node when it is created.
+<<graph utilities>>=
+let node_num = ref 0
+let new_num ()   = let n = !node_num in node_num := n + 1; n
+@
+Printing node information is useful for debugging.
+<<printing utilities>>=
+let show_rtl = function
+    Some r -> Rtlutil.ToString.rtl r
+  | None   -> ""
+
+let printReg (s, i, w) = Printf.sprintf "%c%d" s i
+let print_node node = 
+      String.concat "" (List.flatten
+       [ [ name node; ": "]
+       ; List.flatten [ [ string_of_int (num node)
+                        ; ": "
+	                      ]
+                      ; if is_join node then labels node
+                        else [show_rtl (to_instr node)]
+                      ; [ "\n" ] ]
+       ; ["  Preds: "]
+       ; List.fold_right (fun n rst -> Printf.sprintf "%d, " (num n) :: rst)
+                         (preds node) []
+       ; ["Succs: "]
+       ; List.fold_right (fun n rst -> Printf.sprintf "%d, " (num n) :: rst)
+                         (succs node) []
+       ])
+@
+If we believe that the lists passed to [[uniq]] will never be long, we may actually
+do better with simple [[List.exists]] comparisons.
+<<graph utilities>>=
+let log m = ()
+let uniq lst = match lst with
+  | [] | [_] -> lst (* premature optimization? *)
+  | _ -> fst (List.fold_left (fun (ns,set as rst) n1 ->
+                                let i = num_util n1 in
+                                if IS.mem i set then rst else (n1::ns, IS.add i set))
+                             ([],IS.empty) lst)
+
+let is_ill node = match node with
+  | Ill _ -> true
+  | _     -> false
+
+let is_exi node = match node with
+  | Exi _ -> true
+  | _     -> false
+
+let ce_getnodes ce = Array.map (fun ce -> ce.node) ce
+@
+
+We merge two join points by combining the information in the second
+([[keep]]) node.
+We also mutate the first join point ([[j1]]) to share the fields of
+the second join point.
+NOT USED, NOT EXPOSED, NOT EXPECTED TO WORK.  
+<<UNDEFINED graph utilities>>=
+(*
+let merge_joins j1 j2 succ lpred = match j1, j2 with
+  | Joi j1, Joi j2 ->
+    { joi_num    = new_num ()
+    ; joi_labels = j1.joi_labels @ j2.joi_labels
+    ; joi_cfg    = j1.joi_cfg
+    ; joi_preds  = j1.joi_preds  @ j2.joi_preds
+    ; joi_succ   = j2.joi_succ
+    ; joi_lpred  = j2.joi_lpred
+    ; joi_jx     = j2.joi_jx
+    }
+  | _                -> undef "merge_joins" "non-join"
+*)
+@
+
+Graph heads are defined as the entry node and the join points.
+<<graph utilities>>=
+let heads cfg =
+  List.filter (fun n -> Pervasives.(<>) (kind_util n) Exit)
+              (uniq (cfg.entry :: SM.fold (fun _ h rst -> h::rst) cfg.label_map []))
+@
+
+We have some simple operations for handling sets of nodes.
+<<join node set operations>>=
+let emptyset              = IS.empty
+let add    n set          = IS.add (num n) set
+let member n set          = IS.mem (num n) set
+@
+
+
+Missing stuff:
+\begin{itemize}
+\item
+ adding impossible edges on infinite loops
+\end{itemize}
+

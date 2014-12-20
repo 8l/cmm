@@ -1,0 +1,119 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% ------------------------------------------------------------------ 
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+\section{Continuations}
+% ------------------------------------------------------------------ 
+
+A continuation is a pointer-sized {\PAL} \emph{value}. As such, it can
+be passed around and stored in registers. However, not all data
+necessary to represent a continuation fit into a pointer and therefore
+the pointer points to a pair of two values: first, a pointer to the code
+belonging to a continuation, and second, a stack pointer value. We call
+this pair the continuation \emph{representation}. The representation is
+stored in the activation record of a procedure and is initialized when
+the procedure becomes active.
+
+To deal with the different aspects of a continuation, this module
+provides an abstraction that is carefully balanced with the target and
+calling convention.
+Each is responsible for different types of information:
+\begin{itemize}
+\item contn: the continuation's layout in memory 
+\item target: sizes
+\item cc: which reg is the sp; how to set the pc and sp
+\end{itemize}
+
+A continuation is a block of memory with two locations: one for a stack
+pointer, and another for a code pointer.
+[[with_overflow]] creates a stack block for a continuation; the
+[[overflow]] input is a block for overflow parameters, and the base
+address of the whole continuation will be relative to the base of
+[[overflow]].
+The observer function
+[[rep]] can be used to get the stack block for the continuation.
+
+A continuation value is a pointer to the block. The block resides in
+the stack frame of a procedure. It initializes the block by passing the
+stack-pointer location and the address of the continuation code to
+[[init_code]]. The call returns a list of instructions that perform the
+initialization of the block.
+<<contn.mli>>=
+type t
+
+val init_code     : t -> Mflow.cut_args -> Rtl.rtl
+val rep           : t -> Block.t     (* entire cont in memory; rep is address *)
+val with_overflow : ('a, 'b, 'c) Target.t -> overflow:Block.t -> t
+@
+
+The [[cut_args]] function takes a pointer to the continuation ([[contn]])
+on the stack and returns the argument record that can be used to make the cut.
+The [[ovblock_exp]] function takes an expression that points to a continuation
+value, the memsize and pointersize of the machine, and the alignment of the overflow
+block. It returns the base address of the overflow block.
+The [[get_contn]] function takes pointers to a pc * sp pair
+from a continuation and returns a pointer to the continuation.
+
+<<contn.mli>>=
+val cut_args    : ('a, 'b, 'c) Target.t -> contn:Rtl.exp -> Mflow.cut_args
+val ovblock_exp : Rtl.exp -> int -> int -> int -> Rtl.exp
+val get_contn   : Rtl.exp * Rtl.exp -> Rtl.exp
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+<<contn.ml>>=
+module M = Mflow
+module R = Rtl
+module T = Target
+
+type t =
+    { block    : Block.t     (* memory block for pair + overflow incoming parms *)
+    ; sp       : Rtl.loc     (* location inside block for sp *)
+    ; pc       : Rtl.loc     (* location in block for code ptr *)
+    }
+
+let init_code t vals =
+    Rtl.par [ Rtl.store t.pc vals.M.new_pc (Rtlutil.Width.loc t.pc)
+            ; Rtl.store t.sp vals.M.new_sp (Rtlutil.Width.loc t.sp)
+            ]
+
+let rep t = t.block
+
+let offset base n w  = Rtlutil.addk w base n
+
+let pc_sp base t =
+  let (_, _, cell)    = t.T.memspace in
+  let (Rtl.C n) as ct = Cell.to_count cell t.T.pointersize in
+  let mem addr        = Rtl.mem Rtl.none t.T.memspace ct addr in
+  let pc              = mem (offset base 0 t.T.pointersize) in
+  let sp              = mem (offset base n t.T.pointersize) in
+  pc, sp
+
+let ovblock_exp e memsize ptrsize alignment = 
+  let ptrcells = ptrsize / memsize in
+	offset e (Auxfuns.round_up_to alignment (2 * ptrcells)) ptrsize
+
+let with_overflow t ~overflow =
+  let size = t.T.pointersize / t.T.memsize in
+  let my_pc_sp =
+    Block.relative (Block.base overflow) "continuation block"
+      Block.at ~size:(2 * size) ~alignment:t.T.alignment in
+  let my_rep = Block.cathl overflow my_pc_sp in
+  let pc, sp = pc_sp (Block.base my_rep) t in
+  { block = my_rep; sp = sp; pc = pc }
+
+let cut_args t ~contn =
+  let w = t.T.pointersize in
+  let pc, sp = pc_sp contn t in
+  {Mflow.new_pc=R.fetch pc w; Mflow.new_sp=R.fetch sp w}
+
+let get_contn (newpc, newsp) = newpc
+@

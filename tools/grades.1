@@ -1,0 +1,42 @@
+.TH GRADES 1 "$ Date: $"
+.\" For nroff, turn off justification.  Always turn off hyphenation; it makes
+.\" way too many mistakes in technical documents.
+.hy 0
+.if n .na
+.\"
+.SH NAME
+grades \- extract quality grades from files
+.SH SYNOPSIS 
+\fBgrades\fP [\fIfile\fP ...]
+.SH DESCRIPTION
+\fBGrades\fP extracts grade annotations from \fIfiles\fP and prints them to
+stdout. The output format is a single line per file with four entires,
+separated by tabs: file name, quality, importance, urgency. For a
+description of the grading system, see below.
+.SH OPTIONS
+No options.
+.SH GRADE SYNTAX
+A grade annotation is a single line of the form \fB%%Grades:\fP \fIquality\fP
+\fIimportance\fP \fIurgency\fP, like this:
+.IP
+.B "%%Grades: B Central Later"
+.PP
+The annotation must be a line of its own and start with \fB%%Grade:\fP.
+Grades have three axes: quality, importance, and urgency. The three axes
+have the following respective domains:
+.TP
+Quality:
+A B C D E F
+.TP
+Importance:
+Central Subsystem Peripheral
+.TP
+Urgency:
+Immediate Soon Later
+.SH BUGS
+Do we need options for more output formats?
+.SH AUTHOR
+Christian Lindig <lindig@eecs.harvard.edu>
+.SH VERSION
+$Id: grades.1,v 1.4 2006-03-08 22:33:16 nr Exp $
+

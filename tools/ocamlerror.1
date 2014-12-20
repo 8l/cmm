@@ -1,0 +1,76 @@
+.TH GRADES 1 "$ Date: $"
+.\" For nroff, turn off justification.  Always turn off hyphenation; it makes
+.\" way too many mistakes in technical documents.
+.hy 0
+.if n .na
+.\"
+.SH NAME
+ocamlerror \- annotate OCaml stack traces with source code positions
+.SH SYNOPSIS
+\fBocamlerror\fP [\fIdirectory\fP] ...
+.SH DESCRIPTION
+\fBocamlerror\fP reads a stack trace produced by an OCaml byte code binary
+from stdin, annotates it with source code positions, and writes it to
+stdout. The source code positions in parentheses are calculated from the
+character offsets that are part of the stack trace:  
+.IP
+Called from module Set, character 8360
+.br
+Called from module Cfg3, character 31510 (cfg3.nw: 785, column 40)
+.br
+Called from module Astasm, character 4745 (astasm.nw: 238, column 39)
+.br
+Called from module List, character 1783
+.br
+Called from module List, character 1783
+.br
+Called from module Ast3ir, character 30374 (ast3ir.nw: 1168, column 48)
+.PP
+To calculate a source code positions from a character positions
+\fBocamlerror\fP must read a modules' source file. It searches for the file
+in the directories given on the command line. If \fBocamlerror\fP cannot
+find the source file for a module from the stack trace it emits the line
+from the stack trace unaltered.
+.SH OPTIONS
+No options. Directories \fBocamlerror\fP searches for source file are
+passed on the command line. The current directory is implicitly the last
+element of the search path.
+.SH HINTS
+A byte code binary emits its stack trace to stderr, but \fBocamlerror\fP
+expects its input on stdin. The easiest way is often to use the mouse to
+paste a stack trace into stdin of \fBocamlerror\fP. Alternatively, you have
+to use output redirection in your shell:
+.nf
+    ./buggy      |& ocamlerror ../lib       # in csh(1)
+    ./buggy 2>&1 |  ocamlerror ../lib       # in sh(1)
+.fi
+See the ocamlc(1) documentation how to enable stack traces: to emit stack
+traces, programs must be compiled with \fBocamlc -g\fP \fBand\fP the runtime
+system ocamlrun(1) must use the \fB-b\fP flag.
+.SH VERSION
+\fBocamlerror\fP works with OCaml versions 3.01 and above. Stack traces
+were introduced in OCaml 3.01.
+.SH EXIT CODE
+In case of an error \fBocamlerror\fP exits with code 1, and 0 otherwise.
+.SH SEE ALSO
+ocaml(1), http://www.ocaml.org/
+.SH AUTHOR
+Christian Lindig <lindig@eecs.harvard.edu>
+.PP
+\fBocamlerror\fP is part of the \fBQuick C--\fP compiler project for the
+\fBC--\fP language. Visit http://www.cminusminus.org/ for more information.
+.SH COPYING
+This program is in the public domain.
+.PP
+THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
+WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR AND COPYRIGHT HOLDER BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY,
+OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
+TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
+THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.

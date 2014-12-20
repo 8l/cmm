@@ -1,0 +1,92 @@
+# ------------------------------------------------------------------ 
+# $Id: mkfile,v 1.13 2004-08-04 21:33:40 nr Exp $ 
+# ------------------------------------------------------------------ 
+
+NAME = asdl
+TOP  = ..
+<      $TOP/config/config.mk
+
+# ------------------------------------------------------------------ 
+# paths
+# ------------------------------------------------------------------ 
+
+LIBCMA  = ${B}$NAME.cma      # bytecode library
+LIBCMXA = ${B}$NAME.cmxa     # native library
+
+INTERP = evaluating
+DEPEND = ${B}DEPEND.$INTERP  # store depend information here
+
+LIBDIR =    ../lib
+
+# ------------------------------------------------------------------ 
+# (high level) virtual targets
+# ------------------------------------------------------------------ 
+
+all:V:        $LIBCMA
+all.opt:V:    $LIBCMXA
+depend:V:     $DEPEND
+dvi \
+html:VQ:
+	echo "nothing to be done for $target"
+
+# update and update.opt targets
+<$TOP/config/libupdate.mk
+update:V: libupdate
+update.opt:V: libupdate.opt
+
+# ------------------------------------------------------------------ 
+# cleanup
+# ------------------------------------------------------------------ 
+
+clean.opt:V:
+	rm -f $B*.cmx $B*.cmxa $B*.o $B*.a
+
+clean:V: clean.opt
+	rm -f $B*.cmi $B*.cmo $B*.cma
+
+clobber:V: dep-clobber clean
+	rm -f *.aux *.log *.dvi *.toc *.html
+	rm -f $B*.ml $B*.ml[ily] $B*.output
+
+# ------------------------------------------------------------------ 
+# rules and tools for OCaml
+# ------------------------------------------------------------------ 
+
+<$TOP/config/noweb.mk
+<$TOP/config/ocaml.mk
+NOPOLY=/dev/null
+
+#
+# compiler flags used by the rules just included
+#
+
+OCAMLC_FLAGS =  $OCAMLC_FLAGS -I $LIBDIR
+OCAMLO_FLAGS =  $OCAMLO_FLAGS -I $LIBDIR
+
+# ------------------------------------------------------------------ 
+# important file sets
+# ------------------------------------------------------------------ 
+
+MLI =   share.mli sexpLex.mli sexpPkl.mli pklInt.mli stdPkl.mli\
+        stdPrims.mli stdPrimsUtil.mli
+
+ML  =   share.ml  sexpLex.ml  sexpPkl.ml  pklInt.ml  stdPkl.ml \
+        stdPrims.ml  stdPrimsUtil.ml  
+
+ML  = ${ML:%.ml=$B%.ml}
+MLI = ${MLI:%.mli=$B%.mli}
+CMO = ${ML:%.ml=%.cmo}
+CMX = ${ML:%.ml=%.cmx}
+
+SCAN = $ML $MLI
+<$TOP/config/depend.mk
+
+# ------------------------------------------------------------------ 
+# build the libraries
+# ------------------------------------------------------------------ 
+
+$LIBCMA:  dep-chk $CMO
+	$OCAMLC $OCAMLC_FLAGS -a -o $target $CMO
+
+$LIBCMXA: dep-chk $CMX
+	$OCAMLO $OCAMLO_FLAGS -a -o $target $CMX

@@ -1,0 +1,30 @@
+#! /usr/bin/perl -w
+#
+# $Id: ocamlburgfix,v 1.6 2004-11-02 20:43:34 nr Exp $
+#  
+# Usage: ocamlburg foo.mlb | ./ocamlburgfix foo.ml 
+# See documentation below.
+
+if ($#ARGV != 0) {
+    print STDERR "usage   : $0 file.ml\n";
+    print STDERR "typical : ocamlburg foo.mlb | $0 foo.ml\n";
+    exit 1;
+}
+
+$file = $ARGV[0];       # file name of output file
+$n = 0;                 # line number
+
+open(OUTFILE, ">$file") or die "cannot open $file: $!";
+while (defined($line = <STDIN>)) {
+    $n++;
+    if ($line =~ /^# 000 "\/dev\/stdout"/) {
+        printf(OUTFILE "# %d \"%s\"\n", $n+1, $file);
+        next;
+    } else {
+        print(OUTFILE  $line);
+    }    
+}
+close(OUTFILE) or die "cannot close $file: $!";
+
+exit 0;
+__END__

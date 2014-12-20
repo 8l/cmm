@@ -1,0 +1,338 @@
+# 
+# Lua interpreter - library and standalone binary
+#
+# ------------------------------------------------------------------ 
+# call 'mk depend' after sources have been checked out of CVS!
+# ------------------------------------------------------------------ 
+#
+# To add a new module to the library:
+# (1) add it to LIBML		if it is a .ml  file
+# (2) add it to LIBMLI		if it is a .mli file	
+#
+# If your module must be scanned for dependencies but is not covered
+# by (1) or (2), add it to SCAN
+#
+# If you have trouble with depdencies check LIBML, LIBMLI, and SCAN.
+# Rebuild dependencies with "mk depend".
+
+# This interpreter is being used for performance experiments.  These
+# experiments involve plugging in multiple different interperter
+# modules.  For that reason, we configure the mkfile as follows:
+#    * Source for the interpreter is in ${INTERP}luainterp.nw
+#    * Derived ML source goes into $INTERP/luainterp.ml*.
+#    * Libraries are named lua-$INTERP.cma, etc.
+#    * Binaries are named oclua-$INTERP, oclbench-$INTERP, etc.
+#    * `mk update' deposits the default `std' versions.
+#      If others are tried, mk `doesn't know how to mk...'
+#    * Dependencies now live in DEPEND.$INTERP
+
+TOP    =        ..
+LIBDIR =        ../lib
+BINDIR =        ../bin
+
+INTERP       =  std
+# interp must appear before noweb is included
+
+<$TOP/config/config.mk
+<$TOP/config/noweb.mk
+<$TOP/config/ocaml.mk
+
+NOPOLY=/dev/null
+
+PROFILE=$P
+OCAMLC_FLAGS = 	$OCAMLC_FLAGS -I $B$INTERP -I $B$LIBDIR
+OCAMLO_FLAGS =	$OCAMLO_FLAGS -I $B$INTERP -I $B$LIBDIR 
+
+NWSRC=`echo *.nw`
+NWHTML=${NWSRC:%.nw=%.html}
+
+DEPEND = ${B}DEPEND.$INTERP
+
+# ------------------------------------------------------------------ 
+# high level (virtual) targets
+# ------------------------------------------------------------------ 
+
+all:V: 		${B}lua-$INTERP.cma  oclua-$INTERP     oclbench-$INTERP
+all.opt:V:      ${B}lua-$INTERP.cmxa oclua-$INTERP.opt oclbench-$INTERP$PROFILE.opt
+
+update:V:	update-msg $B$LIBDIR/lua.cma  $BINDIR/oclbench-$INTERP
+update.opt:V:   update-msg $B$LIBDIR/lua.cmxa update-bench.opt
+update-bench.opt:V: $BINDIR/oclbench-$INTERP$PROFILE.opt
+
+update-msg:VQ:
+	if [ $INTERP = std ]; then true
+	else echo "error: to mk update, must have INTERP=std" 1>&2; exit 1
+	fi
+
+depend:V: dirs $DEPEND
+dirs:V:
+	[ -d $B$INTERP ] || mkdir -p $B$INTERP
+
+doc:V:		lua.ps
+
+html:V:		$NWHTML
+dvi:VQ:
+	echo "nothing to be done for $target"     
+
+COUNTED=\
+  lua.nw \
+  luaast.nw \
+  luabaselib.nw \
+  luahash.nw \
+  luaiolib.nw \
+  lualib.nw \
+  luamathlib.nw \
+  luarun.nw \
+  luastrlib.nw \
+  luasyntax.nw \
+  luavalue.nw \
+  stdluainterp.nw \
+
+
+count:V: $COUNTED
+	nocount $prereq
+
+
+clean.opt:V:
+	rm -f $B*.cmx $B*.cmxa $B*.o $B*.a
+	rm -f $B$INTERP/*.cmx $B$INTERP/*.cmxa $B$INTERP/*.o $B$INTERP/*.a
+
+clean:V: clean.opt
+	rm -f $B*.cmi $B*.cmo $B*.cma
+
+clobber:V: dep-clobber clean
+	rm -f *.aux *.log *.dvi *.toc *.tex *.inc *.html
+	rm -f $B*.ml $B*.ml[ily] $B*.output
+	rm -f $B$INTERP/*.ml $B$INTERP/*.ml[ily] $B$INTERP/*.output
+	rm -f $NWHTML
+	rm -f tspecl lspecl *.icn
+	rm -f oclua-* oclua-*.opt
+	rm -f lua.ps
+	rm -f oclbench-*
+	rm -f luaclient
+
+standalone:V: lua-ml.tar
+standalonetest:V: lua-ml.tar
+	rm -rf lua-ml
+	tar xf lua-ml.tar
+	(cd lua-ml; make -f Makefile.alone depend; make -f Makefile.alone)
+	rm -rf lua-ml
+
+xluaclient.tex:D:	luaclient.nw
+	noweave -delay $prereq > $target
+
+xluaclient.html:	luaclient.tex
+	hevea nw.hva $prereq
+	tidy -f /dev/null -im $target
+
+
+ALONE=luasyntax.nw lua.nw luaast.nw luabaselib.nw luahash.nw \
+	luaiolib.nw luacamllib.nw lualib.nw \
+        luamathlib.nw luarun.nw luastrlib.nw luavalue.nw\
+        log.nw ../cllib/srcmap.nw\
+        main.nw bench.nw\
+        luaclient.nw luaclient.html\
+        stdluainterp.nw\
+        Makefile.alone README.ALONE\
+	refman.ps \
+        ../bin/nofake nw.hva
+
+
+lua-ml.tar:D: $ALONE
+	rm -rf /tmp/lua-ml
+	mkdir /tmp/lua-ml
+	mkdir /tmp/lua-ml/std
+	scp -p $prereq /tmp/lua-ml
+	chmod +x /tmp/lua-ml/nofake
+	(cd /tmp; tar cvf - lua-ml) > $target
+
+# ------------------------------------------------------------------ 
+# api documentation
+# ------------------------------------------------------------------ 
+
+lua.tex: lua.nw
+	noweave -x lua.nw > lua.tex
+
+# ------------------------------------------------------------------ 
+# lua library
+# ------------------------------------------------------------------ 
+# The order of files determines the link order. No file must use any
+# of its successors
+
+LIBML = 	log.ml		\
+		luahash.ml	\
+		luafloat.ml	\
+		luavalue.ml	\
+		luaast.ml	\
+		luaparser.ml	\
+		luascanner.ml	\
+		luabaselib.ml	\
+		lualib.ml		\
+		$INTERP/luainterp.ml	\
+		luarun.ml	\
+		lua.ml          \
+		luastrlib.ml	\
+		luamathlib.ml	\
+		luaiolib.ml	\
+		luacamllib.ml	\
+
+LIBML  = ${LIBML:%.ml=$B%.ml}
+LIBCMO = ${LIBML:%.ml=%.cmo}
+LIBCMX = ${LIBML:%.ml=%.cmx}
+LIBOBJ = ${LIBML:%.ml=%.o}
+
+# order does not matter here - so keep it alphabetical
+# we wan't easily deduce LIBMLI from LIBML because there might be
+# interfaces with no implementation and vice versa.
+
+LIBMLI = 	log.mli		\
+		lua.mli		\
+		luaast.mli	\
+		luabaselib.mli	\
+		luacamllib.mli	\
+		$INTERP/luainterp.mli	\
+		luaiolib.mli	\
+		lualib.mli	\
+		luamathlib.mli	\
+		luaparser.mli	\
+		luarun.mli	\
+		luastrlib.mli	\
+		luavalue.mli	\
+		luahash.mli	\
+
+LIBMLI = ${LIBMLI:%.mli=$B%.mli}
+LIBCMI = ${LIBMLI:%.mli=%.cmi}
+
+rawcount:V: $LIBMLI $LIBML	
+	wc $prereq
+
+${B}lua-$INTERP.cma:	$LIBCMO $LIBCMI
+	$OCAMLC $OCAMLC_FLAGS -a -o $target $LIBCMO
+
+# this target also creates *.o files and a lua.a library
+${B}lua-$INTERP.cmxa:	$LIBCMX	$LIBCMI 
+	$OCAMLO $GPROF $OCAMLO_FLAGS -a -o $target $LIBCMX
+
+
+# copy library and interfaces to $LIBDIR. Note that lua-std.a is
+# implicitly built when lua-std.cmxa is built.
+<$TOP/config/libupdate.mk
+$B$LIBDIR/lua.cma:Q: libupdate
+	cp ${B}lua-std.cma $target
+
+$B$LIBDIR/lua.cmxa:Q: libupdate.opt
+	cp ${B}lua-std.cmxa $target
+	cp ${B}lua-std.a $B$LIBDIR/lua.a
+
+$BINDIR/oclbench%:Q: oclbench%
+	cp $prereq $target
+
+# ------------------------------------------------------------------ 
+# lua standalone interpreter (for tests)
+# ------------------------------------------------------------------ 
+
+ML =	${B}main.ml 
+CMO =	${ML:%.ml=%.cmo} 
+CMX =	${ML:%.ml=%.cmx}
+# PROFCMO is defined in ocaml.mk when profiling
+
+oclua-$INTERP:	${B}lua-$INTERP.cma $CMO
+	$OCAMLC $OCAMLC_FLAGS -o $target $PROFCMO unix.cma cllib.cma $prereq
+
+oclua-$INTERP.opt: 	${B}lua-$INTERP.cmxa $CMX
+	$OCAMLO $GPROF $OCAMLO_FLAGS -o $target unix.cmxa cllib.cmxa $prereq 
+
+oclbench-$INTERP:	${B}lua-$INTERP.cma ${B}bench.cmo
+	$OCAMLC $OCAMLC_FLAGS -o $target $PROFCMO unix.cma cllib.cma $prereq 
+
+oclbench-$INTERP$PROFILE.opt: 	${B}lua-$INTERP.cmxa ${B}bench.cmx
+	$OCAMLO $GPROF $OCAMLO_FLAGS -o $target unix.cmxa cllib.cmxa $prereq 
+
+luaclient: ${B}lua-$INTERP.cma ${B}luaclient.cmo
+	$OCAMLC $OCAMLC_FLAGS -o $target unix.cma cllib.cma $prereq
+
+
+# ------------------------------------------------------------------ 
+# Source files
+# The following files are scanned for dependencies. We have to list them
+# here to make sure they get extracted from Noweb files and generated if
+# neccessary.
+
+SCAN = 		$LIBML $LIBMLI ${B}main.ml ${B}bench.ml
+DEPFLAGS = -I $B$INTERP
+<$TOP/config/depend.mk
+
+src:V: $SCAN
+
+# ------------------------------------------------------------------ 
+# tests
+# ------------------------------------------------------------------ 
+
+TEST=03 04 05 06 07 08 09 10 12 02 16 19 n00
+
+test.opt:V: 	oclua-$INTERP.opt
+	for i in $TEST; do ./$prereq test/$i.lua; done	
+
+test:V: 	oclua-$INTERP
+	for i in $TEST; do ./$prereq test/$i.lua; done	
+
+# ------------------------------------------------------------------ 
+# main interpreter. We special rules to extract sources
+# from noweb files. 
+
+$B$INTERP/luainterp.ml:D: stdluainterp.nw xinterp-$INTERP.nw
+	$NOTANGLE -L"$LINE" -filter "$NOCOND" -filter ./camlboxval -Rluainterp.ml $prereq > $target
+
+stdluainterp.inc:D: stdluainterp.nw
+	noweave -delay -filter ../config/autodefs.ocaml -filter ./texboxval -index $prereq > $target
+
+$B$INTERP/luainterp.mli:D: stdluainterp.nw
+	$NOTANGLE -L"$LINE" -filter "$NOCOND" -Rluainterp.mli $prereq | cpif $target
+
+$B$INTERP/&.cmi:Q: $B$INTERP/&.mli
+	($config_test -n "$B" && cd $B; $OCAMLC $OCAMLC_FLAGS -c $INTERP/$stem.mli)
+
+$B$INTERP/&.cmo:Q: $B$INTERP/&.ml
+	($config_test -n "$B" && cd $B; $OCAMLC $INSTR $OCAMLC_FLAGS -c $INTERP/$stem.ml)
+
+$B$INTERP/&.cmx:Q: $B$INTERP/&.ml
+	($config_test -n "$B" && cd $B; $OCAMLO $INSTR $GPROF $OCAMLO_FLAGS -c $INTERP/$stem.ml)
+
+# ------------------------------------------------------------------ 
+# lua scanner and parser. We need some extra rules to extract sources
+# from noweb files. 
+
+${B}luaparsex.mly: luasyntax.nw
+	[ -r $target ] && chmod +w $target
+	$NOTANGLE -Rluaparser.mly $prereq | 
+        sed "s/','/COMMA/g;	\
+            s/'{'/LBRA/g;	\
+            s/'}'/RBRA/g;	\
+            s/'<'/LT/g;		\
+            s/'>'/GT/g;		\
+            s/':'/COLON/g;	\
+            s/';'/SEMI/g;	\
+            s/'\\^'/HAT/g;	\
+            s/'\\*'/STAR/g;	\
+            s@'/'@SLASH@g;	\
+            s/'('/LPAR/g;	\
+            s/')'/RPAR/g;	\
+            s/'='/GETS/g;	\
+            s/'+'/PLUS/g;	\
+            s/'-'/MINUS/g;	\
+            s/'\\.'/DOT/g;	\
+            s/'\\['/LSQ/g;	\
+            s/'\\]'/RSQ/g" > $target
+	chmod -w $target
+
+${B}luascanner.mll:D: luasyntax.nw
+	$NOTANGLE -Rluascanner.mll $prereq > $target
+
+${B}luafloat.mll:D: luavalue.nw
+	$NOTANGLE -Rluafloat.mll $prereq > $target
+
+${B}luaparser.ml: ${B}luaparsex.ml
+	cp $prereq $target
+
+${B}luaparser.mli:D: ${B}luaparsex.mli luasyntax.nw
+	(sed '/^val /,$d' ${B}luaparsex.mli; $NOTANGLE -L"$LINE" -Rluaparser.mli luasyntax.nw) > $target

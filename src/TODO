@@ -1,0 +1,132 @@
+# vim: ts=8 sw=4 et: 
+
+ $Id: TODO,v 1.9 2002-10-01 17:24:01 lindig Exp $
+
+o Argument lists for testing calling conventions should cause at least
+  two overflowing parameters such that a wrong order in the overflow
+  block gets detected. The current algorithm that traverses an automaton
+  will miss this if all overflow parameters have the same alignment.
+
+o On the Alpha, the SP ($30) is set back in the epilog before the return
+  address is fetched from the stack. It must be the other way round.
+
+        addq $30, 16, $30       /* deallocate frame */
+        ldq $0, -16($30)        /* fetch return address */
+        mov $0, $26; ret ($26)  /* return */
+
+  This problem went away after I modified the calling convention to put
+  the return address in the right register. 
+
+o Some gross hacks in the Alpha backend: prolog code emitted in 
+  alphaasm.nw. Unsatisfying representation and recognition of call and
+  return. Must be fixed with more general design.
+
+o Provide more systematic interface to calling convention analysis
+  functions in automatongraph.nw. A better module name would not hurt
+  either. 
+
+o Clarify signed/unsigned conversion in Bits. The documentation there
+  seems out of date with what is really happening.
+
+o Block.cathl, Block.overlap: Both these functions should take any number
+  of args, which could be blocks or lists of blocks.  Default width if it
+  turns out empty should be backend.target.wordsize.  This may be easier
+  to program in Lua than Caml.
+
+o : nr@labrador 11691 ; ./tqc hello.c--
+  file hello.c--, line 7, character 21 - line 11, character 4 Error: types of
+  +initial values do not match declared type
+  Error: compilation aborted because of errors.
+  Error: Exit with exit code 1
+
+  Several things about the error message should be improved:
+
+      * the source coordinates use too much space
+      * the message should give both types in question
+      * the last line of the message serves no useful purpose that I can see
+      * I'm skeptical about the penultimate line also
+
+o frame layout and use of the stack pointer to support tail calls
+  on x86
+
+o test cases and stack measurements for tail vs non-tail on x86
+
+o Lua support for calling conventions 
+
+o calling convention and frame layout for sparc as a hard test
+  case
+
+o calling conv and layout for other platforms?
+
+o fix Bits to use the Uint64 operations when needed (e.g., in ltu)
+  Drop Uint64.add and Uint64.sub, since they are identical to the
+  Int64 versions.
+
+o Test suite:  
+
+    improve quality and understanding of test suite
+
+    `short': excludes the long tests; run by lazy developers
+
+    `test': includes all tests, but runs a test on multiple targets only when
+              it is actually useful to do so; run by thorough developers
+
+    `redundant': everything; run by the nightly cron job
+
+
+    Of course, we'll need additional rules for specific tests, e.g., run
+    just the x86-assembly tests, but this is a start.
+
+o move knowledge of symbols entirely into the assembler, and expunge
+  Symbol.t from the front end of the compiler.  Arrange for
+  unannounced symbols to be local by default.
+
+o Alter Idgen so that generated symbols, if they make to the assembly
+  language, begin with "L". (may ultimately have to property of the assembler)
+
+o provide a much more flexible writedot function: first parm is name of
+  file to write, or stdout if left nil second parm is table with fields
+  compress and live, or both false if left nil table should also support
+  other dot properties...     figure out correct strategy to use this
+  function in the pipeline, then, finally expunge Asm.dot
+
+o Make the front end aware of the target and make these enhancements:
+
+      * Front end must reject unknown calling convention, unknown registers.
+      
+      * Front end must check the calling convention of a jump is the same as
+        the enclosing procedure. 
+      
+      * The target must advertise to the front end the maximum alignment it
+        can support in stackdata.  This is tough because it's a cc property.
+        Then the front end can issue a sensible error message instead of a
+        core dump.
+  
+
+o retire Bitops.nw, moving any useful stuff into Bits
+
+o Introduce an abstract type for link-time constant expressions, which
+  can be freely converted to Rtl.exp, but which only an assembler can
+  build from an Rtl.exp.  (The rep can be Rtl.exp).  Then introduce an
+  assembler method that converts from Rtl.exp to linkexp option.  In
+  the front end, use this method to check that initialized data is
+  handled correctly.  Use the Reladdr module to build a `standard'
+  implementation that most assemblers will use, and finally expunge
+  the Reloc module.
+
+o add assembler support for querying whether an expression is a
+  link-time constant expression, and use Rtl.exp as the interface for 
+
+o possible demo back end for another platform (estimate difficulty)
+
+o fix bug in astasm: 8-bit initialized data is rendered as 32-bit
+  data.  Also, too many top-level sections for readability.
+
+o use least common multiple for alignment in memalloc (careful special cases)
+  or else be sure that every alignment is a power of 2
+
+o place variables using automata --- start with stack placement
+
+o in Luaiolib, make open and close conform to Lua 4.0 or something else
+  rational.
+

@@ -1,0 +1,181 @@
+# ------------------------------------------------------------------ 
+# $Id: mkfile,v 1.31 2006-04-22 15:31:52 nr Exp $
+# ------------------------------------------------------------------ 
+
+NAME = libqc--
+TOP  = ..
+<      $TOP/config/config.mk
+B=""
+
+LIBA   = ${B}$NAME.a
+DEPEND = ${B}DEPEND
+
+QC=`if [ -x $TOP/bin/qc--.opt ]; then echo $TOP/bin/qc--.opt; else echo $TOP/bin/qc--; fi`
+QCFLAGS=
+
+# ------------------------------------------------------------------ 
+# (high level) virtual targets
+# ------------------------------------------------------------------ 
+
+NW   = pcmap.nw gcc-linux.nw runtime.nw
+HTML = ${NW:%.nw=%.html}
+TEX  = ${NW:%.nw=%.tex}
+INC  = ${NW:%.nw=%.inc}
+
+all:V:     $LIBA pcmap.ld qc--runtime.h 
+all.opt:V: all
+sums:V:	   md5sums
+doc:V:     doc.ps
+dvi:V:     doc.dvi
+html:V:    $HTML
+depend:V:  $DEPEND
+install:V: $LIBA pcmap.ld qc--runtime.h $install_lib $install_inc
+	cp $LIBA pcmap.ld $install_lib
+	cp qc--runtime.h $install_inc
+install.opt:V: install
+
+test:V: all test.exe
+
+doc.dvi: doc.tex $INC
+
+update:V: all
+	cp $LIBA pcmap.ld $TOP/lib
+	cp qc--runtime.h $TOP/include
+
+update.opt:V: update
+
+# ------------------------------------------------------------------ 
+# cleanup
+# ------------------------------------------------------------------ 
+
+clean.opt:V:
+	rm -f $B*.o $B*.a $B*.s thread.c-- cut.c-- yield.c-- 
+
+clean:V: clean.opt
+
+clobber:V: clean
+	rm -f $TEX
+	rm -f DEPEND $C $H *.s
+	rm -f pcmap.ld *.exe
+	rm -f *.aux *.log *.dvi *.toc *.inc *.ps *.html
+
+# ------------------------------------------------------------------ 
+# rules and tools
+# ------------------------------------------------------------------ 
+
+<$TOP/config/noweb.mk
+<$TOP/config/latex.mk
+
+# override weave
+
+pcmap.inc:D: pcmap.nw
+	noweave -delay -autodefs c -index $prereq > $target
+runtime.inc:D: runtime.nw
+	noweave -delay -autodefs c -index $prereq > $target
+gcc-linux.inc:D: gcc-linux.nw
+	noweave -delay -autodefs c -index $prereq > $target
+
+
+# ------------------------------------------------------------------ 
+# important file sets
+# ------------------------------------------------------------------ 
+
+C = runtime.c pcmap.c gcc-linux.c
+CMM = cut.c-- thread.c-- yield.c--
+H = qc--runtime.h pcmap.h
+
+C = ${C:%.c=$B%.c}
+CMM = ${CMM:%=$B%}
+H = ${H:%.h=$B%.h}
+O = ${C:%.c=%.o} ${CMM:%.c--=%.o} $config_arch.o
+
+SCAN = $C trace.c
+# <$TOP/config/depend.mk
+$DEPEND:D: $SCAN mkfile $H
+	gcc -MM $SCAN > $DEPEND
+<$DEPEND
+
+dep-chk:V:
+	echo
+
+# ------------------------------------------------------------------ 
+# build libraries and checksums
+# ------------------------------------------------------------------ 
+
+$LIBA:D:  $O
+	ar cr $target $prereq
+
+md5sums:D: $O $LIBA ../test2/sign-runtime
+	../test2/sign-runtime $O $LIBA > $target
+
+../test2/sign-runtime:Q:
+	(cd ../test2; mk sign-runtime)
+
+
+test.exe: test.o trace.o $LIBA pcmap.ld
+	gcc -o $target $prereq
+
+pcmap.ld:D: pcmap.nw
+	$NOTANGLE $prereq -R$target > $target
+
+'^'(cut|thread|yield).o'$':RD: '\1'.s
+	as -o $target $stem1.s
+
+# -g is omitted from the following rules because it puts the
+# compilation directory into the .o file, which in turn breaks the .5
+# signature
+
+'^'(runtime|pcmap|gcc-linux|trace).o'$':RD: '\1'.c
+	gcc -ansi -pedantic -Wall -Wno-long-long -c -I. $stem1.c
+
+# ------------------------------------------------------------------ 
+# machine-dependent code
+# ------------------------------------------------------------------ 
+
+x86-linux.o: x86cont.s
+	as -o $target $prereq
+
+x86-cygwin.o: x86cont.s
+	as -o $target $prereq
+
+x86cont.s:D: x86cont.nw
+	$NOTANGLE $prereq -R$target > $target
+
+powerpc-darwin.o:
+	cc -c -o $target -x c /dev/null
+
+sparc-solaris.o:
+	gcc -ansi -pedantic -Wall -Wno-long-long -c -o $target -x c /dev/null
+
+# ------------------------------------------------------------------ 
+# extra rules for cases not covered by noweb.mk
+# ------------------------------------------------------------------ 
+
+&.h:D: &.nw
+	$NOTANGLE -L $prereq -R$target > $target
+
+qc--runtime.h:D: runtime.nw
+	$NOTANGLE -L -filter "../config/nocond $config_arch" $prereq -R$target > $target
+
+runtime.c:D: runtime.nw
+	$NOTANGLE -L -filter "../config/nocond $config_arch" $prereq -R$target > $target
+
+${B}cut.c--:D: runtime.nw
+	$NOTANGLE -L $prereq -R$target > $target
+
+${B}thread.c--:D: runtime.nw
+	$NOTANGLE -L $prereq -R$target > $target
+
+${B}yield.c--:D: runtime.nw
+	$NOTANGLE -L $prereq -R$target > $target
+
+'^'${B}(cut|thread|yield).s'$':DR: ${B}'\1'.c-- $QC
+	tmp=/tmp/$stem1$$
+	$QC $QCFLAGS $config_swapopt -S -o $tmp ${B}$stem1.c--
+	sed '/globalsig/d;/ref_to_global_area/d' $tmp > $target
+	rm -f $tmp
+
+'^'${B}(test).o'$':DR: ${B}'\1'.c-- $QC
+	$QC $QCFLAGS $config_swapopt -c -globals ${B}$stem1.c--
+
+<      $TOP/config/install.mk

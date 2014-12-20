@@ -1,0 +1,298 @@
+\documentclass[twoside]{report}
+\usepackage{noweb}
+\title{The Quick {\PAL} Interpreter}
+\author{Reuben Olinsky}
+\usepackage{tabularx,array} 
+\usepackage[hypertex]{hyperref}
+\usepackage{path}
+\usepackage{amsmath}
+\usepackage{grammar}
+\usepackage[dvips]{graphicx}  
+\input{../config/macros.tex}
+\pagestyle{noweb}
+\usepackage{alltt}
+\begin{document} 
+
+\newcommand\nointro{1}
+
+\pagenumbering{roman}
+\maketitle
+\cleardoublepage
+\tableofcontents
+\cleardoublepage
+\pagenumbering{arabic}
+
+
+\newcommand\myinput[1]{\cleardoublepage\input{#1}}
+
+\cleardoublepage
+\part{Overall thoughts and documentation}
+
+\chapter{Known Issues/Thoughts/Worries}
+
+\paragraph{Translation from compiler}
+\begin{itemize}
+    \item  Interpreter is not told correct number of global registers.
+    \item  Multiple returns have not been thoroughly tested 
+      (contingent upon continuations; see above)
+    \item  Translation of guarded-RTLs is not tested.
+\end{itemize}
+
+ \paragraph{client}
+
+\begin{itemize}
+    \item  Not all C standard library functions are registered.  In fact, 
+      only a few are (e.g., malloc, free, printf, exit, and others).
+\end{itemize}
+
+ \paragraph{runtime system}
+\begin{itemize}
+    \item  [[Cmm_RunThread]] is no longer in the language definition, yet is 
+      required by this implementation in order to run a thread.
+    \item  We use static boot-up code to pass an argument off to an initial 
+      {\PAL} procedure; unfortunately, this means that a newly created thread 
+      would be suspended at the boot-up procedure and not the initial 
+      procedure. This might be noticeable when observed through the runtime 
+      system, although the system does take this into account as well as it
+      can.
+\end{itemize}
+
+ \paragraph{interpreter}
+\begin{itemize} 
+    \item  Mutual dependencies among separate assembly units is not allowed 
+      for now.
+    \item  When calls are made from a {\PAL} procedure to a {\PAL} procedure, 
+      the caller's activation record indicates that it is suspended at (has a 
+      PC of) the address of the instruction immediately following the call---
+      not at the call site itself.
+      This would be noticeable when observed through the runtime system.
+    \item  Not all common C function signatures are registered; this will 
+      need to be modified in order to accomodate more varied sorts of C 
+      functions.
+    \item  64-bit ints are supported but there are no 64-bit int operators
+    \item  Cuts across different threads are 100 per cent untested; unexpected
+      behavior might occur.
+    \item  LIMITCHECK instruction unimplemented.
+    \item  BUG : span token must be a positive integer (0 does not work!)
+\end{itemize}
+
+% ----------------------------------------------------------------------------
+\section{Lower Level Implementation Notes}
+% ----------------------------------------------------------------------------
+
+I could probably remove \texttt{locals\_end} and
+\texttt{stackdata\_end} as local variables in function
+\texttt{run\_interp}; but they \emph{must} remain stored away in an
+\texttt{activation} record at all non-tail calls.
+
+FIX FIX have to change [[ROTL]] and [[ROTR]] so they deal with the
+case when $d > x$.
+
+[[label_new]] does NOT copy its string argument; do NOT free anything
+you pass off to [[label_new]]!
+
+Use CII: maybe sequences to store closure pointers, check out Hanson's
+[[malloc]] interface (that allows debugging), maybe rings for the dead
+set, look at dvars and [[array_t]].
+
+Consider making better use of the [[lua_State *]] in the [[table]]
+structure.
+
+Use ``higher-order'' macros to declare, define and register operator
+implementations (instead of the current [[#undef]] business).
+
+Do we have to handle [[never returns]] annotations?
+
+Quote from manual: \emph{All separately compiled modules must have} identical \emph{top-level variable declarations}.
+
+Consider changing operator representation/implementation so that OP
+bytecode does not need to carry around a 32-bit value (right now it
+carries around an (operator *)).
+
+Use dynamic arrays!  Stop with this assertion failure business.
+
+% ----------------------------------------------------------------------------
+\chapter{Prerequisites}
+% ----------------------------------------------------------------------------
+
+In order to build and use the interpreter, there are a few externally
+available libraries that you need:
+
+\begin{itemize}
+\item We make use of an embedded Lua interpreter in our C code.  To
+download the source code and/or binaries for the Lua language, please
+visit [[http://www.lua.org]].  We link Lua libraries [[liblua.a]] and
+[[liblualib.a]] together with our code.
+
+\item We make use of the New Jersey Machine-Code Toolkit to preprocess
+our C code on its way to the compiler.  To download the source code
+and/or binaries for the toolkit, please visit
+[[http://www.eecs.harvard.edu/~nr/toolkit/]].  We use the binary
+[[tools]] to preprocess our code, and link the library [[mclib.o]]
+together with our code.
+
+\item If you want to build the NJ Machine-Code Toolkit library
+yourself from the source code, you will need to have access to an Icon
+compiler or bytecode compiler.  Visit
+[[http://www.cs.arizona.edu/icon/]] to download Icon.
+
+\item We make use of David Hanson's \textit{C Interfaces and
+Implementations} library of C coding idioms.  The necessary header
+files and code files are included with the interpreter.  Visit
+[[http://www.cs.princeton.edu/software/cii/]] for background
+information about this library.
+
+\end{itemize}
+
+% ----------------------------------------------------------------------------
+% ----------------------------------------------------------------------------
+
+% ----------------------------------------------------------------------------
+\chapter{User's guide}
+% ----------------------------------------------------------------------------
+
+\input{manual.inc}
+\input{formal.inc}
+
+% ----------------------------------------------------------------------------
+\chapter{Client's view}
+% ----------------------------------------------------------------------------
+
+\let\interface\section
+\let\implementation \section
+\input{client.inc}
+
+% ----------------------------------------------------------------------------
+\chapter{All the interfaces}
+% ----------------------------------------------------------------------------
+
+This chapter presents all of the interfaces for the interpreter.
+They are included to present an overall picture of the major facilities
+exported by each of the modules that comprise this application.
+The implementations of these interfaces may be found elsewhere in this
+document.
+
+The interpreter's interfaces, as we present them, consist of type definitions,
+function prototypes, and ``faux prototypes'' for macros defined elsewhere.  
+The Quick~{\PAL} Interpreter also makes use of a number of external libraries
+not standard to C.  
+The New Jersey Machine-Code Toolkit is used to ease the burden of generating
+in-memory bytecode for interpreter instructions and managing relocatable
+addresses and labels.  
+The Lua C libraries allow us to use an embedded Lua interpreter within the C
+environment to ease the otherwise uninteresting task of parsing input files;
+additionally, they provide us with access to Lua tables, which are easily
+manipulated dynamic, associative arrays.  
+We will limit our discussion of these libraries to the extent to which we need to make use of them.
+
+The major interfaces to this interpreter include:
+
+\begin{tabularx}{\linewidth}{@{\hskip2em}lX@{}}
+   [[assemblyunit]]  & {\PAL} assembly units
+\\ [[activation]]    & {\PAL} activation frames
+\\ [[ccall]]         & {\PAL} $\rightarrow$ C calling mechanism
+\\ [[cmmfloat]]      & Floating-point portability interface
+\\ [[controlflow]]   & {\PAL} control flow constructs
+\\ [[disasm]]        & Bytecode disassembly
+\\ [[encoding]]      & Bytecode generation and loading
+\\ [[intervals]]     & Natural number sets
+\\ [[label]]         & {\PAL} labels and namespace management
+\\ [[lualink]]       & Extended Lua interface
+\\ [[operator]]      & {\PAL} primitive operators
+\\ [[runtime]]       & {\PAL} runtime system
+\\ [[span]]          & {\PAL} spans
+\\ [[stack]]         & Value stacks
+\\ [[table]]         & Dynamic, associative arrays
+\\ [[thread]]        & {\PAL} threads of execution
+\\ [[types]]         & Basic C types
+\\ [[uid]]           & Unique identifiers for activation frames
+\\ [[value]]         & {\PAL} values
+\end{tabularx}
+\\
+
+These interfaces are presented in a somewhat logical order.
+A pure top-down or bottom-up approach is not entirely possible due to the
+vast number of mutually recursive dependencies among modules, but we do
+our best to present the simple interfaces first and proceed onward to the
+more complicated depths of the interpreter.
+
+% ----------------------------------------------------------------------------
+
+\begingroup
+\let\origsubpageref\subpageref
+\let\origsublabel\sublabel
+\def\subpageref#1{\origsubpageref{int-#1}}
+\def\sublabel#1{\origsublabel{int-#1}}
+\let\interface\section
+\def\implementation#1{\endinput}  % if we don't do this, we end up with 
+                                  % trailing garbage in interfaces only section
+
+\input{cmmfloat.inc}
+\input{types.inc}
+\input{value.inc}
+\input{stack.inc}
+\input{lualink.inc}
+\input{table.inc}
+\input{intervals.inc}
+\input{uid.inc}
+\input{activation.inc}
+\input{controlflow.inc}
+\input{label.inc}
+\input{thread.inc}
+\input{assemblyunit.inc}
+\input{encoding.inc}
+\input{interp.inc}
+\input{operator.inc}
+\input{ccall.inc}
+\input{span.inc}
+\input{disasm.inc}
+\input{inspect.inc}
+\input{runtime.inc}
+
+\endgroup
+
+% ----------------------------------------------------------------------------
+\cleardoublepage
+\part{Modules with interfaces}
+% ----------------------------------------------------------------------------
+
+We present the modules comprising the interpreter once more; this time, we
+include the implementations of their interfaces.
+For ease of reading, the modules' interfaces are reproduced here as well.
+
+\def\interface#1{\chapter{#1} \section{Module Interface}}
+\def\implementation#1{\section{Module Implementation}}
+
+\input{cmmfloat.inc}
+\input{types.inc}
+\input{value.inc}
+\input{stack.inc}
+\input{lualink.inc}
+\input{table.inc}
+\input{intervals.inc}
+\input{uid.inc}
+\input{activation.inc}
+\input{controlflow.inc}
+\input{label.inc}
+\input{thread.inc}
+\input{assemblyunit.inc}
+\input{encoding.inc}
+\input{interp.inc}
+\input{operator.inc}
+\input{ccall.inc}
+\input{span.inc}
+\input{disasm.inc}
+\input{inspect.inc}
+\input{runtime.inc}
+
+% ----------------------------------------------------------------------------
+\cleardoublepage
+\part{Unused stuff}
+% ----------------------------------------------------------------------------
+
+\input{opgen.inc}
+
+%\bibliographystyle{nchicago}
+%\bibliography{../doc/qc--}
+
+\end{document}

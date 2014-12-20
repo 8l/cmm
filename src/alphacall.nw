@@ -1,0 +1,396 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% ------------------------------------------------------------------ 
+\section{Alpha calling conventions}
+% ------------------------------------------------------------------ 
+
+This module implements calling conventions for the Alpha. The
+parameters represent the machine instructions to implement [[return]]
+and [[cut to]].
+
+<<alphacall.mli>>=
+val cconv :
+  return_to:(Rtl.exp -> Rtl.rtl) -> 
+  Mflow.cut_args Target.map -> 
+  string -> Automaton.cc_spec ->
+  Call.t
+@
+
+The implementation is based on \textit{True64 {\small UNIX} Assembly
+Language Programmer's Guide}, Version 5.1, published by Compaq Computer,
+Houston.
+
+It is not clear how to handle the requirements that on entry,
+register~27 is live and holds the address of the called procedure, or
+that on exit, register~26 is live and must hold the return address.
+It's probably easier to manage register~26.
+
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation of Alpha calling conventions}
+% ------------------------------------------------------------------ 
+
+<<alphacall.ml>>=
+module A  = Automaton
+module C  = Call
+module R  = Rtl
+module RP = Rtl.Private
+module RS = Register.Set
+module RU = Rtlutil
+module T  = Target
+
+let impossf fmt = Printf.kprintf Impossible.impossible fmt
+let wordsize   = 64
+@
+\paragraph{Registers}
+
+A non-volatile register can be used in a procedure if its initial value
+is restored upon exit. Such a register is also called callee-saved. A
+volatile register can be used without saving and restoring. Registers
+that are neither volatile nor non-volatile are unavailable for register
+allocation.
+
+The return address [[ra]] is volatile.  It can be used for register
+allocation, but the call instruction always writes it (and it is live on
+entry).
+
+<<alphacall.ml>>=
+let byteorder = R.LittleEndian         
+let mspace = ('m', byteorder, Cell.of_size 8)
+let rspace = ('r', byteorder, Cell.of_size 64)
+let fspace = ('f', byteorder, Cell.of_size 64)
+
+let r n     = (rspace, n, R.C 1)
+let f n     = (fspace, n, R.C 1)
+let vfp     = Vfp.mk wordsize
+@
+Calling conventions treat floating point registers specially; therefore
+we have separate lists for them.
+
+Can we use register \$26, \$27 and \$28, \$29? \$27 is used implictly
+for sub-routine calls. If we make the use explicit in our call {\rtl},
+we could use it.
+
+<<alphacall.ml>>=
+let vol_int  = List.map r ((Auxfuns.from 0 ~upto:8)@(Auxfuns.from 16 ~upto:26))
+let nvl_int  = List.map r (Auxfuns.from 9  ~upto:15)
+let vol_fp   = List.map f ([0;1] @ (Auxfuns.from 10  ~upto:30))
+let nvl_fp   = List.map f (Auxfuns.from 2 ~upto:9)
+@
+Non-volatile registers are saved somewhere in the frame. Currently, we
+cannnot provide dedicated locations as they are demanded in \S 6.3.3.5.
+<<alphacall.ml>>=
+let saved_nvr temps =
+    let t = Talloc.Multiple.loc temps 't' in
+    let u = Talloc.Multiple.loc temps 'u' in
+        function
+        | (('r', _, _),_,_) as reg -> t (Register.width reg)
+        | (('f', _, _),_,_) as reg -> u (Register.width reg)
+        | ((s,_,_),i,_) -> impossf "cannot save $%c%d" s i
+@
+\paragraph{Conventions}
+
+The size of the Alpha frame must be a multiple of 16. This cannot be
+specified here.
+<<alphacall.ml>>=
+let ra        = R.reg (r 26)            (* return address *)
+let sp        = R.reg (r 30)            (* stack pointer  *)
+let spval     = R.fetch sp wordsize
+let growth    = Memalloc.Down           (* stack grows down *)
+let sp_align  = 16                      (* SP always 16-byte aligned *)
+
+let std_sp_location = 
+    RU.add wordsize vfp (R.late "minus frame size" wordsize)
+
+let ( *> ) = A.( *> )
+
+let badwidth (msg:string) (w:int) = 
+    impossf "unsupported (rounded) width %d in Alpha: %s" w msg
+
+let fatal _ = 
+    impossf "fatal error in Alpha automaton"
+@
+
+And in Lua:
+
+<<Alpha calling convention automata in Lua>>=
+A               = Automaton
+Alpha           = Alpha           or {}
+Alpha.cc        = Alpha.cc        or {}
+Alpha.cc["C"]   = Alpha.cc["C"]   or {}
+Alpha.cc["cmm"] = Alpha.cc["cmm"] or {}
+
+Alpha.sp_align  = 16
+Alpha.wordsize  = 64
+
+function reg(sp,i) 
+  return {space = sp, index = i, cellsize = Alpha.wordsize, count = 1}
+end
+function f(i) return(reg("f", i)) end
+function r(i) return(reg("r", i)) end
+
+Alpha.vol_fp  = (f(0) .. f(1)) .. (f(10) .. f(30))  -- includes f0-f1, f10-f30
+Alpha.vol_int = (r(0) .. r(8)) .. (r(16) .. r(26))  -- includes r0-f8, r16-f26
+@ 
+
+\paragraph{C~return results}
+
+A C~function returns an integer (up to 64 bits wide) in [[$0]], a
+floating-point result (up to two 64-bit values) in [[$f0]] and [[$f1]].
+
+old comment --
+THIS IS PROBABLY A BUG!  [[useregs]] CREATES MUTABLE STATE, SO IF A
+COMPILATION UNIT HAS MULTIPLE CALL SITES THAT RETURN THE SAME HINT, WE
+SHOULD SEE A FAILURE HERE.
+<<Alpha calling convention automata in Lua>>=
+Alpha.cc["C"].results =
+  { A.widen(64, "multiple")
+  , A.choice { "float" , A.useregs { f(0), f(1) }
+             , A.is_any, A.useregs { r(0) }
+             }
+  }
+@ 
+As an alternative we provide calling convention [[cmm]] that returns
+every result in memory. This is for experiments with custom calling
+conventions.
+<<Alpha calling convention automata in Lua>>=
+Alpha.cc["cmm"].results =
+  { A.widths { 64 }
+  , A.overflow { growth = "up", max_alignment = Alpha.sp_align
+               }
+  }
+@
+
+\paragraph{C~procedure parameters}
+
+Table 6-3 summarizes the calling convention: the location of an argument
+is determined by its position and type:
+
+\begin{quote}
+\begin{tabular}{lll}
+Position & Integer  & Floating-Point \\
+\hline
+1        & [[$16]]  & [[f16]] \\
+2        & [[$17]]  & [[f17]] \\
+3        & [[$18]]  & [[f18]] \\
+4        & [[$19]]  & [[f19]] \\
+5        & [[$20]]  & [[f20]] \\
+6        & [[$21]]  & [[f21]] \\
+7        & stack    & stack   \\
+\dots    & \dots    & \dots   \\
+\end{tabular}
+\end{quote}
+
+The implementation below uses the \emph{position} of a parameter to
+determine the register it is passed in. The [[counter]] stage counts
+the number of bits requested for allocation; the [[regs_by_bits]] stages
+looks at its list of registers, ignores as many registers as are
+needed to account for bits already allocated and then uses any
+remaining register to satisfy the request.
+
+Note that the direction of [[growth]] in the overflow block is
+independent of the stack growth. 
+        
+<<Alpha calling convention automata in Lua>>=
+Alpha.cc["C"].call =
+  { A.widen(64, "multiple")
+  , A.bitcounter("bits")
+  , A.choice { "float",  A.regs_by_bits("bits", f(16) .. f(21))
+             , A.is_any, A.regs_by_bits("bits", r(16) .. r(21))
+             }
+  , A.overflow { growth = "up", max_alignment = Alpha.sp_align }
+  }
+
+Alpha.cc["cmm"].call  = Alpha.cc["C"].call
+@
+
+\paragraph{C~cut-to parameters}
+
+Since this is strictly an internal calling convention, we can use
+whatever we like. We use all volatile registers.
+<<Alpha calling convention automata in Lua>>=
+Alpha.cc["C"].cutto =
+ { A.widen(64, "multiple")
+ , A.choice { "float",  A.useregs(Alpha.vol_fp)
+            , A.is_any, A.useregs(Alpha.vol_int)
+            }
+ , A.overflow { growth = "down", max_alignment = Alpha.sp_align }
+ }
+
+Alpha.cc["cmm"].cutto = Alpha.cc["C"].cutto
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Putting it together} 
+% ------------------------------------------------------------------ 
+
+The Alpha demands (\S 6.3.3.2) that a procedure loads the global pointer
+value ($\$27$) into $\$gp$, if the procedure uses large constants. We
+have to assume that this is always the case. How do we implement this
+requirement? Update: currently there is no appropriate mechanism. For
+the Alpha, work is distributed over the code expander, the assembler,
+and the recognizer.
+
+I don't understand the meaning of [[autosp]] and [[postsp]]. On the
+Alpha, the stack pointer does not move during calls. It is once set in
+the prolog of a procedure and set back before the procedure returns. I
+hope the code below reflects this.
+
+<<transformations>>=
+let autoAt = A.at mspace in
+let prolog =
+  let autosp = (fun _ -> vfp) in
+  C.incoming ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "in call parms" autoAt spec.A.call)
+    ~autosp
+    ~postsp:(fun _ _ -> std_sp_location)
+      ~insp:(fun a _ _ -> autosp a) in
+
+let epilog =
+  C.outgoing ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "out ovfl results" autoAt spec.A.results)
+    ~autosp:(fun r -> std_sp_location)
+    ~postsp:(fun _ _ -> vfp) in
+
+let call_actuals =
+  C.outgoing ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "out call parms" autoAt spec.A.call)
+    ~autosp:(fun r  -> std_sp_location)
+    ~postsp:(fun _ sp -> sp) in  
+
+let call_results =
+  let autosp = (fun r -> std_sp_location) in
+  C.incoming ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "in ovfl results" autoAt spec.A.results)
+    ~autosp
+    ~postsp:(fun _ _ -> std_sp_location)
+    ~insp:(fun a _ _ -> autosp a) in
+
+
+let also_cuts_to =
+  let autosp = (fun r -> std_sp_location) in
+  C.incoming ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "in cont parms" autoAt spec.A.cutto)
+    ~autosp
+    ~postsp:(fun _ _ -> std_sp_location)
+      ~insp:(fun a _ _ -> autosp a) in
+
+let cut_actuals base  =
+   C.outgoing ~growth ~sp ~mkauto:(fun () -> autoAt base spec.A.cutto)
+     ~autosp:(fun r -> spval)
+     ~postsp:(fun _ _ -> spval) in
+
+<<alphacall.ml>>=
+let rtn return_to k n ~ra =
+    if k = 0 & n = 0 then return_to ra
+    else impossf "alternate return using C calling convention" 
+
+let c ~return_to cut spec = 
+    <<transformations>>
+    { C.name            = "C"
+    ; C.overflow_alloc  = { C.parameter_deallocator = C.Caller
+                          ; C.result_allocator      = C.Caller
+                          }
+    ; C.call_parms      = { C.in' = prolog       ; C.out = call_actuals }
+    ; C.cut_parms       = { C.in' = also_cuts_to ; C.out = cut_actuals  }
+    ; C.results         = { C.in' = call_results ; C.out = epilog       }
+
+    ; C.stack_growth     = growth
+    ; C.stable_sp_loc    = std_sp_location
+    ; C.replace_vfp      = Cfgx.Vfp.replace_with ~sp
+    ; C.sp_align         = sp_align
+    ; C.pre_nvregs       = RS.union (RS.of_list nvl_int) (RS.of_list nvl_fp)
+    ; C.volregs          = RS.union (RS.of_list vol_int) (RS.of_list vol_fp)
+    ; C.saved_nvr        = saved_nvr
+    ; C.cutto            = cut
+    ; C.return           = rtn return_to
+    ; C.ra_on_entry      = (fun _     -> R.fetch ra wordsize)
+    ; C.where_to_save_ra = (fun _ t   -> Talloc.Multiple.loc t 't' wordsize)
+    ; C.ra_on_exit       = (fun _ _ t -> ra)
+    ; C.sp_on_unwind     = (fun e -> RU.store sp e)
+    ; C.sp_on_jump       = (fun _ _ -> Rtl.null)
+    }
+
+@
+
+And in Lua we need only register the defined conventions.
+<<Alpha calling convention automata in Lua>>=
+-- register the new calling conventions!
+A.register_cc(Backend.alpha.target, "C"   , Alpha.cc["C"  ])
+A.register_cc(Backend.alpha.target, "cmm0", Alpha.cc["C"  ])
+A.register_cc(Backend.alpha.target, "cmm1", Alpha.cc["C"  ])
+A.register_cc(Backend.alpha.target, "cmm2", Alpha.cc["C"  ])
+A.register_cc(Backend.alpha.target, "cmm3", Alpha.cc["cmm"])
+@ 
+
+\paragraph{Test of new calling convention specification} Module
+\module{callspec} provides a new interface to build a calling
+convention. The convention returned acts as a template for us; we have
+to provide some small changes to make it fit.  We have to fix the
+location of the return address on exit. It has to be in \$26. Using
+[[SaveToTemp]] also crashes the register allocator.
+
+<<alphacall.ml>>=
+module CS = Callspec
+
+let template = (* conservative spec *)
+        { CS.name           = "cmm"
+        ; CS.stack_growth   = Memalloc.Down
+        ; CS.overflow       = CS.overflow C.Caller C.Caller
+        ; CS.memspace       = mspace
+        ; CS.sp             = r 30
+        ; CS.sp_align       = sp_align
+        ; CS.all_regs       = RS.of_list (List.concat [nvl_int; nvl_fp;
+                                                       vol_int; vol_fp])
+        ; CS.nv_regs        = RS.of_list (nvl_int @ nvl_fp)
+        ; CS.save_nvr       = saved_nvr
+        ; CS.ra             = (ra, CS.ReturnAddress.SaveToTemp 't')
+        }
+@
+
+We build a [[Call.t]] value from a specification and do the final fixup
+for the return address. 
+
+<<alphacall.ml>>=
+let cc auto return_to cut spec =
+    let t = CS.to_call cut (rtn return_to) auto spec in 
+        { t with C.ra_on_exit   = (fun _ _ t -> ra)
+        ;        C.sp_on_unwind = (fun e -> RU.store sp e)
+        }
+@
+
+Most variations we are interested in can be expressed in the
+specification. Here are calling conventions that we derive from our
+template.
+
+<<alphacall.ml>>=
+let cmm0 ~return_to cut ccspec = cc ccspec return_to cut
+    { template with CS.name     = "cmm0"
+                  ; CS.overflow = CS.overflow C.Caller C.Caller 
+    }
+let cmm1 ~return_to cut ccspec = cc ccspec return_to cut
+
+    { template with CS.name     = "cmm1"
+                  ; CS.overflow = CS.overflow C.Caller C.Callee 
+    }
+let cmm2 ~return_to cut ccspec = cc ccspec return_to cut 
+    { template with CS.name     = "cmm2"
+                  ; CS.overflow = CS.overflow C.Callee C.Caller 
+    }
+let cmm3 ~return_to cut ccspec = cc ccspec return_to cut 
+    { template with CS.name     = "cmm3"
+                  ; CS.overflow = CS.overflow C.Callee C.Callee 
+    }
+@
+
+And now the lookup function.
+<<alphacall.ml>>=
+let cconv ~return_to cut ccname spec = 
+  let f =
+    match ccname with
+    | "cmm0" -> cmm0
+    | "cmm1" -> cmm1
+    | "cmm2" -> cmm2
+    | _      -> c
+  in f ~return_to cut spec
+@

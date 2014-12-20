@@ -1,0 +1,1926 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*- %
+
+\begingroup
+\input{op-sem}
+
+% ----------------------------------------------------------------------------
+\interface{[[interp]] : Interpreting Loaded Bytecode}
+% ----------------------------------------------------------------------------
+
+This module actually performs the core bytecode interpreting of the
+interpreter.
+
+<<interp.h>>=
+#ifndef _INTERP_H
+#define _INTERP_H
+
+#include <lua.h>
+#include <mclib.h>
+
+#include "activation.h"
+#include "assemblyunit.h"
+#include "value.h"
+#include "intervals.h"
+#include "label.h"
+#include "table.h"
+#include "thread.h"
+#include "util.h"
+
+<<constant definitions>>
+<<macro definitions>>
+<<global variable declarations>>
+
+<<function prototypes>>
+
+#endif /* _INTERP_H */
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Representation}
+% ----------------------------------------------------------------------------
+
+% ----------------------------------------------------------------------------
+\paragraph{Bytecode}
+% ----------------------------------------------------------------------------
+
+Before an input file to the Quick~{\PAL} Interpreter may be interpreted, it is first translated into bytecode and stored in memory.  
+Thus, the in-memory format of the instructions is simply a byte array. 
+For purposes of internal addressing, we make use of the NJ Machine-Code Toolkit's relocatable address type ([[RAddr]]).
+
+<<external definitions>>=
+typedef struct relocatable_address *RAddr;
+@ 
+
+We will see later how these addresses are manipulated and how the bytecode is structured in memory with respect to {\PAL} sections.
+
+% ----------------------------------------------------------------------------
+\subsection{Bytecode Generation}
+% ----------------------------------------------------------------------------
+
+To assist in generating bytecode, we use the NJ Machine-Code toolkit.  
+As a client of this library, we are responsible for writing a general
+allocation function and a closure allocation function (allocates
+[[RClosure]]s). 
+Additionally, when using certain toolkit functions we are required to
+supply an error printing function that takes a format string and a
+variable number of arguments and returns nothing. 
+<<function prototypes>>=
+void *mc_alloc(int size, Mc_alloc_pool pool);
+RClosure mc_alloc_closure(unsigned size, RBlock dest_block,
+                                 unsigned dest_lc);
+@
+Of our own volition, we provide function [[mc_free_all]] to free all memory
+allocated by [[mc_alloc]] and [[mc_alloc_closure]] since the last call to
+[[mc_free_all]]. 
+<<function prototypes>>=
+void mc_free_all(void);
+@ 
+
+% ----------------------------------------------------------------------------
+\paragraph{Encoding Helpers}
+% ----------------------------------------------------------------------------
+
+When it comes time to permanently relocate a relocatable block ([[RBlock]]), we call Lua-style helper function [[lua_relocate_block]], which: takes a [[lua_State *]], expects a pointer to an [[RBlock]] to be atop the Lua stack, permanently relocates this [[RBlock]], pops the pointer off the Lua stack, and returns 0.
+
+<<function prototypes>>=
+int    lua_relocate_block(lua_State *L);
+@
+
+Unfortunately, we must use a separate helper function to actually copy the contents of a relocated [[RBlock]] into their permanent memory location.
+For this, we use helper [[lua_copy_block_contents]], which: takes a [[lua_State *]], expects a pointer to an [[RBlock]] to be atop the Lua stack, copies the contents of this [[RBlock]] into its permanent location, pops the pointer off the stack, and returns 0.
+
+<<function prototypes>>=
+int    lua_copy_block_contents(lua_State *L);
+@ 
+
+% ----------------------------------------------------------------------------
+\paragraph{Loading an Assembly Unit}
+% ----------------------------------------------------------------------------
+
+To load an entire assembly unit into memory (i.e., generate bytecode for it and store the bytecode in memory), we create the main bytecode generation function [[load_assembly_unit]].
+This function takes a string with the name of the source file to be loaded as an assembly unit or the string to be loaded itself, and an indication of whether a filename or source string is being passed in; it returns an error code indicating success or failure.
+
+<<function prototypes>>=
+int load_assembly_unit(char *s, assembly_unit_type source_type);
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Bytecode Interpreting}
+% ----------------------------------------------------------------------------
+
+The main interpreting of this application is done in the [[run_interp]] function.  
+Given a suspended {\PAL} thread at which to start program interpretation, [[run_interp]] executes program code stored as in-memory bytecode.
+
+[[run_interp_n]] runs up to [[num_bytecodes]] bytecodes and then saves the state of
+the interpreter on the stack, in [[interp_state]], and in the continuation.  It returns the number of
+bytecodes actually interpreted.  If the program finishes or fails, this will be
+less than the number of bytecodes requested.
+
+[[interp_state_new]] and [[interp_state_free]] allocate and deallocate
+interpreter ``machine state" that is not stored on the stack.  This is the
+argument space and the value stack, corresponding to the registers of the
+interpreter ``machine." The sizes are given by the arguments to [[cmm_open]].
+This allows clients to treat the interpreter state as an opaque type.
+
+<<function prototypes>>=
+typedef struct {
+  valstack values;
+  vptr arguments;
+  vptr arguments_limit;
+} interp_state;
+
+interp_state* interp_state_new();
+void interp_state_free(interp_state*);
+
+void run_interp(continuation *k);
+int run_interp_n(continuation *k, interp_state* values1, int num_bytecodes);
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Starting it All}
+% ----------------------------------------------------------------------------
+
+Finally, we get to the main function that initializes the interpreter: the [[cmm_interp_open]] function.
+This function takes two arguments that specify the sizes of the value stack and argument-passing space used in the interpreter.
+
+<<function prototypes>>=
+int cmm_interp_open(int valstack_size1, int argspace_size);
+@ 
+
+[[cmm_interp_open]] starts up Lua and prepares for future encoding and interpreting, returning a non-zero [[int]] only if an error occurred.
+We internally use helper [[init_interp]] to perform basic interpreter initialization (including operator registration, etc.).
+
+<<internal function prototypes>>=
+static void init_interp(int valstack_size, int argspace_size);
+@ 
+
+We also make sure that defined [[MEMSIZE]]s and [[PTRSIZE]]s will work with the current architecture.
+
+<<function prototypes>>=
+void   check_architecture(assembly_unit *au);
+@ 
+
+% ----------------------------------------------------------------------------
+\paragraph{Ending it All}
+% ----------------------------------------------------------------------------
+
+To close down, we have the function [[cmm_interp_close]].
+
+<<function prototypes>>=
+void cmm_interp_close(void);
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Error Handling}
+% ----------------------------------------------------------------------------
+
+There are two major sorts of errors we expect to encounter during the interpreter's execution: errors occuring during the loading of assembly files, and errors occurring during the interpreting of bytecode in memory.
+We make use of the C standard library's [[setjmp]] and [[longjmp]] functions for error handling; they essentially allow us to perform non-local returns to two main sites.
+Whenever we must raise an error, we simply call helper function [[cmm_err]], which prints an appropriate message and then [[longjmp]]s to the appropriate error-handling site (either the site of assembly file loading or the site of assembly file interpreting).
+This use of non-local return allows, for example, an interactive interpreter to continue execution even after attempting to load a bad source file or execute a successfully-loaded yet error-ridden program.
+
+[[cmm_err]] is given a error string to print.  Cousins [[cmm_err_wstr]] and
+[[cmm_err_wint]] allow the error string to include a format specifier for
+an extra string or integer argument (respectively).
+\emph{Note that [[cmm_err]] should only ever be called by a function that properly sets [[errorjmp]] or a function called by such a function.}
+
+<<function prototypes>>=
+void cmm_err     (const char *fmt);
+void cmm_err_wstr(const char *fmt, const char *s);
+void cmm_err_wint(const char *fmt, const int   i);
+@ 
+
+To keep track of which error handling site to jump to, we use the global variable [[errorjmp]].
+
+<<global variable definitions>>=
+static jmp_buf errorjmp;
+static int     errorjmp_set = 0;
+@  
+
+When an interrupt signal occurs, we try to catch it and provide the user
+with some useful information before returning control to the system.
+We use a signal handler:
+
+<<function prototypes>>=
+void cmm_sighandler(int sig);
+@
+
+As minor helper macros, we use [[mem_assert]] to catch errors that occur when there is a memory allocation error and [[cmm_assert]] to make assertions with better error messages.
+
+[[mem_assert]] should be used after memory allocation to confirm that the allocation was successful.
+Its use should differ from that of [[cmm_assert]] in the following way: a [[mem_assert]] error signifies that the interpreter has simply run out of memory, whereas a [[cmm_assert]] error signifies that something has gone \emph{logically} wrong in the interpreter or in input source code.
+
+[[cmm_assert]] and [[mem_assert]] call [[cmm_err]]; as such, calling them 
+does not necessarily result in an exit to the system but potentially allows an
+interactive interpreter to try to recover.
+The C standard library's [[assert]] macro should be used whenever an immediate
+system exit is desired (calls to [[assert]] imply horrible errors from which
+we would rather not recover).
+
+\emph{Because [[mem_assert]] and [[cmm_assert]] call [[cmm_err]] in their bodies, they should only be called where it is legal to call [[cmm_err]] (see above).}
+
+<<faux prototypes>>=
+void mem_assert(int boolean_expression_result);
+void cmm_assert(int assertion, const char *err_msg);
+@ 
+
+For specific matters of Lua errors, we are assisted by error handler [[lua_error_handle]].
+This function properly interpets Lua library error codes and acts appropriately
+(perhaps by warning the user or exiting).
+
+<<function prototypes>>=
+void   lua_error_handle(int err_code, const char *fn);
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Machine-Dependent Details}
+% ----------------------------------------------------------------------------
+
+Because the interpreter needs to perform a number of low-level fetches and
+stores to memory, it needs to know some basic facts about the machine on
+which it is running (for example, byte order).
+
+Helper function [[infer_architecture]] tries to infer as much about the machine
+on which it runs as is possible; based on this information inferred,
+[[mem_aggregate]] is able to properly aggregate multiple unaligned bytes into
+an integer value.
+
+Helper function [[round_up]] takes a pointer and rounds it up (in the direction
+of increasing memory addresses) so it is aligned to the current machine 
+architecture's alignment requirement.
+
+<<function prototypes>>=
+void      infer_architecture(void);
+unsigned  mem_aggregate(unsigned char *a, byte_order bo, unsigned num_bytes);
+void     *round_up(void *);
+@ 
+
+% ----------------------------------------------------------------------------
+\implementation{Interpreting Loaded Bytecode}
+% ----------------------------------------------------------------------------
+
+This section contains the implementation of the interpreting core of the
+Quick~{\PAL} Interpreter.
+We begin with the SLED definition of the interpreter's instruction set and continue with the implementation of the functions and macros described in the last section.
+
+% ----------------------------------------------------------------------------
+\subsection{SLED Definition}
+% ----------------------------------------------------------------------------
+
+The following code implements a SLED description of the Quick~{\PAL} Interpreter's abstract machine.
+We create fields to represent the different segments of a bytecode (instruction code + arguments), and construct a pattern table from all the instructions we wish to include in the bytecode.  
+A few instructions from our interpreter's language have multiple versions in the table; this allows these instructions to take arguments of different bit widths.
+
+<<bytecode.sled>>=
+fields of bcode     (8) op      0:7
+fields of byte      (8) bits8   0:7
+fields of byte2     (8) bits8b  0:7
+fields of byte3     (8) bits8c  0:7
+fields of short    (16) bits16  0:15
+fields of long     (32) bits32  0:31
+fields of longlong (64) bits64  0:63
+
+patterns
+  [ DEFINE_PROC   END_PROC       PUSH           GSTORE
+    FETCH         STORE          FETCH_ARG      STORE_ARG
+    STORE_LOCAL8  STORE_GLOBAL8  FETCH_LOCAL8   FETCH_GLOBAL8
+    STORE_LOCAL16 STORE_GLOBAL16 FETCH_LOCAL16  FETCH_GLOBAL16
+    GSTORE_LOCAL8 GSTORE_LOCAL16 GSTORE_GLOBAL8 GSTORE_GLOBAL16
+    GOTO          CBRANCHT       CBRANCHF       BRANCHTF
+    CALL          CMM_TAIL_CALL  RETURN         CUT
+    EMIT_RADDR    PUSH_SYMBOL    OP
+    FETCH_ROUND   STORE_ROUND    FETCH_SP
+    PLACECODE     BREAKPT
+    HALT          FORBIDDEN
+  ] is op = {0 to 37}
+@ 
+
+To add an instruction to the bytecode, one must simply add an instruction name to the [[op]] table above and increase the upper bound of [[op]]'s value range.
+
+We next define another set of patterns to ease constructor generation of similarly structured instructions.
+
+<<bytecode.sled>>=
+patterns 
+  any8    is STORE_LOCAL8   | STORE_GLOBAL8   | FETCH_LOCAL8  | FETCH_GLOBAL8
+           | GSTORE_LOCAL8  | GSTORE_GLOBAL8  | FETCH_ARG     | STORE_ARG
+  any16   is STORE_LOCAL16  | STORE_GLOBAL16  | FETCH_LOCAL16 | FETCH_GLOBAL16
+           | GSTORE_LOCAL16 | GSTORE_GLOBAL16
+  any32   is CALL           | DEFINE_PROC     | PUSH_SYMBOL
+  memory  is FETCH | STORE  | GSTORE
+  nullary is HALT  |  GOTO  | CMM_TAIL_CALL   | CUT           | END_PROC
+           | FETCH_ROUND    | STORE_ROUND     | FETCH_SP
+           | BREAKPT        | FORBIDDEN
+@ 
+The [[relocatable]] and [[placeholder]] keywords allow us to specify
+that some arguments to instructions will be relocatable addresses
+([[RAddr]]s). 
+<<bytecode.sled>>=
+relocatable addr
+relocatable addr2
+
+placeholder for bcode is PLACECODE
+placeholder for long  is bits32 = 0
+@ 
+Now, we create constructors for our instructions (or for groups of instructions as we defined them in the above pattern definition); these are used in our C code when we need to use the toolkit to parse the bytecode into something human-readable.
+<<bytecode.sled>>=
+constructors
+  any8           bits8                is any8;       bits8
+  any16          bits16               is any16;      bits16
+  any32          bits32               is any32;      bits32
+  memory         bits8  bits8b bits8c is memory;     bits8;      bits8b; bits8c
+  EMIT_RADDR     addr                 is bits32=addr
+  PUSH           bits32 bits8         is PUSH;       bits32;     bits8
+  APPLY_OPERATOR bits32               is OP;         bits32
+  CBRANCHT       addr                 is CBRANCHT;   bits32=addr
+  CBRANCHF       addr                 is CBRANCHF;   bits32=addr
+  BRANCHTF       addr   addr2         is BRANCHTF;   bits32=addr;bits32=addr2
+  RETURN         bits8  bits8b        is RETURN;     bits8;      bits8b
+  nullary
+@ 
+
+The conditional assembly present in the definition allows an instruction to be represented by multiple opcodes (each instantiation expects to find arguments of different bit-lengths) yet be connected with one NJ Machine-Code Toolkit constructor.
+
+<<bytecode.sled>>=
+# conditional assembly
+  store_local bits16
+    when { }  is store_local8 (bits16)
+    otherwise is store_local16(bits16)
+  store_global bits16
+    when { }  is store_global8 (bits16)
+    otherwise is store_global16(bits16)
+  gstore_local bits16
+    when { }  is gstore_local8 (bits16)
+    otherwise is gstore_local16(bits16)
+  gstore_global bits16
+    when { }  is gstore_global8 (bits16)
+    otherwise is gstore_global16(bits16)
+  fetch_local bits16
+    when { }  is fetch_local8 (bits16)
+    otherwise is fetch_local16(bits16)
+  fetch_global bits16
+    when { }  is fetch_global8 (bits16)
+    otherwise is fetch_global16(bits16)
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Initialization and Error-Handling}
+% ----------------------------------------------------------------------------
+
+% ----------------------------------------------------------------------------
+\subsubsection{Initialization and Configuration}
+% ----------------------------------------------------------------------------
+
+[[init_interp]] initializes global tables, allocates some globally-used memory,
+and initializes default-registered C function signatures and primitive
+arithmetic operators.
+
+<<utility functions>>=
+static void init_interp(int valstack_size1, int argspace_size) {
+  lua_State *L;
+
+  /* infer information about architecture */
+  infer_architecture();
+
+  /* initialize the contents of global tables */
+  assembly_units_table   = fresh_table();
+  exports_table          = fresh_table();
+  operator_table         = fresh_table();
+  span_table             = fresh_table();
+
+  c_func_table           = fresh_table();
+  c_sig_table            = fresh_table();
+
+  /* initialize a Lua interpreter */
+  L = init_lua_interp();
+
+  /* initialize the lua_State field of global tables */
+  assembly_units_table.L = L;
+  exports_table.L        = L;
+  operator_table.L       = L;
+  span_table.L           = L;
+
+  c_func_table.L         = L;
+  c_sig_table.L          = L;
+ 
+  /* store global constants */
+  <<store size of value stack and argument space>>
+
+  /* register C function signatures */
+  init_c_sigs();
+
+  /* register operators */
+  init_operators();
+}
+@ 
+
+The value stack and argument space are  allocated for each thread, so we simply
+store the sizes in global variables.
+
+<<store size of value stack and argument space>>=
+  valstack_size = valstack_size1;
+  arguments_size = argspace_size;
+@
+
+% ----------------------------------------------------------------------------
+\subsubsection{Utility Functions}
+% ----------------------------------------------------------------------------
+
+The utility helper functions assist with machine-dependent details and 
+error handling.
+
+<<utility functions>>=
+<<machine-dependent details>>
+<<error-handling functions>>
+@ 
+
+% ----------------------------------------------------------------------------
+\paragraph{Machine-Dependent Details}
+% ----------------------------------------------------------------------------
+
+We try to infer as much as possible about the machine on which the interpreter
+is running in [[infer_architecture]].
+The methods used here are borrowed from the implementation of the New Jersey
+Machine-Code Toolkit.
+
+<<global variable definitions>>=
+byte_order DEF_BYTE_ORDER;
+@ 
+
+<<machine-dependent details>>=
+void infer_architecture(void) {
+  static union { unsigned u; unsigned char c[sizeof(unsigned)]; } u =
+     { 0xaabbccdd };
+
+  switch (u.c[0]) {
+    case 0xaa: DEF_BYTE_ORDER = BIG;    break;
+    case 0xdd: DEF_BYTE_ORDER = LITTLE; break;
+    default:
+      fprintf(stderr, "error: machine has unknown natural byte-order\n");
+      exit(1);
+  }   
+}
+@ 
+
+Once we have inferred this byte-order information, helper [[mem_aggregate]]
+is able to properly order bytes so as to effectively allow multi-byte loads.
+[[mem_aggregate]] aggregates [[num_bytes]] number of bytes according to
+byte order [[bo]] from memory address [[a]], returning the resulting value
+as an [[unsigned int]].
+
+<<machine-dependent details>>=
+unsigned mem_aggregate(unsigned char *a, byte_order bo, unsigned num_bytes) {
+  int      i;
+  unsigned u = 0;
+
+  cmm_assert(a, "attempted to dereference or fetch at address NULL");
+
+  switch (bo) {
+    case LITTLE:
+      for (i = 0; i < num_bytes; i++)
+        u += (a[i] << (i * 8));
+      break;
+    case BIG:
+      for (i = 0; i < num_bytes; i++)
+        u += (a[i] << ((num_bytes - i - 1) * 8));
+      break;
+    default:
+      fprintf(stderr, "error: cannot aggregate data in unknown byte-order\n");
+      exit(1);
+  }
+
+  return u;
+}
+
+void *round_up(void *p) {
+  if (DEF_ALIGN <= 1) return p;
+  {
+    unsigned long x = (unsigned long) p;
+    if (x % DEF_ALIGN == 0) return p;
+    x += DEF_ALIGN - (x % DEF_ALIGN);
+    return (void *) x;
+  }
+}
+@ 
+
+We now define aggregated fetch functions for the NJ Machine-Code 
+Toolkit, using [[mem_aggregate]].
+
+<<decode.fetch>>=
+address type is "unsigned char *"
+fetch 8  using "mem_aggregate(%a,DEF_BYTE_ORDER,1)"
+fetch 16 using "mem_aggregate(%a,DEF_BYTE_ORDER,2)"
+fetch 32 using "mem_aggregate(%a,DEF_BYTE_ORDER,4)"
+@ 
+
+Finally, for all information we cannot accurately infer, we define a few 
+constants in [[machine.h]] to provide information about the architecture on 
+which the interpreter is currently being run.
+
+<<machine.h.sparc>>=
+#ifndef _MACHINE_H
+#define _MACHINE_H
+
+#include "types.h"
+
+/* FIX :  the float types are here defined in a machine-dependent manner; */
+typedef float       float32;
+typedef double      float64;
+typedef long double float96;
+
+extern  byte_order DEF_BYTE_ORDER;
+
+#define DEF_MEMSIZE    8
+#define DEF_ALIGN      8
+
+typedef u_int32 Cmm_Word;
+#endif /* _MACHINE_H */
+@ 
+
+<<machine.h.x86>>=
+#ifndef _MACHINE_H
+#define _MACHINE_H
+
+#include "types.h"
+
+/* FIX :  the float types are here defined in a machine-dependent manner; */
+typedef float       float32;
+typedef double      float64;
+typedef long double float96;
+
+extern  byte_order DEF_BYTE_ORDER;
+
+#define DEF_MEMSIZE    8
+#define DEF_ALIGN      1
+
+typedef u_int32 Cmm_Word;
+#endif /* _MACHINE_H */
+@ 
+
+Although likely unnecessary, we also perform a few quick assertions to make 
+sure nothing horribly wrong is going on before we begin to interpret code.
+
+<<machine-dependent details>>=
+void check_architecture(assembly_unit *au) {
+  if (au->memsize != 8)
+    cmm_err("this interpreter can only handle a MEMSIZE of 8");
+  if (au->ptrsize != 32)
+    cmm_err("this interpreter can only handle a PTRSIZE of 32");
+  if (au->byte_order != DEF_BYTE_ORDER)
+    cmm_err("this interpreter can only handle native byteorder memory access");
+}
+@
+
+% ----------------------------------------------------------------------------
+\paragraph{Error Handling}
+% ----------------------------------------------------------------------------
+
+Whenever we need to raise an error (with a few exceptions), we call 
+[[cmm_err]].
+This function prints an appropriate error message, given its arguments, and 
+[[longjmp]]s to the appropriate error-handling site.
+Note that this function's behavior is undefined if the error did not occur 
+during assembly file loading ([[load_assembly_unit]]) or during bytecode 
+interpreting (or relocation).
+
+<<error-handling functions>>=
+void cmm_err(const char *fmt) {
+  if (fmt != NULL)
+    fprintf(stderr, "error: %s\n", fmt);
+
+  if (lua_linenumber != LUA_INVALIDLINE) {
+      fprintf(stderr, "error: error noticed when reached "
+                      "<line number %d>\n", lua_linenumber);
+      lua_linenumber = LUA_INVALIDLINE;
+  }
+
+  if (errorjmp_set)
+  	longjmp(errorjmp, 1);
+
+  /* as a default case, if we haven't setjmp, we simply exit */
+  exit(1);
+}
+@
+
+The two functions below get [[cmm_err]] to handle [[longjmp]]ing and such.
+Theoretically they could be merged into one and implemented as a macro.
+<<error-handling functions>>=
+void cmm_err_wstr(const char *fmt, const char *s) {
+  if (fmt != NULL) {
+    fprintf(stderr, "error: ");
+    fprintf(stderr, fmt, s);
+    fprintf(stderr, "\n");
+  }
+  cmm_err((const char *) NULL);
+}
+
+void cmm_err_wint(const char *fmt, const int i) {
+  if (fmt != NULL) {
+    fprintf(stderr, "error: ");
+    fprintf(stderr, fmt, i);
+    fprintf(stderr, "\n");
+  }
+  cmm_err((const char *) NULL);
+}
+@
+
+To help catch memory allocation errors, we provide macro [[mem_assert]].
+
+<<macro definitions>>=
+#define mem_assert(EXP) ((EXP) ? (void)0 \
+                               : cmm_err_wint("(out of) memory error " \
+                                              "<"__FILE__":%d>", __LINE__))
+@ 
+
+To allow failed assertions to generate better error messages and to make it
+possible to recover from failed assertions, we provide [[cmm_assert]]--which
+in turn calls [[cmm_err]].
+
+<<macro definitions>>=
+#define cmm_assert(A, MSG) ((A) ? (void)0 : cmm_err(MSG))
+@ 
+
+Our signal handler does very little:
+
+<<error-handling functions>>=
+void cmm_sighandler(int sig) {
+  switch (sig) {
+  case SIGINT:
+	  cmm_err("user interrupt");
+  case SIGSEGV:
+      cmm_err("the interpreter had a SEGMENTATION FAULT");
+  default:
+      cmm_err("an unknown signal was caught");
+  }
+}
+@
+
+We also need to register our signal handler with the system with some
+code that will find its way into [[cmm_interp_open]]:
+
+<<register signal handlers>>=
+(void) signal(SIGINT , cmm_sighandler);
+(void) signal(SIGSEGV, cmm_sighandler);
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Bytecode Generation}
+% ----------------------------------------------------------------------------
+
+The main plan with bytecode generation is this: a Lua source file written using the functions listed in the interpreter user guide ([[manual.nw]]) is run using an embedded Lua interpreter that is extended with C functions implementing the {\PAL} Lua functions.  
+These C functions (defined in the [[encoding]] module) are more or less wrappers for C encoding functions that are automatically generated when the SLED definition of the interprer's instruction set ([[bytecode.sled]]) is run through the NJ Machine-Code Toolkit. 
+These generated functions (in [[encode.c]]) emit bytecode into relocatable memory blocks ([[RBlock]]s), which we use to represent {\PAL} sections.
+
+% ----------------------------------------------------------------------------
+\subsubsection{Lua Interaction Helpers}
+% ----------------------------------------------------------------------------
+
+To ease interactions with the embedded Lua interpreter, we write a few helper functions.
+[[lua_error_handle]] simply checks an error code returned by one of Lua's API functions for interpreting Lua code (e.g., [[lua_dofile]], [[lua_dostring]]).  
+If an error occurred from which we think we can recover, we call [[cmm_err]] with a (somewhat) helpful error message.
+If a seemingly horrible error occurred, we exit to the operating system with
+a non-zero exit code.
+Otherwise, if no error occurred, [[lua_error_handle]] returns to its caller.
+
+<<bytecode generation>>=
+void lua_error_handle(int err_code, const char *fn) {
+  switch (err_code) {
+  case 0:
+    return;
+  case LUA_ERRRUN:
+    cmm_err_wstr("run-time error while interpreting [%s]", fn);
+  case LUA_ERRSYNTAX:
+    cmm_err_wstr("a syntax error was found in [%s]", fn);
+  case LUA_ERRMEM:
+    fprintf(stderr, "error: Lua memory allocation error [%s]", fn);
+    break;
+  case LUA_ERRERR:
+    fprintf(stderr, "error: unrecoverable internal error [%s]", fn);
+    break;
+  case LUA_ERRFILE:
+    cmm_err_wstr("cannot open file [%s]", fn);
+  }
+  exit(1);
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\subsubsection{NJ Machine-Code Toolkit Library Interactions}
+% ----------------------------------------------------------------------------
+
+% ----------------------------------------------------------------------------
+\paragraph{Allocation and Closures}
+% ----------------------------------------------------------------------------
+
+As a client of the toolkit, our code is obligated to define functions [[mc_alloc]] and [[mc_alloc_closure]]; these must allocate memory to be used by Toolkit-generated code.
+
+We use David Hanson's ``arenas'' for allocation; they allow for one-shot
+de-allocation.
+
+<<global variable definitions>>=
+static Arena_T mc_arena = NULL;
+@ 
+
+<<bytecode generation>>=
+void *mc_alloc(int size, Mc_alloc_pool pool) {
+  void *a;
+
+  if (mc_arena == NULL) {
+    mc_arena = Arena_new();
+    mem_assert(mc_arena);
+  }
+
+  a = (void *) Arena_alloc(mc_arena, size, __FILE__, __LINE__);
+  mem_assert(a);
+  return a;
+}
+@ 
+
+While we allocate memory for closures, we must also keep track of pointers to these closures so we can later apply them with the toolkit API function [[apply_closure]].
+A simple array of pointers works here; if the array gets too small to fit the closures, we dynamically resize the array to twice its previous size.
+
+<<global variable definitions>>=
+static RClosure  *closures_base  = NULL;
+static RClosure  *closures_free  = NULL;
+static RClosure  *closures_limit = NULL;
+@ 
+
+<<bytecode generation>>=
+RClosure mc_alloc_closure(unsigned size, RBlock dest_block, 
+                                 unsigned dest_lc)
+{
+  /* note: RClosure is a typedef'd struct pointer */
+  RClosure a = (RClosure) mc_alloc(size, RClosure_pool);
+
+  /* store the closure in a "dynamic array" so it can later be applied */
+  if (closures_free >= closures_limit) {
+    RClosure *closures_new = realloc(closures_base, 
+                             2 * sizeof(RClosure) *
+                             (closures_limit - closures_base));
+    mem_assert(closures_new);
+    closures_limit = closures_new + 2*(closures_limit - closures_base);
+    closures_free  = closures_new + (closures_free - closures_base);
+    closures_base  = closures_new;
+  }
+  (closures_free++)[0] = a;
+
+  return a;
+}
+@
+
+To free all memory allocated for the Machine-code Toolkit since the last call
+to [[mc_free_all]], we simply free the contents of [[mc_arena]].
+
+<<bytecode generation>>=
+void mc_free_all(void) {
+  if (mc_arena != NULL) {
+    Arena_free(mc_arena);
+    Arena_dispose(&mc_arena);
+    mc_arena = NULL;
+  }
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\paragraph{Bytecode Relocation}
+% ----------------------------------------------------------------------------
+
+[[lua_relocate_block]] is the C function exported to Lua that implements bytecode relocation.  
+It pops an [[RBlock]] off the Lua stack, uses [[mc_alloc]] to find enough contiguous space in memory to store the [[RBlock]], and calls Toolkit API function [[set_address]] to permanently relocate it.  
+The 0 return value tells Lua no values are being returned from [[lua_relocate_block]].
+
+<<bytecode generation>>=
+int lua_relocate_block(lua_State *L) {
+  RBlock bl, oldbl;
+  void   *loc;
+
+  if (!lua_isuserdata(L, -1) || 
+      lua_tag(L, -1) != lua_RBlock_tag ||
+      (bl = (RBlock) lua_touserdata(L, -1)) == NULL)
+  {
+    lua_pop(L, 1);
+    cmm_err("internal error relocating block");
+  }
+
+  /* emit a HALT instruction at the end of the block */
+  oldbl = crb();
+  set_block(bl);
+  halt();
+  set_block(oldbl);
+
+  /* THIS NEEDS A SLIGHTLY REVISED VERSION OF mclib.c 
+   * the original mclib.c, as distributed on the net does _not_ include a
+   * relocated_pool; this is our own addition
+   */
+  loc = (void *) mc_alloc(block_size(bl), relocated_pool);
+
+  set_address(bl, (unsigned) loc);
+
+  lua_pop(L, 1);
+
+  return 0;
+}
+@
+
+Unfortunately [[lua_relocate_block]] only assigns a permanent address to an [[RBlock]] and does not actually relocate its contents (remember that we must use [[lua_relocate_block]] to relocate all blocks, then apply all closures, and then move the contents of the [[RBlock]]s into their permanent memory locations).
+[[lua_copy_block_contents]] helps here with the actual copying.
+It pops an [[RBlock]] off the Lua stack, looks up its permanent address, uses Toolkit API function [[block_copy]] to copy its contents, and returns 0 to tell Lua it's returning no values.
+
+<<bytecode generation>>=
+int lua_copy_block_contents(lua_State *L) {
+  RBlock bl;
+  
+  if (!lua_isuserdata(L, -1) ||
+      lua_tag(L, -1) != lua_RBlock_tag ||
+      (bl = (RBlock) lua_touserdata(L, -1)) == NULL)
+  {
+    lua_pop(L, 1);
+    cmm_err("internal error copying block contents");
+  }
+
+  assert(block_address_known(bl));
+  block_copy((unsigned char *) block_address(bl), bl, 0, block_size(bl));
+
+  lua_pop(L, 1);
+
+  return 0;
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\paragraph{Helper Functions}
+% ----------------------------------------------------------------------------
+
+Such functions in the API of the NJ Machine-Code Toolkit as
+[[apply_closure]] require error-handling functions that take a format
+string indicating the error and a variable number of arguments
+supplying values formatted by the string. 
+Because we cannot compile a variadic function into {\PAL},
+we are going to cheat like crazy
+<<bytecode generation>>=
+static void mclib_error(const char *fmt, const char *arg) {
+  fprintf(stderr, "Fatal error in machine-code toolkit: ");
+  fprintf(stderr, fmt, arg);
+  exit(1);
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\subsubsection{Loading an Assembly Unit}
+% ----------------------------------------------------------------------------
+
+As a side effect, [[load_assembly_unit]] changes the current assembly unit ([[unit]]) using the helper function [[enter_new_assembly_unit]].
+
+<<bytecode generation>>=
+int load_assembly_unit(char *s, assembly_unit_type source_type) {
+  lua_State     *L  = assembly_units_table.L;
+  RClosure      *cl;
+
+  /* enter new assembly unit */
+  assembly_unit *au = enter_new_assembly_unit(L);
+
+  errorjmp_set = 1;
+  if (setjmp(errorjmp)) {
+    errorjmp_set = 0;
+    /* don't try to apply closures that were created during the bad load */
+    closures_free = closures_base;
+
+    if (source_type == SRC_FILE) {
+      fprintf(stderr, "error: unrecoverable error; cannot finish loading "
+                      "file [%s]\n", s);
+    } else {
+      fprintf(stderr, "error: unrecoverable error; cannot finish loading "
+                      "assembly unit\n");
+    }
+    return 1;
+  } else {
+    assembly_unit *temp;
+
+    if (source_type == SRC_FILE) {
+      <<run Lua source file [[s]]>>
+    } else if (source_type == SRC_STRING) {
+      <<run Lua source string [[s]]>>
+    } else {
+      assert(source_type == SRC_STDIN);  /* this can't happen */
+      assert(s           == NULL);       /* this can happen if client errs */
+      <<run Lua source code on [[stdin]]>>
+    }
+    <<perform bytecode relocation>>
+  }
+
+  lua_linenumber = LUA_INVALIDLINE;
+
+  errorjmp_set = 0;
+  return 0;
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\paragraph{Source File Encoding}
+% ----------------------------------------------------------------------------
+
+To run a Lua source file, we call Lua API function [[lua_dofile]] and relegate error handling to [[lua_error_handle]].
+
+<<run Lua source file [[s]]>>=
+  lua_error_handle(lua_dofile(L, s), s);
+@
+
+To run a Lua source string, we call Lua API function [[lua_dostring]] and relegate error handling to [[lua_error_handle]].
+
+<<run Lua source string [[s]]>>=
+  lua_error_handle(lua_dostring(L, s), s);
+@ 
+
+To run Lua source code on [[stdin]], we call [[lua_dofile]] with a [[NULL]] argument (signifying that the Lua source code can be found on [[stdin]]).
+
+<<run Lua source code on [[stdin]]>>=
+  lua_error_handle(lua_dofile(L, NULL), "<stdin>");
+@ 
+
+% ----------------------------------------------------------------------------
+\paragraph{Relocating Relocatable Blocks}
+% ----------------------------------------------------------------------------
+
+Once we have finished emitting all bytecode into [[RBlock]]s, we are ready to assign permanent addresses to the [[RBlock]]s.
+Here, we iterates through all values stored in the Lua section table ([[section_table]])--which should be a table of all [[RBlock]]s created during bytecode generation--and call the Lua function [[relocate_block]] on each value.
+
+Note that we loop through all assembly units starting at [[au]].
+This is done because we may have read in multiple assembly units (see
+function [[lua_CMM_new_assembly_unit]] in the [[encoding]] module) and we need
+to properly relocate them in the correct order.
+
+<<perform bytecode relocation>>=
+  for (temp = au; temp != NULL; temp = temp->next) {
+    /* relocate all named sections */
+    lua_error_handle(lua_table_foreach(L,temp->section_table,"relocate_block"),
+                     "<internal code>");
+
+    /* relocate special block */
+    lua_pushusertag(L, (void *) temp->def_section, lua_RBlock_tag);
+    lua_relocate_block(L);
+  }
+@ 
+
+Now, each of the [[RBlock]]s we created to store bytecode have been assigned addresses although their contents have yet to be copied to their final memory locations.
+We must then make sure to apply all closures stored away in the C [[closures]] array to propagate permanent addresses to all [[RAddr]]s and [[RLabel]]s.
+
+<<perform bytecode relocation>>=
+  /* apply closures in closure table */
+  for (cl = closures_base; cl < closures_free; cl++) {
+    apply_closure(*cl, cl_emitm, (FailCont) mclib_error);
+  }
+
+  /* reclaim memory */
+  closures_free = closures_base;
+@ 
+
+Finally, we actually copy the contents of the relocated [[RBlock]]s into their permanent memory locations using Lua-style helper function ([[lua_copy_block_contents]]).
+
+<<perform bytecode relocation>>=
+  for (temp = au; temp != NULL; temp = temp->next) {
+    /* copy blocks */
+    lua_error_handle(lua_table_foreach(L, temp->section_table, 
+                                       "copy_block_contents"), 
+                     "<internal code>");
+  
+    /* copy special block */
+    lua_pushusertag(L, (void *) temp->def_section, lua_RBlock_tag);
+    lua_copy_block_contents(L);
+  }
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Bytecode Interpreting}
+% ----------------------------------------------------------------------------
+
+% ----------------------------------------------------------------------------
+\subsubsection{Initialization}
+% ----------------------------------------------------------------------------
+
+Finally, we get to the main part of the interpreter.
+By now we should know how many globals are used in the source {\PAL} code;
+this number has been stored in the global C variable [[num_globals]].
+We [[malloc]] space for them.
+
+<<allocate memory for globals>>=
+  /* we know precisely how much to malloc for globals */
+  if (globals == NULL) {
+    if (num_globals <= 0 || num_globals == INVALID) {
+      num_globals = 0;
+    } else {
+      globals = (vptr) malloc(sizeof(value) * num_globals);
+      mem_assert(globals);
+    }
+  }
+@
+
+% ----------------------------------------------------------------------------
+\subsubsection{[[interp_state]] utility functions}
+% ----------------------------------------------------------------------------
+[[interp_state_new]] and [[interp_state_free]] allocate and deallocate
+interpreter ``machine state" that is not stored on the stack.  This is the
+argument space and the value stack, corresponding to the registers of the
+interpreter ``machine." The sizes are given by the arguments to [[cmm_open]].
+This allows clients to treat the interpreter state as an opaque type.
+
+<<bytecode interpreting>>=
+interp_state* interp_state_new() {
+  interp_state* s = malloc(sizeof(*s));
+
+  s->values.s_base      = (valsptr) malloc(sizeof(value) * valstack_size);
+  mem_assert(s->values.s_base);
+  s->values.s_limit     = s->values.s_base + valstack_size;
+  s->values.s_free      = s->values.s_base - 1;
+
+  s->arguments = malloc(sizeof(value)*arguments_size);
+  mem_assert(s->arguments);
+  s->arguments_limit = s->arguments + arguments_size;
+
+  return s;
+}
+
+void interp_state_free(interp_state* s) {
+  free(s->values.s_base);
+  free(s->arguments);
+  free(s);
+}
+
+@
+% ----------------------------------------------------------------------------
+\subsubsection{The Main Interpreting Loop}
+% ----------------------------------------------------------------------------
+
+For the main interpreting loop, we use the ``matching'' decoding feature of the New Jersey Machine-Code Toolkit.  
+This code is pre-processed by the Toolkit and ends up in normal C format.
+
+<<bytecode interpreting>>=
+void run_interp(continuation* k) {
+  interp_state* s = interp_state_new();
+
+  /* stress test */
+  while(run_interp_n(k, s, 1));
+
+  interp_state_free(s);
+}
+
+int run_interp_n(continuation* k, interp_state* s, int num_bytecodes) {
+  int            err_occurred = 0, 
+                 done         = 0;
+  unsigned char *next;
+  int bytecode;
+  actptr       act;
+
+  assert(k != NULL);
+  assert(k->sp != NULL);
+  assert(k->code != NULL);
+  assert(s != NULL);
+  
+  thread* t = find_thread_c(k);
+  assert(t != NULL);
+
+  /* we have to allocate memory for globals here */
+  <<allocate memory for globals>>
+
+  /* The activation record is on the stack.  We fetch it through the stack pointer. */
+  act = actptr_from_sp(k->sp);
+  mem_assert(act >= (actptr)t->stack_base);
+
+
+  errorjmp_set = 1;
+  if (setjmp(errorjmp)) {
+    /* This is the exception handler.  If an error occurs, we long-jump here. */
+    errorjmp_set = 0;
+    fprintf(stderr, "error: unrecoverable runtime error at PC 0x%x\n", (unsigned)act->pc);
+    if (act->name)
+	  fprintf(stderr, "| Stack trace:\n");
+      fprintf(stderr, "| 0: %s()\n", act->name);
+    if (act->caller)
+	  activation_trace(act->caller);
+
+    if (act->name)
+      fprintf(stderr, "Try disassembling '%s' to find relevant instructions\n",
+                      act->name);
+  } else {
+    for (bytecode = 0; bytecode < num_bytecodes; bytecode++) {
+      /*
+      if (act->name) {
+        printf("%s: ",act->name);
+      }
+      disassemble_instruction(stdout, act->pc);*/  /* Handy for debugging interp */
+      match [next] act->pc to
+        <<matching statement>>
+      | HALT              => {
+                             cmm_err("fell off end of a C-- section");
+                             }
+      else cmm_err("unsupported instruction encoutered");
+      endmatch
+
+      if (err_occurred || done) break;
+    }
+
+    /* Save the stack and code pointers here in k. */
+    k->sp = act->stackdata;
+    k->code = act->pc;
+  }
+
+  errorjmp_set = 0;
+  return bytecode;
+}
+@ 
+
+The bulk of the matching statement's body follow from the operational semantics of the interpreter's instructions.
+For ease of understanding, the relevant operational rules are reproduced above each instruction's case in the matching statement.
+
+The one thing we must make sure to do in the body of our matching statement is to advance the program counter ([[pc]]) to the proper address in memory.
+The local C variable [[next]] is set to the address of the immediately next instruction, as stored in memory; control-flow instructions must do something more interesting than merely setting [[pc = next]], though.
+
+
+Literal value pushes, local/global stores and fetches are all straightforward.
+We push and pop values using our stack manipulation macros and functions (see modules [[value]] and [[stack]]), and use the [[locals]] and [[globals]] arrays for local and global operations.
+
+\useops{Literal}
+<<matching statement>>=
+    | PUSH(v, width)    => if (width > 32) {  /* FIX this could be better */
+                             width = sizeof(MP_T);
+                           }
+
+                           PUSH(to_CMM_value(v, width), s->values); 
+                           act->pc = next;
+@  
+
+\useops{Fetch-Local}
+\useops{Fetch-Global}
+<<matching statement>>=
+    | fetch_local(n)    => PUSH( act->locals[n], s->values); act->pc = next;
+    | fetch_global(n)   => PUSH(globals[n], s->values); act->pc = next;
+@ 
+
+\useops{Store-Local}
+\useops{Store-Global}
+<<matching statement>>=
+    | store_local(n)    =>  act->locals[n] = POP(s->values); act->pc = next;
+    | store_global(n)   => globals[n] = POP(s->values); act->pc = next;
+@ 
+
+Guarded local and global stores require one more step; we must first see if the expected boolean is true or false with a simple [[if]] statement.
+
+\useops{Guarded-Store-Local-True}
+\useops{Guarded-Store-Local-False}
+\useops{Guarded-Store-Global-True}
+\useops{Guarded-Store-Global-False}
+We first perform an underflow check to make sure that we can safely pop 2 values off the value stack (we do not use two sequential [[POP]]s here because that would introduce unnecessary intermediate pointer computations).
+We observe the next-to-top stack element, which we expect to be a boolean value.
+If we find the boolean is true, we store the top stack value (the value to be stored) in the proper location.
+Either way, we must decrement the [[values]] pointer by 2 to simulate the popping of 2 values off the value stack.
+
+<<matching statement>>=
+    | gstore_local(n)   => UNDERFLOW_CHECK(s->values, 2);
+                           if (STACK_ELT(s->values, -1).bool) {
+                             act->locals[n] = STACK_ELT(s->values, 0);
+                           }
+                           s->values.s_free -= 2;
+                           act->pc = next;
+
+    | gstore_global(n)  => UNDERFLOW_CHECK(s->values, 2);
+                           if (STACK_ELT(s->values, -1).bool) {
+                             globals[n] = STACK_ELT(s->values, 0);
+                           }
+                           s->values.s_free -= 2;
+                           act->pc = next;
+@ 
+
+[[FETCH_SP]] is an easy instruction to interpret.
+We simply push the current value of [[stackdata]].
+
+<<matching statement>>=
+    | FETCH_SP()        => {
+                           value v = value_zero();
+                           v.ptr   = (void *) act->stackdata;
+                           PUSH(v, s->values); 
+
+                           act->pc = next;
+                           }
+@ 
+
+Memory space fetches, stores, and guarded stores are more complex.
+They theoretically involve correctly aggregating / breaking up data into small pieces, arranged by the specified byte-order.
+For now, we only support the natural byte-order of the machine on which the interpreter is running (e.g., little-endian byte-order on x86 machines).
+
+\useops{Fetch}
+\useops{Store}
+\useops{Guarded-Store-True}
+\useops{Guarded-Store-False}
+<<matching statement>>=
+    | FETCH(sz,bo,al)   => {
+                           assert(bo == DEF_BYTE_ORDER);
+                           assert(al == DEF_ALIGN);
+                           if (sz <= 0 || sz > sizeof(value)*8)
+                             cmm_err_wint("cannot fetch %d bits", sz);
+                           <<fetch value from given address>>
+                           act->pc = next;
+                           }
+    | STORE(sz,bo,al)   => {
+                           assert(bo == DEF_BYTE_ORDER);
+                           assert(al == DEF_ALIGN);
+                           if (sz <= 0 || sz > sizeof(value)*8)
+                             cmm_err_wint("cannot fetch %d bits", sz);
+                           <<store given value at given address>>
+                           s->values.s_free -= 2;
+                           act->pc = next;
+                           }
+    | GSTORE(sz,bo,al)  => {
+                           assert(bo == DEF_BYTE_ORDER);
+                           assert(al == DEF_ALIGN);
+                           if (sz <= 0 || sz > sizeof(value)*8)
+                             cmm_err_wint("cannot fetch %d bits", sz);
+                           UNDERFLOW_CHECK(s->values, 3);
+                           if (STACK_ELT(s->values, -2).bool) {
+                             <<store given value at given address>>
+                           }
+                           s->values.s_free -= 3;
+                           act->pc = next;
+                           }
+@ 
+We only support fetches and stores in the machine's natural byte-order, so we
+can simply use [[memcpy]] from [[<stdlib.h>]] and trust it to properly
+aggregate / dis-aggregate data for unaligned multi-byte loads and stores.
+<<fetch value from given address>>=
+  {
+    value *fetched       = (value *) STACK_ELT(s->values, 0).ptr;
+    value  v             = value_zero();
+
+    cmm_assert(fetched != NULL, "attempted to FETCH at address NULL");
+
+    memcpy((void *) &v, (const void *) fetched, sz / 8);
+    STACK_ELT(s->values, 0) = v;
+  }
+@ 
+<<store given value at given address>>=
+  {
+    value *tostore       = (value *) STACK_ELT(s->values, -1).ptr;
+
+    cmm_assert(tostore != NULL, "attempted to STORE to address NULL");
+    memcpy(tostore, &(STACK_ELT(s->values, 0)), sz / 8);
+  }
+@ 
+The argument to the operator application instruction should be a pointer to an [[operator]] record.
+We simply dereference the function pointer stored within this record, and pass
+[[values]] as an argument to this function.
+Operator implementation functions return a new [[valstack]] so we set
+[[values]] to the result of this function call.
+
+\useops{ApplyOp}
+<<matching statement>>=
+    | APPLY_OPERATOR(o) => s->values = (((operator *) o)->f)(s->values); 
+                           /* REMOVE this print_value_stack call */
+                           print_value_stack(s->values.s_free, s->values.s_base, 
+                                             "values");
+                           act->pc = next;
+@
+``Fetching'' a rounding mode pushes the current hardware floating-point 
+rounding mode atop the value stack.
+``Storing'' a rounding mode involves popping a 2-bit value off the value stack
+and setting it to be the current hardware floating-point rounding mode.
+See the [[cmmfloat]] module for information about C language support for
+manipulating the hardware rounding mode.
+<<matching statement>>=
+    | FETCH_ROUND()     => PUSH(to_CMM_value(cmm_getround(),2), s->values);
+                           act->pc = next;
+    | STORE_ROUND()     => {
+                           value v  = POP(s->values);
+                           cmm_setround(v.bits2);
+                           act->pc = next;
+                           }
+@ 
+Fetching and storing from the argument space is not difficult.
+\useops{Push-Arg}
+\useops{Pop-Arg}
+<<matching statement>>=
+    | STORE_ARG(n)      => cmm_assert(s->arguments + n < s->arguments_limit,
+                                  "invalid register index to argument space");
+                           s->arguments[n] = POP(s->values); act->pc = next;
+    | FETCH_ARG(n)      => cmm_assert(s->arguments + n < s->arguments_limit,
+                                  "invalid register index to argument space");
+                           PUSH(s->arguments[n], s->values); act->pc = next;
+@ 
+
+For goto and branches, we conditionally (or unconditionally in the case of goto) assign a new value to [[pc]].
+
+\useops{Goto}
+<<matching statement>>=
+    | GOTO              => { 
+                           value v = POP(s->values);
+                           act->pc      = (bytecodeptr) v.ptr;
+                           }
+@ 
+\useops{CBranchT-True}
+\useops{CBranchT-False}
+\useops{CBranchF-True}
+\useops{CBranchF-False}
+<<matching statement>>=
+    | CBRANCHT(a)       => {
+                           value v = POP(s->values);
+                           if (v.bool) {
+                             act->pc = (bytecodeptr) a;
+                           } else { act->pc = next; }
+                           }
+    | CBRANCHF(a)       => {
+                           value v = POP(s->values);
+                           if (!v.bool) {
+                             act->pc = (bytecodeptr) a;
+                           } else { act->pc = next; }
+                           }
+@ 
+\useops{BranchTF-True}
+\useops{BranchTF-False}
+<<matching statement>>=
+    | BRANCHTF(a, b)    => {
+                           value v = POP(s->values);
+                           act->pc      = (bytecodeptr) (v.bool ? a : b);
+                           }
+@ 
+
+\useops{PushSymbol}
+The encoding function [[lua_CMM_push_symbol]] writes a pointer to a [[CMM_label]] in memory; here, we must actually find the address or structure the label represents.
+We push simple labels atop the value stack as actual memory addresses (to allow
+label arithmetic); all other [[CMM_label]]s are pushed atop the stack as
+[[CMM_label]]s.
+<<matching statement>>=
+    | PUSH_SYMBOL(sym)    => {
+                           CMM_label *lbl = (CMM_label *) sym;
+                           value      v   = value_zero();
+
+                           assert(lbl != NULL);   /* this can't happen */
+
+                           switch (lbl->ty) {
+                           case CMM_LABEL:
+                             {
+                             unsigned loc;
+                             if (!location_known(lbl->lbl.raddr))
+                               cmm_err_wstr("cannot push value of undefined "
+                                            "symbol \"%s\"", 
+                                            lbl->lbl.raddr->label->name);
+
+                             loc = location(lbl->lbl.raddr);
+                             v = to_CMM_value(loc, sizeof(void *) * 8);
+                             break;
+                             }
+                           case CMM_PROCEDURE:
+                           case CMM_CFUNCTION:
+                             v.ptr = (void *) lbl;
+                             break;
+                           default:
+                             cmm_err_wint("internal label error "
+                                          "(corrupt label 0x%x)", sym);
+                           }
+
+                           PUSH(v, (s->values));
+                           act->pc = next;
+                           }
+@ 
+
+We implement both {\PAL} and foreign C procedure calls with one matching case.
+
+<<matching statement>>=
+    | CALL(a)           => {
+                           value        v;
+                           CMM_label   *lbl;
+
+                           v    = POP(s->values);
+                           lbl  = (CMM_label *) v.ptr;
+                           ASSERT_EMPTY(s->values);
+                           if (lbl->ty == CMM_CFUNCTION) {
+                             <<perform C call>>
+                           } else if (lbl->ty != CMM_PROCEDURE) {
+                             if (lbl->ty == CMM_LABEL)
+                              cmm_err_wstr("target label '%s' not a procedure",
+                                           lbl->lbl.raddr->label->name);
+
+                             cmm_err_wint("target label (0x%x) not a procedure"
+                                          " and appears corrupted",(int)v.ptr);
+                           } else {
+                             <<perform {\PAL} call>>
+                           }
+                           }
+@ 
+
+First, to implement a {\PAL} procedure call, we must store information about the present activation in the current thread's activation stack and perform some pointer bookkeeping.
+We pop a pointer to a C [[procedure]] structure off the value stack, and dereference it to find needed information about the callee (so we can properly allocate new memory for stackdata and locals on its thread's stack.
+
+\useops{CMMCall}
+<<perform {\PAL} call>>=
+                           {
+                             annotations *ann  = (annotations *) a;
+                             procedure   *proc = lbl->lbl.proc;
+
+                             assert(ann  != NULL);
+                             assert(proc != NULL);
+                             cmm_assert(location_known(proc->raddr),
+                                      "cannot call undefined procedure");
+                            
+                             /* First, we set up the current activation. */
+                             act->pc = next;
+                             act->kappa = ann;
+
+                             /* Next, we allocate a new frame. */
+                             act->callee   = Cmm_AllocFrameNext(proc->num_locals, proc->stackdata_size, act->stackdata,t->stack_limit);
+                             act->callee->caller = act;
+
+                             /* Now, we move to the new frame and set it up. */
+                             act = act->callee;
+                             act->u   = new_uid(t);
+                             act->proc =  proc;
+                             act->name      = proc->raddr->label->name;
+                             act->pc  = (bytecodeptr) location(proc->raddr);
+
+                             /* When the matching statement is executed once
+                              * more during the next cycle of the [[for]] loop,
+                              * {\PAL} code interpreting will seamlessly
+                              * continue at the next procedure. */
+
+                           }
+@
+
+C calls can be tricky to perform because we need to specially call any registered C function by casting a stored function pointer to the correct C type and dereferencing it.
+Unfortunately we cannot support an infinite number of C function types.
+\emph{We need to create a partial stack record at all C calls so that the runtime system may inspect the currently active frame; we need to restore the partial record in case the runtime system modified any of its contents.}
+
+\useops{CCall}
+<<perform C call>>=
+                           {
+                           c_caller      call_helper;
+                           void        (*f) (void);
+                           lua_State    *L = c_func_table.L;
+                           unsigned int  i = lbl->lbl.cfunc_id;
+
+                           act->pc = next;
+
+                           <<[[name]] $\leftarrow$ name of C function>>
+
+                           <<[[call_helper]] $\leftarrow$ pointer to C caller>>
+                           <<[[f]] $\leftarrow$ pointer to C function>>
+
+                           <<use [[call_helper]] to call [[f]]>>
+
+                           }
+@
+
+We retrieve the descriptive name of the C function so we can output useful
+information during stack traces.
+
+<<[[name]] $\leftarrow$ name of C function>>=
+                           lua_pushtable(L, c_func_table);
+                           lua_rawgeti(L, -1, i);
+                           lua_pushstring(L, C_FUNC_NAME);
+                           lua_gettable(L, -2);
+                           /* TODO (djp): I don't understand what this does.
+                           if (!lua_isstring(L, -1)) {
+                             name = NULL;
+                           } else {
+                             name = lua_tostring(L, -1);
+                           } */
+     
+                           lua_pop(L, 3);  /* pop tables & retrieved value */
+@
+
+Retrieving [[call_helper]] and [[f]] simply involves some queries to Lua tables.
+
+<<[[call_helper]] $\leftarrow$ pointer to C caller>>=
+                           lua_pushtable(L, c_func_table);
+                           lua_rawgeti(L, -1, i);
+                           lua_assert_istable(L, -1, 
+                                              "internal error with c call");
+
+                           lua_pushstring(L, C_FUNC_CALLER);
+                           lua_gettable(L, -2);
+                           if (!lua_isuserdata(L, -1) ||
+                               lua_tag(L, -1) != lua_c_sig_tag ||
+                               (call_helper = (c_caller) 
+                                               lua_touserdata(L, -1)) == NULL)
+                           {
+                             lua_pop(L, 3); /* pop bogus val, tables */
+                             cmm_err("internal error with c call");
+                           }
+                           lua_pop(L, 1);   /* pop call_helper pointer */
+@
+<<[[f]] $\leftarrow$ pointer to C function>>=
+                           lua_pushstring(L, C_FUNC_POINTER);
+                           lua_gettable(L, -2);
+                           if (!lua_isuserdata(L, -1) ||
+                               lua_tag(L, -1) != lua_c_func_tag ||
+                               (f=(void(*)(void))lua_touserdata(L,-1)) == NULL)
+                           {
+                             lua_pop(L, 3); /* pop bogus val and 2 tables */
+                             cmm_err("internal error with c call");
+                           }
+                           lua_pop(L, 3);   /* pop pointer and 2 tables */
+@
+
+We make a call to [[call_helper]] to perform the C call.
+We simply pass the argument-passing space in and get it back out again
+(possibly with its contents altered).
+
+<<use [[call_helper]] to call [[f]]>>=
+                           s->arguments = call_helper(s->arguments, f);
+@ 
+
+{\PAL} tail calls are easier to implement than regular {\PAL} procedure calls because we need not save the activation record of the calling activation.
+In fact, we must effectively kill off the calling activation (we call [[dies_uid]] to signal the death of the activation).
+We pop a [[procedure *]] off the value stack to get the needed information about the callee.
+
+\useops{CMMTailCall}
+<<matching statement>>=
+    | CMM_TAIL_CALL     => {
+                           value      v;
+                           CMM_label *lbl;
+                           procedure *proc;
+
+                           v    = POP(s->values);
+                           lbl  = (CMM_label *) v.ptr;
+                           ASSERT_EMPTY(s->values);
+                           proc = lbl->lbl.proc;
+                           assert(proc != NULL);
+
+                           dies_uid(act->u);
+
+                           /* Because the old activation dies, we can simply
+                            * reuse the memory chunk it used on its thread's
+                            * stack for [[stackdata]] and [[locals]].  To
+                            * accomplish this, we ask Cmm_AllocFrameNext for a
+                            * frame after the current frame's caller, i.e.,
+                            * replacing the current frame.
+                            */
+                           assert(act->caller != NULL); /* we should never be tailcalling from the stub. */
+                           act = Cmm_AllocFrameNext(proc->num_locals, proc->stackdata_size, act->caller->stackdata,t->stack_limit); 
+
+                           cmm_assert(lbl->ty == CMM_PROCEDURE,
+                                      "target label not a procedure");
+
+                           cmm_assert(location_known(proc->raddr),
+                                      "cannot call undefined procedure");
+                           /* We assign a new UID since this is a conceptually a new frame. */
+                           act->u = new_uid(t);
+                           act->name      = proc->raddr->label->name;
+                           act->proc = proc;
+                           act->pc   = (bytecodeptr) location(proc->raddr);
+                           }
+@ 
+
+We implement both return rules with one matching case.
+\useops{ReturnDefault}
+\useops{ReturnAlt}
+<<matching statement>>=
+    | RETURN(i, count)  => { 
+                           lua_State *L;
+
+                           ASSERT_EMPTY(s->values);
+                           assert(i <= count);       /* this can't happen */
+                           
+                           /* FIX for now we allow walking off stack */
+                           if (act->stackdata == round_up(
+                                            (actptr *)(t->stack_base)+1)) {
+                             /* reclaim dead space */
+                             interval_list_free(t->dead_list);
+
+                             /*
+                              printf("[returned from specified procedure].\n");
+                             */
+
+                             done = 1;
+                             break;
+                           }
+
+                           /* reclaim dead space */
+                           dies_uid(act->u);
+                           <<restore activation record stored at [[caller]]>>
+
+                           }
+@ 
+
+If the [[caller]] has no [[kappa]] annotations, then we simply move to the
+[[caller]] frame (and print a warning).
+
+Otherwise, we check the annotation to determine the proper return continuation,
+  and we write its code pointer into [[act->caller->pc]].  Then we move to the
+  [[caller]] frame.
+
+<<restore activation record stored at [[caller]]>>=
+                           if (NULL == act->caller->kappa) {
+			     if (act->name) {
+			       fprintf(stderr, "WARNING: returning from %s to a caller with NULL kappa.\n", act->name);
+			     } else {
+			       fprintf(stderr, "WARNING: returning to a caller with NULL kappa.\n");
+			     }
+			   } else {
+			     L = act->caller->kappa->also_returns_to.L;
+			     lua_pushtable(L, act->caller->kappa->also_returns_to);
+
+			     /* we here assert that count = |returns| */
+			     cmm_assert(count == lua_getn(L, -1),
+				 "continuation count in return stmt. "
+				 "does not match number of return "
+				 "continuations");
+
+			     if (i != count) {
+                   /* We're returning to a non-standard return continuation.  Find
+                    * out what it is, and put the pc in act->caller->pc. */
+			       CMM_label *lbl;
+
+			       /* Lua tables 1-indexed; returns are 0-indexed */
+			       lua_rawgeti(L, -1, i + 1);
+			       if (!lua_isuserdata(L, -1) ||
+				   lua_tag(L, -1) != lua_CMM_label_tag ||
+				   (lbl = lua_touserdata(L, -1)) == NULL ||
+				   !CMM_label_defined(lbl))
+			       {
+				 lua_pop(L, 2); /* pop bogus label, table */
+				 cmm_err("invalid call-site label");
+			       }
+			       lua_pop(L, 1); /* pop label */
+
+			       cmm_assert(location_known(CMM_label_raddr(lbl)),
+				   "cannot return to undefined "
+				   "continuation");
+			       act->caller->pc = CMM_label_location(lbl);
+			     } /* else we're returning to the standard continuation, and
+                                * we don't have to do anything special. */
+			     lua_pop(L, 1); /* pop table */
+			   }
+
+                           act = act->caller;
+                           act->callee = NULL;
+@
+
+Next comes the cut instruction, one of the most difficult to implement.
+We begin by popping off a [[continuation]] pointer from the value stack and making sure it represents a valid cut continuation.
+We then save the current activation if the destination continuation is in a different thread and jump to the new thread.
+We kill off all aborted activations (ones that are ``above'' [[cont->dest_act]] in the activation chain of the destination thread).
+We restore state information from the destination activation and recover memory once used by the aborted activations.
+
+\useops{Cut}
+<<matching statement>>=
+    | CUT               => {
+                           value         v;
+                           continuation *cont;
+                           activation   *dest_act;
+
+                           v   = POP(s->values);
+
+                           cont = (continuation *) v.ptr;
+                           /* make sure cont is a valid cut continuation
+                            * FIX: we _do not_ check UIDs; there is currently no way to do this */
+                           check_cont(cont);
+                           
+                           /* Remember that [[pc]] is the current program counter and that we must store 
+                            * away [[next]] so that we do not end up in an infinite loop. */
+                           act->pc = next;
+                          
+                           /* Here's the activation we're cutting to. */
+                           dest_act = actptr_from_sp(cont->sp);
+                           
+                           /* What kind of CUT is it? */
+                           if (dest_act->u.thread != act->u.thread) {
+                               /* jump over to destination thread */
+                               t = find_thread(dest_act->u);
+                           } else if (dest_act->u.frame == act->u.frame) {
+                               /* if we're here, then we're cutting to a
+                                  continuation in the current activation */
+                               /* FIX : for now, just treat like GOTO */
+                               act->pc = cont->code;
+                               continue;
+                           }
+
+                           /* <kill off activations above [[dest_act]] in [[t]]> */
+ 
+                           act           = dest_act; /* move into the new frame */
+                           act->pc       = cont->code;  /* we take the pc from continuation, not from the frame,
+                                                      * since that is a return address. */
+                           act->callee   = NULL;     /* questionable.  Is this the right thing? */
+	                       }
+@
+We next kill off all applications ``above'' [[dest_act]] in the activation chain of the destination thread.\footnote{When we say ``above'', we refer to the transitive closure of the following relation: a callee's activation is directly ``above'' its caller's activation if they are in the same thread.}
+
+<<kill off activations above [[dest_act]] in [[t]]>>=
+                           /* FIX if callee is NULL what does that mean? */
+                           assert(cont->dest_act->callee != NULL);
+                           /* TODO (djp).  killing off continuations.  we don't have stack_free.
+                           dies_uid_range(
+                               (((actptr) t->stack_free)) - 1)->u,
+                               (cont->dest_act->callee)->u);*/
+@
+
+As final matching cases, we interpret the structure-related instructions.
+First comes [[DEFINE_PROC]].
+Leaving a procedure definition as an instruction allows us to store a pointer to the procedure's activation record within all of its continuations.
+This lets us quickly cut to the continuation without unnecessarily walking down the call stack.
+The argument to the [[DEFINE_PROC]] constructor should be a [[procedure *]].
+We need to store an activation pointer within each of the activations contained within the procedure.
+
+<<matching statement>>=
+    | DEFINE_PROC(p)    => {
+                           act->proc = (procedure *) p;
+                           act->pc = next;
+                           }
+@ 
+
+And its brother, [[END_PROC]].
+
+<<matching statement>>=
+    | END_PROC()        => {
+                           act->proc = NULL;
+                           cmm_err("procedure missing return/jump statement");
+                           }
+@ 
+
+[[BREAKPT]] is a debugging-related bytecode instruction that should do
+nothing at runtime.
+Its presence simply allows us to easily pause our interpreter in a C debugger
+when it is about to interpret a certain bytecode instruction.
+
+<<matching statement>>=
+    | BREAKPT()         => {
+                             int saved_verbosity = verbosity;
+                             verbosity           = 1;
+                             print_value_stack(s->values.s_free, s->values.s_base,
+                                               "values");
+                             verbosity           = saved_verbosity;
+                             act->pc = next;
+                           }
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Interpreter Interaction Initialization}
+% ----------------------------------------------------------------------------
+
+Next, we proceed onto our [[cmm_interp_open]] and [[cmm_interp_close]] functions.
+In [[cmm_interp_open]], we get everything ready for future source-code encoding and interpreting.
+[[cmm_interp_close]] closes down the interpreter safely.
+
+<<constant definitions>>=
+#define DEF_VALSTACK_SIZE 256
+#define DEF_ARGSPACE_SIZE 256
+@ 
+
+<<application initialization>>=
+int cmm_interp_open(int valstack_size, int argspace_size)
+{
+  <<register signal handlers>>
+
+  if (valstack_size <= 0) valstack_size = DEF_VALSTACK_SIZE;
+  if (argspace_size <= 0) argspace_size = DEF_ARGSPACE_SIZE;
+
+  /* FIX */
+  if (argspace_size <= 4) argspace_size = 4;
+
+  errorjmp_set = 1;
+  if (setjmp(errorjmp)) {
+    errorjmp_set = 0;
+    fprintf(stderr, "error: unrecoverable error; quitting interpreter\n");
+    return 1; /* signal error */
+  } else {
+    /* check basic C types */
+    check_value_types();
+
+    <<prepare for encoding library>>
+    <<initialize a Lua interpreter and the {\PAL} interpreter>>
+  }
+
+  errorjmp_set = 0;
+  return 0;
+}
+void cmm_interp_close(void) {
+  lua_State *lua_interp = assembly_units_table.L;
+
+  <<gracefully shut down>>
+}
+@
+
+% ----------------------------------------------------------------------------
+\subsubsection{Preparation and Initialization}
+% ----------------------------------------------------------------------------
+
+Initializing the {\PAL} interpreter involves a simple call to helper [[init_interp]].
+This helper initializes the operator table and a few other things (as well as
+starting up a Lua interpreter).
+
+<<initialize a Lua interpreter and the {\PAL} interpreter>>=
+  init_interp(valstack_size, argspace_size);
+@ 
+
+Before using the NJ Machine-Code Toolkit encoding library, we must first prepare by creating an array to store closures ([[RClosure]]s).
+
+<<constant definitions>>=
+#define DEF_CLOSURESARRAY_SIZE  1024
+@ 
+<<prepare for encoding library>>=
+  closures_base = (RClosure *) malloc(DEF_CLOSURESARRAY_SIZE*sizeof(RClosure));
+  mem_assert(closures_base);
+  closures_free = closures_base;
+  closures_limit = closures_base + DEF_CLOSURESARRAY_SIZE;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Putting it Together}
+% ----------------------------------------------------------------------------
+
+Putting it all together, we have [[interp.m]], the C file with NJ Machine-Code Toolkit constructs that must first be preprocessed by the toolkit and then compiled.
+
+<<interp.m>>=
+#include "interp.h"
+
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <math.h>
+#include <setjmp.h>
+#include <signal.h>
+
+#include "cmmfloat.h"
+#include "lualink.h"
+#include "encode.h"
+#include "ccall.h"
+#include "operator.h"
+#include "encoding.h"
+#include "uid.h"
+#include "types.h"
+#include "span.h"
+#include "stack.h"
+#include "controlflow.h"
+
+#include <cii/arena.h>
+#include <cii/mp.h>
+
+<<global variable definitions>>
+
+<<internal function prototypes>>
+
+<<utility functions>>
+<<bytecode generation>>
+<<bytecode interpreting>>
+
+<<application initialization>>
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Missing Details}
+% ----------------------------------------------------------------------------
+
+We left out a few minor details from the previous sections.
+First come [[#define]]'d constants:
+
+<<constant definitions>>=
+#define INVALID         (-1)
+@ 
+
+And then come global variables:
+
+<<global variable declarations>>=
+extern  int       arguments_size;
+extern  int       valstack_size;
+
+extern  int       num_globals;
+extern  vptr      globals;
+
+extern  int       max_args;
+
+extern  int       verbosity;
+@ 
+
+<<global variable definitions>>=
+int       valstack_size;
+int       arguments_size;
+
+int       max_args        = 0;
+
+int       num_globals     = INVALID;
+value    *globals         = NULL;
+
+int       verbosity       = 0;
+@
+
+% ----------------------------------------------------------------------------
+\paragraph{Shut Down}
+% ----------------------------------------------------------------------------
+
+Finally, we have to properly shut down the interpreter (this code sits in [[cmm_interp_close]]).
+
+<<gracefully shut down>>=
+
+/* free allocated space */
+
+free(globals);           globals       = NULL;
+
+free(closures_base);     closures_base = NULL; 
+
+    CMM_label_free_all();
+         span_free_all();
+     operator_free_all();
+  controlflow_free_all();
+assembly_unit_free_all();
+           mc_free_all();
+
+lua_close(lua_interp);
+lua_interpreter = NULL;
+@
+
+\endgroup

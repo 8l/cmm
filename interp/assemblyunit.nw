@@ -1,0 +1,238 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*- %
+
+\ifx\nointro\undefined
+This document contains the interface and implementation of {\PAL} assembly unit representation.
+\fi
+
+% ----------------------------------------------------------------------------
+\interface{[[assemblyunit]] : {\PAL} Assembly Units}
+% ----------------------------------------------------------------------------
+
+<<assemblyunit.h>>=
+#ifndef _ASSEMBLYUNIT_H
+#define _ASSEMBLYUNIT_H
+
+#include <assert.h>
+#include <mclib.h>
+#include <lua.h>
+#include "controlflow.h"
+#include "table.h"
+#include "types.h"
+#include "machine.h"
+
+#include <cii/arena.h>
+
+<<type definitions>>
+
+<<global variable declarations>>
+<<function prototypes>>
+
+#endif /* _ASSEMBLYUNIT_H */
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Data Structures}
+% ----------------------------------------------------------------------------
+
+To represent an assembly unit in the interpreter, we create the type
+[[assembly_unit]].
+This type allows us to keep track of all information that is common to code in
+an assembly unit yet not global to the interpreter.
+
+Note that we keep all [[assembly_unit]]s in an implicit chain (using the
+field [[next]]).  We have no way of finding the beginning of such a chain, but
+the linking allows us to load in multiple assembly units at once and then
+properly relocate the [[RBlock]]s associated with each one just loaded (in
+the correct order).
+
+NOTE: the [[definitions_yet]] field is a boolean indicating whether or not the
+interpreter has seen any label or procedure definitions in the assembly unit.
+
+<<type definitions>>=
+typedef struct au {
+  unsigned   int id;
+
+  byte_order byte_order;
+  unsigned   memsize;
+  unsigned   ptrsize;
+
+  RBlock     def_section;
+  table      section_table;
+  table      label_table;
+
+  unsigned   int definitions_yet;
+
+  struct au *next;
+} assembly_unit;
+@
+
+To distinguish assembly unit source strings from assembly unit source files,
+we create the [[typedef]]'d [[enum]] type [[assembly_unit_type]].
+
+<<type definitions>>=
+typedef enum {
+  SRC_STRING, SRC_FILE, SRC_STDIN
+} assembly_unit_type;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Managing Memory for [[assembly_unit]]s}
+% ----------------------------------------------------------------------------
+
+To abstract away from the details of memory management, this interface
+provides a function to create a new [[assembly_unit]] and a function that frees
+all existing [[assembly_unit]]s in memory.
+
+<<internal function prototypes>>=
+static assembly_unit *assembly_unit_new(void);
+@ 
+
+<<function prototypes>>=
+void assembly_unit_free_all(void);
+@ 
+
+Note that [[assembly_unit_new]] returns a pointer to an \emph{uninitialized} 
+[[assembly_unit]].
+The lower-level [[assembly_unit_new]] is \emph{not} to be confused with 
+function [[enter_new_assembly_unit]].
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Functions}
+% ----------------------------------------------------------------------------
+
+To signal the entering of a new assembly unit, [[enter_new_assembly_unit]]
+should be called; it returns a pointer to a fresh, initialized
+[[assembly_unit]] and updates global variable [[unit]] to point to this
+[[assembly_unit]].
+
+<<function prototypes>>=
+assembly_unit *enter_new_assembly_unit(lua_State *L);
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Global Variables}
+% ----------------------------------------------------------------------------
+
+To reduce unnecessary parameter-passing through a myriad of functions, we 
+maintain a global pointer to the [[assembly_unit]] representing the current
+assembly unit ([[unit]]).
+We also maintain a global table of all loaded [[assembly_unit]]s.
+
+<<global variable declarations>>=
+extern assembly_unit *unit;
+extern table          assembly_units_table;
+@ 
+
+<<global variable definitions>>=
+assembly_unit    *unit = NULL;
+table             assembly_units_table;
+@ 
+
+% ----------------------------------------------------------------------------
+\implementation{Assembly Units}
+% ----------------------------------------------------------------------------
+
+<<assemblyunit.c>>=
+#include "assemblyunit.h"
+
+#include <stdlib.h>
+#include "lualink.h"
+#include "encoding.h"
+#include "interp.h"
+
+<<internal static variable definitions>>
+<<global variable definitions>>
+
+<<internal function prototypes>>
+<<function definitions>>
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Memory Allocation}
+% ----------------------------------------------------------------------------
+
+We make use of Hanson's ``arenas'' (see \emph{C Interfaces and Implementations})
+to assist in allocating and de-allocating memory for [[assembly_unit]]s.
+
+<<internal static variable definitions>>=
+static Arena_T assembly_unit_arena = NULL;
+@ 
+
+<<function definitions>>=
+static assembly_unit *assembly_unit_new(void) {
+  assembly_unit *au;
+
+  if (assembly_unit_arena == NULL) {
+    assembly_unit_arena = Arena_new();
+    mem_assert(assembly_unit_arena);
+  }
+
+  au = (assembly_unit *) Arena_alloc(assembly_unit_arena, 
+                                     sizeof(assembly_unit),
+                                     __FILE__, __LINE__);
+  mem_assert(au);
+  return au;
+}
+
+void assembly_unit_free_all(void) {
+  if (assembly_unit_arena != NULL) {
+    Arena_free(assembly_unit_arena);
+    Arena_dispose(&assembly_unit_arena);
+    assembly_unit_arena = NULL;
+  }
+}
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Functions}
+% ----------------------------------------------------------------------------
+
+When we enter a new assembly unit, we must make sure to properly initialize
+a new [[assembly_unit]] record: we need to create empty table references, 
+default target-architecture values, etc.
+We use the constants [[#define]]d in [[machine.h]] to initialize the 
+architecture information to default values; these values may be updated by
+appropriate encoding functions in module [[encoding]] (examples include 
+[[lua_CMM_memsize]] and [[lua_CMM_byteorder]]).
+
+<<function definitions>>=
+assembly_unit *enter_new_assembly_unit(lua_State *L) {
+  static unsigned next_au_id = 1;
+
+  assembly_unit *au = assembly_unit_new();
+  mem_assert(au);
+
+  au->definitions_yet = 0;
+
+  au->id          = next_au_id++;
+  au->byte_order  = DEF_BYTE_ORDER;
+  au->memsize     = DEF_MEMSIZE;
+  au->ptrsize     = sizeof(void *) * 8;
+
+  au->def_section     = NULL;
+  au->section_table   = fresh_table();
+  au->label_table     = fresh_table();
+
+  au->section_table.L = au->label_table.L = L;
+  au->next            = NULL;
+
+  /* store assembly_unit in table */
+  lua_pushtable(L, assembly_units_table);
+  lua_pushnumber(L, (double) au->id);
+  lua_pushusertag(L, (void *) au, lua_assembly_unit_tag);
+  lua_settable(L, -3);
+  lua_pop(L, 1); /* pop the assembly_units_table */
+
+  /* reset global variables */
+  if (unit != NULL) {
+    unit->next       = au;
+  }
+  unit             = au;
+
+  /* create and enter default section */
+  assert(lua_gettop(L) == 0);
+  lua_CMM_section(L);
+
+  return au;
+}
+@

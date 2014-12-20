@@ -1,0 +1,31 @@
+
+                        The Quick C-- Compiler
+
+     ``A new perspective on programming-language infrastructure''
+                                                         
+This directory contains the source code for Quick C--.  If you write a
+compiler that emits C--, we'll turn your C-- into efficient machine
+code.  More information can be found at http://www.cminusminus.org.
+
+To build the compiler from source code, see the INSTALL document.  For
+the curious, the INSTALL document also contains some information about
+how the source code is organized.
+
+Once the compiler is built, to make effective use of it, you should
+read the release notes in doc/release.ps.  The notes describe what
+parts of the C-- specification are and are not currently supported.
+You can also try `man qc--'.  Quick C-- is still under development, so
+if there is a feature you need, please ask for it.
+
+The name `Quick C--' belongs to us, but the code is available free for
+any use in any field of endeavor.  You may redistribute Quick C-- in
+whole or in part.  We ask that, as a matter of courtesy, you
+acknowledge its source and include this README file.  You may modify
+Quick C-- and create derived works, with which you may do as you like,
+but the result may not be called Quick C-- without written consent.
+
+We want absolutely everyone to be able to use Quick C-- with
+confidence.  To that end, the software is placed in the public domain.
+It is not protected by copyright, and it is not protected by a
+``copyleft'' agreement like the one used by the Free Software
+Foundation.

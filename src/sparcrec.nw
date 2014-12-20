@@ -1,0 +1,724 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+\section{SPARC Recognizer}
+
+<<sparcrec.mli>>=
+val to_asm : Rtl.rtl -> string
+val is_instruction : Rtl.rtl -> bool
+@ 
+
+A few abbreviations.
+<<modules>>=
+module R  = Rtl
+module RU = Rtlutil
+module RP = Rtl.Private
+module SS = Space.Standard32
+module Down = Rtl.Dn
+module Up   = Rtl.Up
+
+@ 
+<<sparcrec.mlb>>=
+%head {: <<modules>> 
+         <<code to precede the labeler>>
+      :}
+%tail {: <<code to follow the labeler>>
+      :}
+
+%term <<names of types of terminals>>
+
+%%
+<<rules>>
+@ 
+
+\subsection{Utilities}
+<<code to precede the labeler>>=
+let infinity = Camlburg.inf_cost
+let guard b = if b then 0 else infinity
+
+let const32 b =
+  assert (Bits.width b = 32);
+  Nativeint.to_string (Bits.U.to_native b)
+
+let const64 b =
+  assert (Bits.width b = 64);
+  let hi32 = Bits.Ops.lobits 32 (Bits.Ops.shrl b (Bits.U.of_int 32 64)) in
+  let lo32 = Bits.Ops.lobits 32 b in
+  (Nativeint.to_string (Bits.U.to_native hi32),
+   Nativeint.to_string (Bits.U.to_native lo32))
+
+exception Error of string
+let sprintf   = Printf.sprintf
+let s         = Printf.sprintf
+let error msg = raise (Error msg)
+
+let rspace = ('r', R.BigEndian, Cell.of_size 32)
+let spl = RP.Reg(rspace, 14, R.C 1)
+let sp  = RP.Fetch(spl, 32)
+let ral = RP.Reg(rspace, 31, R.C 1)
+let ra  = RP.Fetch(ral, 32)
+let yregl = RP.Reg Sparcregs.y
+let yreg = RP.Fetch(yregl, 32)
+
+let idiomatic_reg_name n =
+  if n = 14 then "%sp"
+  else if n = 30 then "%fp"
+  else if n >= 0 && n < 8 then sprintf "%%g%i" n
+  else if n < 16 then sprintf "%%o%i" (n - 8)
+  else if n < 24 then sprintf "%%l%i" (n - 16)
+  else if n < 32 then sprintf "%%i%i" (n - 24)
+  else Impossible.impossible (sprintf "Register %%r%i doesn't exist" n)
+
+let positive b = Bits.Ops.gt b (Bits.zero 32)
+let negative b = Bits.Ops.lt b (Bits.zero 32)
+
+let in_proc = Reinit.ref false
+@ 
+
+\subsection{Recognizer terminals, nonterminals, and constructors}
+
+<<names of types of terminals>>=
+n w bits symbol
+@ 
+
+\subsection{Recognizer Rules}
+
+\paragraph{Constants}
+<<rules>>=
+lconst : Link(symbol, w) {: symbol#mangled_text :}
+const  : Bits(b:bits) [{: guard (Bits.width b = 32) :}]  {: const32 b :}
+pos    : Bits(b:bits) [{: guard (Bits.width b = 32 && positive b) :}]  {: const32 b :}
+neg    : Bits(b:bits) [{: guard (Bits.width b = 32 && negative b) :}]  {: const32 b :}
+
+constx : Bits(b:bits) [{: guard (Bits.width b = 64) :}] {: const64 b :}
+
+four   : Bits(bits)   [{: guard (Bits.eq bits (Bits.S.of_int 4 32)) :}] {:():}
+one    : Bits(bits)   [{: guard (Bits.eq bits (Bits.S.of_int 1 32)) :}] {:():}
+zero   : Bits(bits)   [{: guard (Bits.eq bits (Bits.S.of_int 0 32)) :}] {:():}
+@ 
+
+\paragraph{Location Types}
+<<rules>>=
+rreg   : Fetch(rregl, w) {: rregl :}
+rregl  : Reg('r', n:int) {: idiomatic_reg_name n :}
+
+freg   : Fetch(fregl, w) {: fregl :}
+fregl  : Reg('f', n:int) {: sprintf "%%f%i" n :}
+
+dreg   : Fetch(dregl, w) {: dregl :}
+dregl  : RegPair('f', n:int) {: sprintf "%%f%i" n :}
+
+dregnum   : Fetch(dregnuml, w) {: dregnuml :}
+dregnuml  : RegPair('f', n:int) {: n :}
+
+yreg : Fetch(yregl, w) {: yregl :}
+yregl : Reg('y', n:int) {: "%y" :}
+
+fsr : Fetch(fsrl, w) {: fsrl :}
+fsrl : Reg('c', n:int) [{: guard (n = 4) :}] {: "%fsr" :}
+
+-- this is stupid, but we don't know how to deal with
+-- changing register windows at this point, so this allows
+-- us to do an ugly hack.
+result_reg   : Fetch(Reg('i', n:int), w) {: sprintf "%%o%i" n :}
+result_regl  : Reg('i', n:int) {: sprintf "%%i%i" n :}
+
+arg_reg   : Fetch(Reg('o', n:int), w) {: sprintf "%%i%i" n :}
+arg_regl  : Reg('o', n:int) {: sprintf "%%o%i" n :}
+
+regl : rregl {: rregl :}
+regl : result_regl {: result_regl :}
+regl : arg_regl {: arg_regl :}
+
+reg : rreg {: rreg :}
+reg : result_reg {: result_reg :}
+reg : arg_reg {: arg_reg :}
+
+mem   : Fetch(meml, w) {: meml :}
+meml  : Mem(reg, w)    {: s "[%s]" reg :} -- indirect
+
+reg_or_const : reg   {: reg :}
+reg_or_const : const {: const :}
+
+target : lconst {: lconst :}
+@ 
+
+\paragraph{Special Locations}
+<<rules>>=
+pcl:  Reg('c',  0) {: () :}
+npcl: Reg('c',  1) {: () :}
+ccl:  Reg('c',  2) {: () :}
+spl:  Reg('r', 14) {: () :}
+fpl:  Reg('r', 30) {: () :}
+ral:  Reg('r', 31) {: () :}
+cwpl: Reg('k',  0) {: () :}
+
+pc:  Fetch(pcl,  w) {: () :}
+cc:  Fetch(ccl,  w) {: () :}
+sp:  Fetch(spl,  w) {: () :}
+ra:  Fetch(ral,  w) {: () :}
+cwp: Fetch(cwpl, w) {: () :}
+@ 
+
+\paragraph{Data movement}
+<<rules>>=
+inst : Store(dst:fregl, Ftoi(src:freg), w)
+  {: sprintf "fstoi %s, %s" src dst :}
+
+inst : Store(dst:fregl, Ftoi(src:dreg), w)
+  {: sprintf "fdtoi %s, %s" src dst :}
+
+inst : Store(dst:fregl, Itof(src:freg), w)
+  {: sprintf "fitos %s, %s" src dst :}
+inst : Store(dst:dregl, Itof(src:freg), w)
+  {: sprintf "fitod %s, %s" src dst :}
+
+inst : Store(dst:fregl, Ftof(src:freg), w)
+  {: sprintf "fmovs %s, %s" src dst :}
+inst : Store(dst:dregl, Ftof(src:freg), w)
+  {: sprintf "fstod %s, %s" src dst :}
+inst : Store(dst:fregl, Ftof(src:dreg), w)
+  {: sprintf "fdtos %s, %s" src dst :}
+
+-- load symbol
+inst : Store(dst:regl, src:lconst, w)
+  {: sprintf "set %s, %s" src dst :}
+
+-- load immediate
+inst : Store(dst:regl, src:const, w)
+  {: sprintf "set %s, %s" src dst :}
+
+-- register move
+inst : Store(dst:regl, src:reg, w)
+  {: sprintf "mov %s, %s" src dst :}
+
+inst : Store(dst:fregl, src:freg, w)
+  {: sprintf "fmovs %s, %s" src dst :}
+
+inst : Store(dst:regl, src:yreg, w)
+  {: sprintf "rd %s, %s" src dst :}
+
+-- THIS SHOULD BE DONE IN THE POSTEXPANDER
+inst : Store(dst:dregnuml, src:dregnum, w)
+  {: sprintf "fmovs %%f%d, %%f%d\nfmovs %%f%d, %%f%d" src dst (src+1) (dst+1):}
+
+-- memory load
+inst : Store(dst:regl, src:mem, w)
+  {: if w = 64 then sprintf "ldx %s, %s" src dst
+     else sprintf "ld %s, %s" src dst :}
+inst : Store(dst:regl, Zxbyte(src:mem), w)
+  {: sprintf "ldub %s, %s" src dst :}
+inst : Store(dst:regl, Zxhalf(src:mem), w)
+  {: sprintf "lduh %s, %s" src dst :}
+
+inst : Store(dst:regl, Sxbyte(src:mem), w)
+  {: sprintf "ldsb %s, %s" src dst :}
+inst : Store(dst:regl, Sxhalf(src:mem), w)
+  {: sprintf "ldsh %s, %s" src dst :}
+
+inst : Store(dst:fregl, src:mem, w)
+  {: sprintf "ld %s, %s" src dst :}
+inst : Store(dst:dregl, src:mem, w)
+  {: sprintf "ldd %s, %s" src dst :}
+
+inst : Store(dst:fsrl, src:mem, w)
+  {: sprintf "ld %s, %s" src dst :}
+
+-- memory store
+inst : Store(dst:meml, src:reg, w)
+  {: sprintf "st %s, %s" src dst :}
+inst : Store(dst:meml, Lobyte(src:reg), w)
+  {: sprintf "stb %s, %s" src dst :}
+inst : Store(dst:meml, Lohalf(src:reg), w)
+  {: sprintf "sth %s, %s" src dst :}
+
+
+inst : Store(dst:meml, src:freg, w)
+  {: sprintf "st %s, %s" src dst :}
+inst : Store(dst:meml, src:dreg, w)
+  {: sprintf "std %s, %s" src dst :}
+
+inst : Store(dst:meml, src:fsr, w)
+  {: sprintf "st %s, %s" src dst :}
+
+-- memory store to offset
+-- note that y must be a 13-bit constant...probably need a different
+-- rule that can split 32-bit constants.
+inst : Store(Mem(Add(x:reg, y:const),mw:w), src:reg, w)
+  {: sprintf "st %s, [%s+%s]" src x y :}
+inst : Store(Mem(Add(x:reg, y:const),mw:w), src:freg, w)
+  {: sprintf "st %s, [%s+%s]" src x y :}
+inst : Store(Mem(Add(x:reg, y:const),mw:w), src:dreg, w)
+  {: sprintf "std %s, [%s+%s]" src x y :}
+
+inst : Store(Mem(Add(x:reg, y:const), mw:w), src:fsr, w)
+  {: sprintf "st %s, [%s+%s]" src x y :}
+
+-- memory load from offset
+inst : Store(dst:regl, Fetch(Mem(Add(x:reg, y:const), mw:w), w), w)
+  {: sprintf "ld [%s+%s], %s" x y dst :}
+inst : Store(dst:fregl, Fetch(Mem(Add(x:reg, y:const), mw:w), w), w)
+  {: sprintf "ld [%s+%s], %s" x y dst :}
+
+inst : Store(dst:dregl, Fetch(Mem(Add(x:reg, y:const), mw:w), w), w)
+  {: sprintf "ldd [%s+%s], %s" x y dst :}
+
+inst : Store(dst:fsrl, Fetch(Mem(Add(x:reg, y:const), mw:w), w), w)
+  {: sprintf "ld [%s+%s], %s" x y dst :}
+@ 
+
+
+\paragraph{Arithmetic}
+<<rules>>=
+-- add
+inst : Store(dst:regl, Add(x:reg_or_const, y:reg), w)
+  {: sprintf "add %s, %s, %s" y x dst :}
+inst : Store(dst:regl, Add(x:reg, y:reg_or_const), w)
+  {: sprintf "add %s, %s, %s" x y dst :}
+
+-- sub
+inst : Store(dst:regl, Sub(x:reg, y:reg_or_const), w)
+  {: sprintf "sub %s, %s, %s" x y dst :}
+
+-- mul
+inst : Store(dst:regl, Mul(x:reg_or_const, y:reg), w)
+  {: sprintf "smul %s, %s, %s" y x dst :}
+inst : Store(dst:regl, Mul(x:reg, y:reg_or_const), w)
+  {: sprintf "smul %s, %s, %s" x y dst :}
+
+-- mulx
+inst : Par(Store(dst:regl, Mul(x:reg_or_const, y:reg), w),
+           Store(yregl, Sparcmulxhi(x2:reg_or_const, y2:reg), w))
+--  [{: guard (x = x2 && y = y2) :}]
+-- I'd like to check this, but Burg won't let me!
+  {: sprintf "smul %s, %s, %s" x y dst :}
+
+-- mulux
+inst : Par(Store(dst:regl, Mul(x:reg_or_const, y:reg), w),
+           Store(yregl, Sparcmuluxhi(x2:reg_or_const, y2:reg), w))
+--  [{: guard (x = x2 && y = y2) :}]
+-- I'd like to check this, but Burg won't let me!
+  {: sprintf "umul %s, %s, %s" x y dst :}
+
+-- quot
+inst : Store(dst:regl, Quot(x:reg, y:reg_or_const), w)
+  {: sprintf "sdiv %s, %s, %s" x y dst :}
+
+-- divu
+inst : Store(dst:regl, Divu(x:reg, y:reg_or_const), w)
+  {: sprintf "udiv %s, %s, %s" x y dst :}
+
+-- neg
+inst : Store(dst:regl, Neg(x:reg_or_const), w)
+  {: sprintf "neg %s, %s" x dst :}
+
+-- and
+inst : Store(dst:regl, And(x:reg, y:reg_or_const), w)
+  {: sprintf "and %s, %s, %s" x y dst :}
+inst : Store(dst:regl, And(x:reg_or_const, y:reg), w)
+  {: sprintf "and %s, %s, %s" y x dst :}
+
+-- or
+inst : Store(dst:regl, Or(x:reg, y:reg_or_const), w)
+  {: sprintf "or %s, %s, %s" x y dst :}
+inst : Store(dst:regl, Or(x:reg_or_const, y:reg), w)
+  {: sprintf "or %s, %s, %s" y x dst :}
+
+-- xor
+inst : Store(dst:regl, Xor(x:reg, y:reg_or_const), w)
+  {: sprintf "xor %s, %s, %s" x y dst :}
+inst : Store(dst:regl, Xor(x:reg_or_const, y:reg), w)
+  {: sprintf "xor %s, %s, %s" y x dst :}
+
+-- com
+inst : Store(dst:regl, Com(x:reg_or_const), w)
+  {: sprintf "not %s, %s" x dst :}
+
+-- shl
+inst : Store(dst:regl, Shl(x:reg, y:reg_or_const), w)
+  {: sprintf "sll %s, %s, %s" x y dst :}
+
+-- shrl
+inst : Store(dst:regl, Shrl(x:reg, y:reg_or_const), w)
+  {: sprintf "srl %s, %s, %s" x y dst :}
+
+-- shra
+inst : Store(dst:regl, Shra(x:reg, y:reg_or_const), w)
+  {: sprintf "sra %s, %s, %s" x y dst :}
+
+-- fdiv
+inst : Store(dst:fregl, Fdiv(x:freg, y:freg), w)
+  {: sprintf "fdivs %s, %s, %s" x y dst :}
+inst : Store(dst:dregl, Fdiv(x:dreg, y:dreg), w)
+  {: sprintf "fdivd %s, %s, %s" x y dst :}
+
+-- fmul
+inst : Store(dst:fregl, Fmul(x:freg, y:freg), w)
+  {: sprintf "fmuls %s, %s, %s" x y dst :}
+inst : Store(dst:dregl, Fmul(x:dreg, y:dreg), w)
+  {: sprintf "fmuld %s, %s, %s" x y dst :}
+
+-- fadd
+inst : Store(dst:fregl, Fadd(x:freg, y:freg), w)
+  {: sprintf "fadds %s, %s, %s" x y dst :}
+inst : Store(dst:dregl, Fadd(x:dreg, y:dreg), w)
+  {: sprintf "faddd %s, %s, %s" x y dst :}
+
+-- fsub
+inst : Store(dst:fregl, Fsub(x:freg, y:freg), w)
+  {: sprintf "fsubs %s, %s, %s" x y dst :}
+inst : Store(dst:dregl, Fsub(x:dreg, y:dreg), w)
+  {: sprintf "fsubd %s, %s, %s" x y dst :}
+
+-- fneg
+inst : Store(dst:fregl, Fneg(x:freg), w)
+  {: sprintf "fnegs %s, %s" x dst :}
+@ 
+To negate a double-precision floating-point value, we negate the most
+significant word, which contains the sign bit.
+The least significant word is simply copied.
+Strictly speaking, this ought to be handled in the postexpander.
+That would be good, because then we could get rid of [[dregnuml]].
+<<rules>>=
+inst : Store(dst:dregnuml, Fneg(x:dregnum), w)
+  {: sprintf "fnegs %%f%d, %%f%d\n\tfmovs %%f%d, %%f%d" x dst (x+1) (dst+1) :}
+@ 
+
+\paragraph{Control Flow}
+<<rules>>=
+-- call
+next: Store(regl, Add(pc, four), w) {: regl :}
+inst: Par(Goto(target), next)
+  {: sprintf "call %s, 0\n\tnop" target :}
+inst: Par(Goto(reg), next)
+  {: sprintf "call %s, 0\n\tnop" reg :}
+
+-- decrement register window and allocate space on the stack
+inst : Save(x:sp, y:neg)
+  {: if not !in_proc then (in_proc := true; sprintf "save %%sp, %s, %%sp" y)
+     else sprintf "! Evil recognizer deleted add %%sp, %s, %%sp" y :}
+
+inst : Save(x:neg, y:sp)
+  {: if not !in_proc then (in_proc := true; sprintf "save %%sp, %s, %%sp" x)
+     else sprintf "! Evil recognizer deleted add %%sp, %s, %%sp" x :}
+
+inst : Save(x:sp, y:pos)
+  {: sprintf "! Evil recognizer deleted add %%sp, %s, %%sp" y :}
+
+inst : Save(x:pos, y:sp)
+  {: sprintf "! Evil recognizer deleted add %%sp, %s, %%sp" x :}
+
+-- increment register window and deallocate space on the stack
+restore: Store(cwpl, Add(cwp, one), w) {: () :}
+inst : Par(Goto(ra), restore)
+    {: (in_proc := false; "ret\n\trestore") :}
+
+-- Trap 3 tells the OS to flush all reg window data
+inst: Store(cwpl, zero, w) {: "ta 3" :}
+
+-- cut to
+inst : Par(Goto(r:reg), Store(spl, reg, w))
+   {: sprintf "jmp %s\n\tmov %s, %%sp" r reg :}
+
+-- branches
+inst: Goto(target) {: sprintf "ba %s\n\tnop" target :}
+
+-- indirect branches
+inst: Goto(reg)    {: sprintf "jmp %s\n\tnop" reg :}
+
+-- carry and borrow
+inst: Store(ccl, Sparcaddcc(x:reg, y:reg_or_const), w)
+   {: sprintf "addcc %s, %s, %%g0" x y :}
+
+inst: Store(d:regl, Addc(x:reg, y:reg_or_const, Sparccarrybit(cc)), w)
+   {: sprintf "addx %s, %s, %s" x y d :}
+
+inst: Store(d:regl, Subb(x:reg, y:reg_or_const, Sparccarrybit(cc)), w)
+   {: sprintf "subx %s, %s, %s" x y d :}
+
+     -- assumption: x and y are the same in both sub-expressions
+inst: Par(Store(d:regl, Addc(x:reg, y:reg_or_const, Sparccarrybit(cc)), w),
+          Store(ccl, Sparcadcflags(x:reg, y:reg_or_const, Sparccarrybit(cc)), w))
+   {: sprintf "addxcc %s, %s, %s" x y d :}
+
+inst: Par(Store(d:regl, Subb(x:reg, y:reg_or_const, Sparccarrybit(cc)), w),
+          Store(ccl, Sparcsbbflags(x:reg, y:reg_or_const, Sparccarrybit(cc)), w))
+   {: sprintf "subxcc %s, %s, %s" x y d :}
+
+-- conditional branches
+inst: Store(ccl, Sparcsubcc(x:reg, y:reg_or_const), w)
+   {: sprintf "subcc %s, %s, %%g0" x y :}
+inst: Store(ccl, Sparcsubcc(x:freg, y:freg), w)
+   {: sprintf "fcmps %s, %s\n\tnop" x y :}
+inst: Store(ccl, Sparcsubcc(x:dreg, y:dreg), w)
+   {: sprintf "fcmpd %s, %s\n\tnop" x y :}
+
+inst: Guarded(Sparceq(cc), Goto(target))
+   {: sprintf "be %s\n\tnop" target :}
+inst: Guarded(Sparcne(cc), Goto(target))
+   {: sprintf "bne %s\n\tnop" target :}
+
+inst: Guarded(Sparcge(cc), Goto(target))
+   {: sprintf "bge %s\n\tnop" target :}
+inst: Guarded(Sparcgeu(cc), Goto(target))
+   {: sprintf "bgeu %s\n\tnop" target :}
+inst: Guarded(Sparcgt(cc), Goto(target))
+   {: sprintf "bg %s\n\tnop" target :}
+inst: Guarded(Sparcgtu(cc), Goto(target))
+   {: sprintf "bgu %s\n\tnop" target :}
+
+inst: Guarded(Sparcle(cc), Goto(target))
+   {: sprintf "ble %s\n\tnop" target :}
+inst: Guarded(Sparcleu(cc), Goto(target))
+   {: sprintf "bleu %s\n\tnop" target :}
+inst: Guarded(Sparclt(cc), Goto(target))
+   {: sprintf "bl %s\n\tnop" target :}
+inst: Guarded(Sparcltu(cc), Goto(target))
+   {: sprintf "blu %s\n\tnop" target :}
+
+inst: Guarded(Sparcfeq(cc), Goto(target))
+   {: sprintf "fbe %s\n\tnop" target :}
+inst: Guarded(Sparcfne(cc), Goto(target))
+   {: sprintf "fbne %s\n\tnop" target :}
+
+inst: Guarded(Sparcfge(cc), Goto(target))
+   {: sprintf "fbge %s\n\tnop" target :}
+inst: Guarded(Sparcfgt(cc), Goto(target))
+   {: sprintf "fbg %s\n\tnop" target :}
+
+inst: Guarded(Sparcfle(cc), Goto(target))
+   {: sprintf "fble %s\n\tnop" target :}
+inst: Guarded(Sparcflt(cc), Goto(target))
+   {: sprintf "fbl %s\n\tnop" target :}
+@ 
+
+\paragraph{Other Instructions}
+Why is this here?
+<<rules>>=
+inst : Nop() {: "! Why do you think there should be a nop? " :}
+@ 
+
+\paragraph{Diagnostic rules}
+<<rules>>=
+inst: any [1000] {: s "<%s>" any :}
+
+any : True  () {: "True"  :}
+any : False () {: "False" :}
+any : Link(symbol, w) {: s "Link(%s,%d)" (symbol#mangled_text) w :}
+any : Late(string, w) {: s "Late(%s,%d)" string w :}
+any : Diff(c1:any,c2:any) {: s "Diff(%s,%s)" c1 c2 :}
+any : Bits(bits)     {: sprintf "Bits(%s)" (Bits.to_string bits) :}
+
+any : Fetch (any, w) {: s "Fetch(%s,%d)" any w :}
+
+any : And(x:any, y:any) {: s "And(%s, %s)" x y :}
+any : Or(x:any, y:any)  {: s "Or(%s, %s)" x y :}
+any : Xor(x:any, y:any) {: s "Xor(%s, %s)" x y :}
+any : Com(x:any) {: s "Com(%s)" x :}
+
+
+any : Add(x:any, y:any) {: s "Add(%s, %s)" x y :}
+any : Mul(x:any, y:any) {: s "Mul(%s, %s)" x y :}
+any : Fadd(x:any, y:any) {: sprintf "Fadd(%s, %s)" x y :}
+any : Fsub(x:any, y:any) {: sprintf "Fsub(%s, %s)" x y :}
+any : Fmul(x:any, y:any) {: sprintf "Fmul(%s, %s)" x y :}
+any : Fdiv(x:any, y:any) {: sprintf "Fdiv(%s, %s)" x y :}
+
+any : Fneg(any) {: sprintf "Fneg(%s)" any :}
+any : Fabs(any) {: sprintf "Fabs(%s)" any :}
+
+any : Loword(any) {: sprintf "Loword(%s)" any :}
+
+any : BitInsert(x:any, y:any, z:any) {: sprintf "BitInsert(%s, %s, %s)" x y z :}
+any : BitExtract(lsb:any, y:any, n:w) {: sprintf "BitExtract(%s, %s, %d)" lsb y n :}
+any : Slice(n:w, lsb:n, y:any) {: sprintf "Slice(%d, %d, %s)" n lsb y :}
+
+any : Sx(any) {: s "Sx(%s)" any :}
+any : Zx(any) {: s "Zx(%s)" any :}
+any : F2f(n:w, w, any) {: sprintf "F2f(%d, %d, %s)" n w any :}
+any : F2i(n:w, w, any) {: sprintf "F2i(%d, %d, %s)" n w any :}
+any : I2f(n:w, w, any) {: sprintf "I2f(%d, %d, %s)" n w any :}
+any : Lobits(any, w) {: s "Lobits(%s, %d)" any w :}
+any : Mem(any, w) {: s "Mem(%s)" any :}
+any : Reg  (char, n:int) {: sprintf "Reg(%s, %d)" (Char.escaped char) n :}
+any : RegPair(char, n:int) {: sprintf "RegPair(%s, %d)" (Char.escaped char) n :}
+any : Store (dst:any, src:any, w)
+ {: s "Store(%s,%s,%d)" dst src w :}
+any : Kill(any) {: s "Kill(%s)" any :}
+
+any : Guarded(guard:any, any) {: s "Guarded(%s,%s)" guard any :}
+any : Par(l:any, r:any) {: s "Par(%s,%s)" l r :}
+any : Goto(any) {: s "Goto(%s)" any :}
+@ 
+
+\subsection{Interfacing {\rtl}s with the Expander}
+
+<<special cases for particular operators>>=
+| RP.App(("sub",   [w]), [x; y])  -> conSub    (exp x) (exp y)
+| RP.App(("subb",  [w]), [x; y; z]) -> conSubb (exp x) (exp y) (exp z)
+| RP.App(("add",   [w]), [x; y])  -> conAdd    (exp x) (exp y)
+| RP.App(("addc",  [w]), [x; y; z]) -> conAddc (exp x) (exp y) (exp z)
+| RP.App(("mul",   [32]), [x; y]) -> conMul    (exp x) (exp y)
+| RP.App(("neg",   [w]), [x])     -> conNeg    (exp x)
+| RP.App(("quot",  [w]), [x; y])  -> conQuot   (exp x) (exp y)
+| RP.App(("divu",  [w]), [x; y])  -> conDivu   (exp x) (exp y)
+(* maybe can be implemented with mulx instruction for SPARC 9
+| RP.App(("mulx",  [32;64]), [x; y]) -> conMulx (exp x) (exp y)
+*)
+
+| RP.App(("and",   [w]), [x; y]) -> conAnd    (exp x) (exp y)
+| RP.App(("or",    [w]), [x; y]) -> conOr     (exp x) (exp y)
+| RP.App(("xor",   [w]), [x; y]) -> conXor    (exp x) (exp y)
+| RP.App(("com",   [w]), [x])    -> conCom    (exp x)
+
+| RP.App(("shl",   [w]), [x; y]) -> conShl    (exp x) (exp y)
+| RP.App(("shrl",  [w]), [x; y]) -> conShrl   (exp x) (exp y)
+| RP.App(("shra",  [w]), [x; y]) -> conShra   (exp x) (exp y)
+
+| RP.App(("lobits",[32;8]),  [x]) -> conLobyte (exp x)
+| RP.App(("lobits",[32;16]), [x]) -> conLohalf (exp x)
+| RP.App(("lobits",[64;32]), [x]) -> conLoword (exp x)
+| RP.App(("zx", [8; 32]),    [x]) -> conZxbyte (exp x)
+| RP.App(("zx", [16;32]),    [x]) -> conZxhalf (exp x)
+| RP.App(("sx", [8; 32]),    [x]) -> conSxbyte (exp x)
+| RP.App(("sx", [16;32]),    [x]) -> conSxhalf (exp x)
+
+| RP.App(("sparc_subcc", [w]), [x; y]) -> conSparcsubcc (exp x) (exp y)
+| RP.App(("sparc_addcc", [w]), [x; y]) -> conSparcaddcc (exp x) (exp y)
+| RP.App(("sparc_mulx_hi", [w]), [x; y]) -> conSparcmulxhi (exp x) (exp y)
+| RP.App(("sparc_mulux_hi", [w]), [x; y]) -> conSparcmuluxhi (exp x) (exp y)
+| RP.App(("sparc_adcflags", [w]), [x; y; z]) -> conSparcadcflags (exp x) (exp y) (exp z)
+| RP.App(("sparc_sbbflags", [w]), [x; y; z]) -> conSparcsbbflags (exp x) (exp y) (exp z)
+| RP.App(("sparc_carrybit", _), [x]) -> conSparccarrybit (exp x)
+
+| RP.App(("sparc_eq",    [w]), [x]) -> conSparceq  (exp x)
+| RP.App(("sparc_ne",    [w]), [x]) -> conSparcne  (exp x)
+| RP.App(("sparc_ge",    [w]), [x]) -> conSparcge  (exp x)
+| RP.App(("sparc_geu",   [w]), [x]) -> conSparcgeu (exp x)
+| RP.App(("sparc_gt",    [w]), [x]) -> conSparcgt  (exp x)
+| RP.App(("sparc_gtu",   [w]), [x]) -> conSparcgtu (exp x)
+| RP.App(("sparc_le",    [w]), [x]) -> conSparcle  (exp x)
+| RP.App(("sparc_leu",   [w]), [x]) -> conSparcleu (exp x)
+| RP.App(("sparc_lt",    [w]), [x]) -> conSparclt  (exp x)
+| RP.App(("sparc_ltu",   [w]), [x]) -> conSparcltu (exp x)
+
+| RP.App(("sparc_feq",    [w]), [x]) -> conSparcfeq  (exp x)
+| RP.App(("sparc_fne",    [w]), [x]) -> conSparcfne  (exp x)
+| RP.App(("sparc_fge",    [w]), [x]) -> conSparcfge  (exp x)
+| RP.App(("sparc_fgt",    [w]), [x]) -> conSparcfgt  (exp x)
+| RP.App(("sparc_fle",    [w]), [x]) -> conSparcfle  (exp x)
+| RP.App(("sparc_flt",    [w]), [x]) -> conSparcflt  (exp x)
+
+| RP.App(("fdiv", [w]), [x; y; rm]) -> conFdiv (exp x) (exp y)
+| RP.App(("fmul", [w]), [x; y; rm]) -> conFmul (exp x) (exp y)
+| RP.App(("fadd", [w]), [x; y; rm]) -> conFadd (exp x) (exp y)
+| RP.App(("fsub", [w]), [x; y; rm]) -> conFsub (exp x) (exp y)
+| RP.App(("fneg", [w]), [x])        -> conFneg (exp x)
+
+| RP.App(("i2f", [w;w']), [x; rm]) -> conItof (exp x)
+| RP.App(("f2i", [w;w']), [x; rm]) -> conFtoi (exp x)
+     (* MISSING ASSERTION: %f2i ALWAYS ROUNDS TO ZERO *)
+| RP.App(("f2f", [w;w']), [x; rm]) -> conFtof (exp x)
+
+| RP.App((("add"|"sub"|"mul"|"sx"|"zx"|"lobits"|"bitInsert"|
+           "bitExtract"|"fabs"|"fneg"|"fdiv"|"fmul"|"fsub"|"fadd"|"f2f"|"f2i"|
+           "i2f"|"and"|"or"|"xor"|"com") as op, ws), xs)->
+    Impossible.impossible
+      (Printf.sprintf
+         "operator %%%s specialized to [%s] & applied to %d arguments"
+         op (String.concat "; " (List.map string_of_int ws)) (List.length xs))
+@
+And now we convert between RTLs and Burg constructors.
+<<code to follow the labeler>>=  
+let unimp = Impossible.unimp
+let const = function
+  | RP.Late(s,w)              -> unimp "sparc: late constants"
+  | RP.Bool(b)                -> unimp "sparc: bool"
+  | RP.Link(s,_,w)            -> conLink s w
+  | RP.Diff _                 -> error "PIC not supported"
+  | RP.Bits(b)                -> conBits(b)
+<<code to follow the labeler>>=  
+let rec exp = function
+  | RP.Const(k)               -> const (k)
+  | RP.Fetch(l,w)             -> conFetch (loc l) w
+  <<special cases for particular operators>>
+  | RP.App((o,_),_)           -> error ("unknown operator " ^ o)
+<<code to follow the labeler>>=  
+and loc l = match l with
+  | RP.Mem(('m', aff, _), w, e, ass) -> conMem (exp e) w
+  | RP.Reg((sp, _, _), i, R.C 1)     -> conReg     sp i
+  | RP.Reg((sp, _, _), i, R.C 2)     -> conRegPair sp i
+  | RP.Reg _                  -> unimp "quad registers and other large beasts"
+  | RP.Mem(_, _, _, _)        -> error "non-mem, non-reg cell"
+  | RP.Var _ | RP.Global _    -> error "var found"
+  | RP.Slice(w,i,l)           -> unimp "sparc: slice locations"
+@ 
+We recognize some special forms of single effects.  When is npc used
+and when is pc used?
+
+How to handle returns:
+
+ ret  is really jmpl %i7+8, %g0
+ retl is really jmpl %o7+8, %g0
+ 
+this is a bit of a problem for our code because the machinery has no
+idea that the return address is being placed in different registers
+maybe we should tell it that %i7 is the return address, which is a
+non-volatile register, so that it won't try to save and resore the
+value on the stack, which is pointless.  Should be okay as long as %o7
+is mentioned as volatile and isn't available to pass a parameter on a
+call.  For now, we will just be using the ``ret'' instruction because
+we don't do the so-called ``leaf optimization''.
+<<code to follow the labeler>>=  
+and effect = function
+  | RP.Store(RP.Reg(('c',_,_), i, c), r, _)
+    when (i = 1 (* i = npc *)) -> conGoto (exp r)
+(*
+  | RP.Store(RP.Reg('c',i, _), r, w)  -> error (sprintf "set $c[%d]" i)
+*)
+  | RP.Store(maybe_spl, RP.App(("add",_), [x;y]), _)
+    when (RU.Eq.loc maybe_spl spl && (RU.Eq.exp x sp || RU.Eq.exp y sp)) ->
+      conSave (exp x) (exp y)
+  | RP.Store(l,e,w)                   -> conStore (loc l) (exp e) w
+  | RP.Kill(l)                        -> unimp "sparc: kill effect"
+@
+We attempt to recognize register pairs.
+<<code to follow the labeler>>=  
+and regpair = function
+  | _ -> Impossible.impossible "Argument is not a register pair"
+@
+<<code to follow the labeler>>=
+and rtl (RP.Rtl es) = geffects es
+and geffects = function
+    | []          -> conNop ()
+    | [g, s]      -> guarded g s
+    | (g, s) :: t -> conPar (guarded g s) (geffects t)
+and guarded g eff = match g with
+  | RP.Const(RP.Bool b) -> if b then effect eff else conNop()
+  | _ -> conGuarded (exp g) (effect eff)
+@ 
+
+\subsection{The exported recognizer}
+
+We try not to immediately halt if something goes wrong but instead drop error messages into the assembly language.
+
+<<code to follow the labeler>>=
+let errmsg r msg =
+  List.iter prerr_string
+    [ "recognizer error: "; msg; " on "; RU.ToString.rtl r; "\n" ]
+
+let to_asm r =
+  try
+    let plan = rtl (Down.rtl (Simplify.rtl r)) in
+    plan.inst.Camlburg.action ()
+  with 
+  | Camlburg.Uncovered -> " not an instruction: " ^ RU.ToString.rtl r
+  | Error msg -> (errmsg r msg; " error in recognizer: " ^ msg)
+
+let is_instruction r =
+  try
+    let plan = rtl (Down.rtl (Simplify.rtl r)) in
+    plan.inst.Camlburg.cost < 100  (* should be true, but shade this... *)
+  with 
+  | Camlburg.Uncovered -> false
+  | Error msg -> (errmsg r msg; false)
+@ 

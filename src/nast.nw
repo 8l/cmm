@@ -1,0 +1,357 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+%
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+\section{Normalized Abstract-Syntax Tree}
+
+This is an AST, except we sort and organize everything.
+The key types are [[stmt]], [[proc]], and~[[t]].
+We begin with common abbreviations.
+<<exposed types>>=
+type ty  = Ast.ty
+type exp = Ast.expr
+type loc = Ast.name_or_mem
+
+type 'a marked = Ast.region * 'a
+
+type name = string
+type kind = string
+type convention = string
+type aligned    = int
+@
+Statements.  
+<<exposed types>>=
+type cformal  = Ast.region * kind * name * aligned option
+type actual   = kind * exp * aligned option
+type flow     = Ast.flow list
+type alias    = Ast.mem  list
+type range    = Ast.range
+type procname = string
+type label    = string
+type stmt =
+  | StmtAt of stmt * Ast.region
+  | If     of exp * stmt list * stmt list
+  | Switch of range option * exp * (range list * stmt list) list
+  | Label  of label
+  | Cont   of name * convention * cformal list
+  | Span   of exp * exp * stmt list
+  | Assign of loc list * Ast.guarded list
+  | Call   of loc list * convention * exp  * actual list * procname list * flow * alias
+  | Prim   of loc list * convention * name * actual list * flow
+  | Goto   of exp * label list
+  | Jump   of convention * exp * actual list * procname list
+  | Cut    of convention * exp * actual list * flow 
+  | Return of convention * (exp * exp) option * actual list
+  | Limitcheck of convention * exp * (exp * name) option (* (cookie,(failk,recname)) *)
+@ 
+Both compilation units and procedures can contain type and constant definitions.
+Because these are scoped, we accumulate these definitions in each
+procedure \emph{and} in the unit as a whole.
+Therefore they have their own type.
+<<exposed types>>=
+type typedefn  = ty * name list
+type constdefn = ty option * name * exp
+type compile_time_defns = {
+  types     : typedefn  marked list;
+  constants : constdefn marked list;
+}
+@ 
+Here is a normalized form of procedures and of (possibly initialized) data.
+Initialized data, as well as data in the form of [[SSpan]] and
+[[Procedure]], are found only at top level.
+<<exposed types>>=
+type proc = {
+    region        : Ast.region;
+    cc            : convention;
+    name          : name;
+    formals       : (kind * Ast.variance * ty * name * aligned option) marked list;
+    locals        : Ast.register marked list;
+    pdecls        : compile_time_defns;
+    continuations : (name * convention * cformal list) marked list;
+    labels        : name marked list;  (* code labels *)
+    stackdata     : datum marked list;
+    code          : stmt list;
+  }
+and  datum =
+  | Datalabel  of name
+  | Align      of int
+  | ReserveMem of ty * Ast.memsize * Ast.init option (*init always none on stackdata*)
+  | Procedure  of proc                               (* never on stackdata *)
+  | SSpan      of exp * exp * datum marked list      (* never on stackdata *)
+@ 
+And last, the normal form of a compilation unit.
+<<exposed types>>=
+type section = name * datum marked list
+type t = {
+  target   : Ast.arch marked list;
+  imports  : (Ast.region * Ast.ty option * Ast.import list) list;
+  exports  : (Ast.region * Ast.ty option * Ast.export list) list;
+  globals  : Ast.register marked list;
+  code_labels : name marked list list;
+  udecls   : compile_time_defns;
+  sections : section list
+}
+@ 
+<<nast.mli>>=
+<<exposed types>>
+val program : Ast.toplevel list -> t
+@ 
+\section{Implementation}
+
+One abbreviation, types, and a very important constant.
+<<nast.ml>>=
+module A = Ast
+<<exposed types>>
+let default_proc_section = "text"
+@ 
+First, some simple utility functions.
+<<nast.ml>>=
+let id ss = ss
+let null = function [] -> true | _ :: _ -> false
+
+let rflatten xs =
+  let add (r, xs) tail = List.fold_right (fun a t -> (r, a) :: t) xs tail in
+  List.fold_right add xs []
+
+
+
+let cformal (r, kind, name, aligned) = (r, Auxfuns.Option.get "" kind, name, aligned)
+let formal (r, (kind, variance, ty, name, aligned)) =
+  (r, (Auxfuns.Option.get "" kind, variance, ty, name, aligned))
+let actual (kind, name, aligned) = (Auxfuns.Option.get "" kind, name, aligned)
+let convention = Auxfuns.Option.get "C--"
+@ 
+Conversion of [[datum]].
+The name [[fdata]] is short for ``fold data.''
+<<nast.ml>>=
+let rec add_datum r d ds = match d with
+  | A.DatumAt (d, r) -> add_datum r d ds
+  | A.Label l -> (r, Datalabel l) :: ds
+  | A.Align n -> (r, Align n) :: ds
+  | A.MemDecl (t, s, init) -> (r, ReserveMem (t, s, init)) :: ds
+
+let fdata r = List.fold_right (add_datum r) 
+@ 
+The main idea in this module is CPS.
+We have a boatload of accumulating parameters, and eventually we get a
+program. 
+The parameters are:
+\begin{quote}
+\begin{tabular}{ll}
+[[imps]]& Imports\\
+[[exports]]& Exports\\
+[[lbls]]& Code labels\\
+[[ks]]& Continuations\\
+[[consts]]& Constant definitions\\
+[[types]]& Type definitions\\
+[[archs]]& Target-specific declarations\\
+[[data]]& Initialized data or stack data\\
+\end{tabular}
+\end{quote}
+Most of these accumulating parameters accumulate declarations.
+They are gathered in a record to ensure the OCaml compiler will
+compile calls to [[decl]] as tail calls.
+This bug has happened -- this is not premature optimization.
+<<nast.ml>>=
+type ('a) accumulation_disaster =
+  { imps : (A.region * A.ty option * A.import list) list
+  ; exps : (A.region * A.ty option * A.export list) list
+  ; lbls : 'a
+  ; ks : (Ast.region * (A.name * convention * (A.region * A.hint * A.name * aligned option) list)) list
+  ; consts : (A.region * (A.ty option * A.name * A.expr)) list
+  ; tys : (A.region * (A.ty * A.name list)) list
+  ; regs : (A.region * A.register list) list
+  ; archs : (A.region * A.arch list) list
+  ; data : ((A.region * datum) list) 
+  }
+
+let rec decl r accums d k = match d with
+  | A.DeclAt(x,r)   -> decl r accums x k
+  | A.Typedef d     -> k {accums with tys = ((r,d) :: accums.tys)}
+  | A.Import (t,ii) -> k {accums with imps = ((r,t,ii)::accums.imps)}
+  | A.Export (t,ee) -> k {accums with exps = ((r,t,ee)::accums.exps)}
+  | A.Const d       -> k {accums with consts = ((r,d) :: accums.consts)}
+  | A.Registers rs  -> k {accums with regs = ((r, rs) :: accums.regs)}
+  | A.Target    t   -> k {accums with archs = ((r, t) :: accums.archs)}
+  | A.Pragma        -> k accums
+@ 
+This is a generic lifting function.
+Function [[kmap f]] turns function [[f]] from a function on~[['a]] to
+a function on \mbox{[['a list]]}.
+The function has to supply a value to its continuation;
+if it doesn't, use [[kmap_none]].
+<<nast.ml>>=
+let rec kmap f cons r accums xs k = match xs with
+  | []      -> k [] accums
+  | x :: xs ->
+     kmap f cons r accums xs
+          (fun xs accums -> f r accums x (fun x accums -> k (cons x xs) accums))
+
+let kmap_none f r accums xs k =
+  let xk f r accums x k = f r accums x (k []) in
+  kmap (xk f) (fun _ _ -> []) r accums xs (fun _ -> k)
+@ 
+And now, processing a body item, which is liftable with [[kmap]].
+The continuation~[[k]] expects an optional statement, which is represented
+as a value of type [[stmt list -> stmt list]].
+If there can be no statement, [[k]]'s first argument is~[[id]].
+<<nast.ml>>=
+let rec body r accums b k = match b with
+| A.BodyAt(b,r) -> body r accums b k
+| A.DeclBody d  -> decl r accums d (k id)
+| A.StmtBody s  -> (<<match [[stmt]] [[s]] at [[r]] and continue with [[k]]>>)
+| A.DataBody ds -> k id {accums with data = (fdata r ds accums.data)}
+and bodies r = kmap body (fun add ss -> add ss) r
+@ 
+Here are statements.
+Because an [[Ast.stmt]] may be a declaration instead of a
+``real'' statement, this function may or may not supply an actual statement.
+Function [[cons]] is for the case where we do supply a statement;
+[[id]]~is used where there is no statement.
+Function [[atomic]] helps with the common case in which a statement
+has no substatements, and therefore no declarations.
+The CPS for the other cases is less scary than it looks---if you
+understand [[If]], you understand it all.
+<<match [[stmt]] [[s]] at [[r]] and continue with [[k]]>>=
+let rec stmt r s k = 
+  let cons s ss = StmtAt (s, r) :: ss in
+  let atomic s = k (cons s) accums in
+  match s with
+  | A.StmtAt(s,r) -> stmt r s k
+  | A.IfStmt (c,b1,b2)   ->
+    bodies r accums b2
+      (fun ss2 accums ->
+         bodies r accums b1 (fun ss1 accums -> k (cons(If(c,ss1,ss2))) accums))
+  | A.SwitchStmt (range,e,aa) ->
+      arms r accums aa
+        (fun aa accums ->
+          let stmt = cons (Switch (range, e, aa)) in
+          k stmt accums)
+  | A.LabelStmt l ->
+      k (cons (Label l)) {accums with lbls = ((r, l) :: accums.lbls)}
+  | A.ContStmt (n, formals) ->
+      let formals = List.map cformal formals in
+      let cc      = convention None in
+      let stmt    = cons (Cont (n, cc, formals)) in
+      k stmt {accums with ks = ((r, (n,cc,formals)) :: accums.ks)}
+  | A.SpanStmt(key,v,bs)   -> 
+      bodies r accums bs (fun ss accums -> k (cons (Span (key,v,ss))) accums)
+  | A.AssignStmt (ls, rs) ->
+      atomic (Assign (ls, rs))
+  | A.CallStmt (ls, cc, p, a's, tgts, flows) ->
+      let add a (flows, mems) = match a with
+      | A.Flow f -> (f :: flows, mems)
+      | A.Alias m -> (flows, m :: mems) in
+      let flows, mems = List.fold_right add flows ([], []) in
+      atomic (Call (ls, convention cc, p, List.map actual a's, tgts, flows, mems))
+  | A.PrimStmt (ls, cc, p, a's, flows) ->
+      atomic (Prim (ls, convention cc, p, List.map actual a's, flows))
+  | A.GotoStmt (e, tgts) ->
+      atomic (Goto (e, tgts))
+  | A.JumpStmt (cc, p, a's, tgts) ->
+      atomic (Jump (convention cc, p, List.map actual a's, tgts))
+  | A.CutStmt (e, a's, flows) ->
+      atomic (Cut (convention None, e, List.map actual a's, flows))
+  | A.ReturnStmt (cc, alt, a's) ->
+      atomic (Return (convention cc, alt, List.map actual a's))
+  | A.EmptyStmt
+  | A.CommentStmt _   -> k id accums
+  | A.LimitcheckStmt (cookie, cont) -> 
+      let cc   = convention None in
+      match cont with
+      | None -> atomic (Limitcheck (cc, cookie, None))
+      | Some cont ->
+          (* construct continuation for recovery *)
+          let formals = [] in
+          let name = Idgen.label "overflow-recovery continuation" in
+          let stmt = cons (Limitcheck (cc, cookie, Some (cont, name))) in
+          k stmt {accums with ks = ((r, (name,cc,formals)) :: accums.ks)} in
+stmt r s k
+@ PERHAPS IT SHOULD BE POSSIBLE TO SET THE CALLING CONVENTION FOR CUT TO
+AND FOR CONTINUATION?
+@
+Arm of a case statement.  Nothing interesting here.
+<<nast.ml>>=
+and arm r accums a k = match a with
+| A.ArmAt (a,r) -> arm r accums a k
+| A.Case (ranges,bs) -> 
+    bodies r accums bs (fun stmts accums -> k ((ranges, stmts)) accums)
+and arms r = kmap arm (fun x y -> x::y) r
+@
+A section simply accumulates data, so its continuation doesn't take an
+additional argument before [[imps]].
+In other words, [[section]] is like [[decl]] and not like [[body]] or
+[[stmt]]. 
+<<nast.ml>>=
+let rec section r accums s k = match s with
+| A.SectionAt (s,r) ->
+    section r accums s k
+| A.Decl d ->
+    decl r accums d k
+| A.SSpan(key, v, ss) ->
+    sections r {accums with data = []} ss
+      (fun saccums ->
+        let data' = (r, SSpan(key,v, saccums.data)) :: accums.data in
+        k {saccums with data = data'})
+| A.Datum d ->
+    k {accums with data = (add_datum r d accums.data)}
+| A.Procedure(cc,p,fs,bs,r) ->
+    bodies r { imps = accums.imps ; exps = accums.exps
+             ; lbls = [] ; ks = [] ; consts = [] ; tys = []
+             ; regs  = [] ; archs = accums.archs ; data = [] }
+           bs
+     (fun ss paccums ->
+       let cdecls = { constants = paccums.consts; types = paccums.tys } in
+       let p = { cc = convention cc; name = p; formals = List.map formal fs; code = ss;
+                 continuations = paccums.ks; labels = paccums.lbls; region = r;
+                 locals = rflatten paccums.regs; pdecls = cdecls;
+                 stackdata = paccums.data; } in
+      k {accums with imps  = paccums.imps;
+                     exps  = paccums.exps;
+                     lbls  = paccums.lbls :: accums.lbls;
+                     archs = paccums.archs;
+                     data  = (r,Procedure p)::accums.data})
+and sections r = kmap_none section r
+@ 
+At top level, we accumulate sections, where a section is a named list of data.
+Again, we could have a declaration at top level, so we use [[cons]]
+and [[id]] as before.  
+<<nast.ml>>=
+let rec toplevel r accums t k =
+  let cons s ss = (s, r) :: ss in
+  match t with
+  | A.ToplevelAt(t,r) ->
+      toplevel r accums t k
+  | A.Section(name, ss) ->
+      sections r {accums with data = []} ss
+        (fun saccums -> k (cons (name, saccums.data))
+                          {saccums with data = accums.data})
+  | A.TopDecl d ->
+      decl r accums d (k id)
+  | A.TopProcedure p ->
+      let t = A.Section(default_proc_section, [A.Procedure p]) in
+      toplevel r accums t k
+
+let program ts =
+  let checknull what l =
+    if not (null l) then Impossible.impossible ("some toplevel " ^ what) in
+  kmap toplevel (fun add t -> add t)
+       Srcmap.null
+       { imps = [] ; exps = [] ; lbls = [] ; ks = [] ; consts = []
+       ; tys = [] ; regs = [] ; archs = [] ; data = [] }
+       ts
+    (fun ss saccums ->
+      let _ = checknull "data" saccums.data in
+      let _ = checknull "continuations" saccums.ks in
+      { target = rflatten saccums.archs
+      ; imports = saccums.imps; exports = saccums.exps
+      ; code_labels = saccums.lbls
+      ; globals = rflatten saccums.regs
+      ; sections = List.map fst ss
+      ; udecls = { types = saccums.tys; constants = saccums.consts }
+      })

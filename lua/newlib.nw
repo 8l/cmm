@@ -1,0 +1,472 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+\section{Modules for building Lua libraries}
+
+In general, a library can add new types, global mutable state, and new
+functions to an interpreter.
+Interpreters are typically built by combining multiple libraries, and
+the combination determines the [[userdata]] and [[userstate]] types
+ultimately used in the interpreter's value and state.
+
+We encourage the use of parameterized modules so that libraries can be
+combined easily.  There is some run-time cost for the generality, but
+it can be minimized as discussed below.
+
+Building the interpreter takes place in three phases:
+\begin{enumerate}
+\item
+Different libraries are combined to determine the ultimate
+[[userdata]] and [[state]] types.
+The combination is then used to build an interpreter, which matches
+signature [[INTERP]].
+This step happens at compile time.
+\item
+The full interpreter is passed back to each library, so that each
+library can build a function suitable for initializing interpreters of
+built with those types.
+This step also happens at compile time.
+\item
+A fresh state is created and all the initialization functions are
+called, building a new, fully initialized interpreter.
+This step happens at run time, as often as desired---multiple
+interpreters coexist peacefully.
+\end{enumerate}
+@
+Here is everything that a library is deemed to need to know about an
+interpreter.
+This signature could be extended if necessary.
+The information is divided in two pieces: there is one [[INTERP]]
+piece,  which looks the same to all libraries.
+But each library sees its own [[VIEW]] piece, which provides functions
+that map to and from the type and state provided by that library.
+<<signatures>>=
+module type USERTYPE = sig
+  type 'a t                             (* type parameter will be Lua value *)
+  val tname : string  (* name of this type, for projection errors *)
+  val eq : ('a -> 'a -> bool) -> 'a t -> 'a t -> bool
+  val to_string : ('a -> string) -> 'a t -> string
+end
+
+module type USERSTATE = sig
+  type 'a t
+  val state : 'a -> 'a t
+end
+
+module type INIT = sig
+  type state
+  val init : state -> unit
+end
+
+module type INTERP = sig
+  module V : Luavalue.S
+  val fallback : string -> V.state -> V.value list -> V.value list
+end
+
+module type TYPEVIEW = sig
+  module I : INTERP
+  module U : USERTYPE
+  val map : I.V.value U.t I.V.map
+end 
+
+module type STATEVIEW = sig
+  module I : INTERP
+  module U : USERSTATE
+  val map : I.V.state -> I.V.value U.t
+end 
+@ 
+In principle, there could be four kinds of libraries:
+a [[BARECODE]] library uses only existing types and state;
+a [[FULL]] library adds both a new type and new state;
+a \emph{stateful} library could add only a new state; and
+a \emph{typeful} library could add only a new type.
+This interface currently supports only two of the four alternatives,
+but the others could be added easily enough.
+Each alternative requires its own view signature.
+<<newlib.mli>>=
+<<signatures>>
+module Client : sig
+  <<client signatures>>
+end
+<<client signatures>>=
+  module type BARECODE = functor (Interp : INTERP) -> INIT with type state = Interp.V.state
+  module type T = sig
+   module T : USERTYPE
+   module Make (Interp : INTERP) 
+               (T' : TYPEVIEW with module U = T and module I = Interp and
+module I.V = Interp.V)
+               : INIT with type state = Interp.V.state
+  end
+  module type S = sig
+   module S : USERSTATE
+   module Make (Interp : INTERP) 
+               (S' : STATEVIEW with module U = S and module I = Interp)
+               : INIT with type state = Interp.V.state
+  end
+  module type TS = sig
+   module T : USERTYPE
+   module S : USERSTATE
+   module Make (Interp : INTERP) 
+               (T' : TYPEVIEW  with module U = T and module I = Interp)
+               (S' : STATEVIEW with module U = S and module I = Interp)
+               : INIT with type state = Interp.V.state
+  end
+  module type TT = sig
+   module T1 : USERTYPE
+   module T2 : USERTYPE
+   module Make (Interp : INTERP) 
+               (T1' : TYPEVIEW with module U = T1 and module I = Interp)
+               (T2' : TYPEVIEW with module U = T2 and module I = Interp)
+               : INIT with type state = Interp.V.state
+  end
+@ 
+An interpreter requires at least one [[FULL]] library, so these two
+module combinators suffice to mix any number of any kind of libraries.
+Initialization takes place left to right, but ordinarily
+initialization of different libraries should be independent, so this
+shouldn't be an onerous restriction.
+<<newlib.mli>>=
+module Combine : sig
+  module TS_TS (L1 : Client.TS) (L2 : Client.TS) : Client.TS
+  module T_T   (L1 : Client.T)  (L2 : Client.T)  : Client.T
+  module TS_B  (L1 : Client.TS) (L2 : Client.BARECODE) :
+                   Client.TS with module T = L1.T and module S = L1.S
+  module T_S (L1 : Client.T) (L2 : Client.S) 
+             : Client.TS with module T = L1.T and module S = L2.S
+  module Sharing_T (Shared : Client.T) : sig
+    module TT_TT (L1 : Client.TT with module T1 = Shared.T)
+                 (L2 : Client.TT with module T1 = Shared.T)
+                 : Client.TT with module T1 = Shared.T
+    module Hide (L : Client.TT with module T1 = Shared.T) : Client.T 
+  end
+end
+module ConvertType (T : USERTYPE) : Lua.USERDATA
+module Convert (T : Client.T) : Lua.Lib.FULL
+module EmptyT : Client.T
+@ As is typical, it's less efficient to string together a bunch of
+pairs than it is to build larger tuples.
+Perhaps one day soon we will provide more alternatives---perhaps by
+generating them automatically.
+That's why we've left room for more sub-modules of [[Combine]].
+@
+\section{Implementation}
+
+If you understand the interfaces, there's nothing of interest here.
+It's all bookkeeping.
+<<newlib.ml>>=
+<<signatures>>
+module Client = struct
+  <<client signatures>>
+end
+
+module Combine = struct
+  <<combining modules>>
+end
+@ 
+@
+<<combining modules>>=
+  module T_T (L1 : Client.T) (L2 : Client.T) : Client.T = struct
+    type 'a ty = 
+      | L1 of 'a L1.T.t 
+      | L2 of 'a L2.T.t 
+    module T = struct
+      type 'a t = 'a ty
+      let tname = L1.T.tname ^ " or " ^ L2.T.tname
+      let eq veq x y = match x, y with
+      | L1 x,    L1 y    -> L1.T.eq veq x y
+      | L2 x,    L2 y    -> L2.T.eq veq x y
+      | _, _ -> false
+      let to_string vs = function
+        | L1 x -> L1.T.to_string vs x
+        | L2 x -> L2.T.to_string vs x
+   end
+   module Make (Interp : INTERP) 
+               (T' : TYPEVIEW  with module U = T and module I = Interp)
+               : INIT with type state = Interp.V.state =
+   struct
+      module V = Interp.V
+      module T1 = struct
+        module U = L1.T
+        module I = Interp
+        type 'a t = 'a L1.T.t
+        let map = { V.embed = (fun x -> T'.map.V.embed (L1 x))
+                  ; V.project = (fun v -> match T'.map.V.project v with
+                                        | L1 x -> x
+                                        | _ -> raise (V.Projection (v, L1.T.tname)))
+                  }
+      end
+      module T2 = struct
+        module U = L2.T
+        module I = Interp
+        type 'a t = 'a L2.T.t
+        let map = { V.embed = (fun x -> T'.map.V.embed (L2 x))
+                  ; V.project = (fun v -> match T'.map.V.project v with
+                                        | L2 x -> x
+                                        | _ -> raise (V.Projection (v, L2.T.tname)))
+                  }
+      end
+      module L1' = L1.Make (Interp) (T1)
+      module L2' = L2.Make (Interp) (T2)
+      type state = Interp.V.state
+      let init g = (L1'.init g; L2'.init g)
+  end
+end
+
+
+
+
+<<combining modules>>=
+module TS_B (L1 : Client.TS) (L2 : Client.BARECODE) 
+  : Client.TS with module T = L1.T and module S = L1.S =
+struct
+  module T = L1.T
+  module S = L1.S
+  module Make  (Interp : INTERP) 
+               (T' : TYPEVIEW  with module U = T and module I = Interp)
+               (S' : STATEVIEW with module U = S and module I = Interp)
+               : INIT with type state = Interp.V.state =
+    struct
+      module L1' = L1.Make (Interp) (T') (S')
+      module L2' = L2  (Interp)
+      type state = Interp.V.state
+      let init g = (L1'.init g; L2'.init g)
+    end
+end
+<<combining modules>>=
+module T_S (L1 : Client.T) (L2 : Client.S) 
+  : Client.TS with module T = L1.T and module S = L2.S =
+struct
+  module T = L1.T
+  module S = L2.S
+  module Make  (Interp : INTERP) 
+               (T' : TYPEVIEW  with module U = T and module I = Interp)
+               (S' : STATEVIEW with module U = S and module I = Interp)
+               : INIT with type state = Interp.V.state =
+    struct
+      module L1' = L1.Make (Interp) (T') 
+      module L2' = L2.Make (Interp) (S')
+      type state = Interp.V.state
+      let init g = (L1'.init g; L2'.init g)
+    end
+end
+@ 
+<<combining modules>>=
+  module Sharing_T (Shared : Client.T) = struct
+    module TT_TT (L1 : Client.TT with module T1 = Shared.T)
+                 (L2 : Client.TT with module T1 = Shared.T)
+                 : Client.TT with module T1 = Shared.T = 
+      struct
+        type 'a ty =
+          | L1 of 'a L1.T2.t 
+          | L2 of 'a L2.T2.t 
+        module T1 = Shared.T
+        module T2 = struct
+          type 'a t = 'a ty
+          let tname = L1.T2.tname ^ " or " ^ L2.T2.tname
+          let eq veq x y = match x, y with
+          | L1 x,    L1 y    -> L1.T2.eq veq x y
+          | L2 x,    L2 y    -> L2.T2.eq veq x y
+          | _, _ -> false
+          let to_string vs = function
+            | L1 x -> L1.T2.to_string vs x
+            | L2 x -> L2.T2.to_string vs x
+        end
+        module Make (Interp : INTERP) 
+                    (T1' : TYPEVIEW with module U = T1 and module I = Interp)
+                    (T2' : TYPEVIEW with module U = T2 and module I = Interp)
+               : INIT with type state = Interp.V.state =
+        struct
+          module V = Interp.V
+          module L1V = struct
+            module I = Interp
+            module U = L1.T2
+            let map = { V.embed = (fun x -> T2'.map.V.embed (L1 x))
+                      ; V.project = (fun v -> match T2'.map.V.project v with
+                                        | L1 x -> x
+                                        | _ -> raise (V.Projection (v, L1.T2.tname)))
+                      }
+          end
+          module L2V = struct
+            module I = Interp
+            module U = L2.T2
+            let map = { V.embed = (fun x -> T2'.map.V.embed (L2 x))
+                      ; V.project = (fun v -> match T2'.map.V.project v with
+                                        | L2 x -> x
+                                        | _ -> raise (V.Projection (v, L2.T2.tname)))
+                      }
+          end
+          module L1' = L1.Make (Interp) (T1') (L1V)
+          module L2' = L2.Make (Interp) (T1') (L2V)
+          type state = Interp.V.state
+          let init g = (L1'.init g; L2'.init g)
+        end (* Make *)
+      end (* TT_TT *)
+
+
+    module Hide (L : Client.TT with module T1 = Shared.T) : Client.T = 
+      struct
+        type 'a ty =
+          | L1 of 'a L.T1.t 
+          | L2 of 'a L.T2.t 
+        module T = struct
+          type 'a t = 'a ty
+          let tname = L.T1.tname ^ " or " ^ L.T2.tname
+          let eq veq x y = match x, y with
+          | L1 x,    L1 y    -> L.T1.eq veq x y
+          | L2 x,    L2 y    -> L.T2.eq veq x y
+          | _, _ -> false
+          let to_string vs = function
+            | L1 x -> L.T1.to_string vs x
+            | L2 x -> L.T2.to_string vs x
+       end
+       module Make (Interp : INTERP)
+                   (T' : TYPEVIEW with module U = T and module I = Interp) =
+         struct
+           module V = Interp.V
+           module T1 = struct
+             module U = L.T1
+             module I = Interp
+             type 'a t = 'a L.T1.t
+             let map = { V.embed = (fun x -> T'.map.V.embed (L1 x))
+                       ; V.project = (fun v -> match T'.map.V.project v with
+                                             | L1 x -> x
+                                             | _ -> raise (V.Projection (v, L.T1.tname)))
+                       }
+           end
+           module T2 = struct
+             module U = L.T2
+             module I = Interp
+             type 'a t = 'a L.T2.t
+             let map = { V.embed = (fun x -> T'.map.V.embed (L2 x))
+                       ; V.project = (fun v -> match T'.map.V.project v with
+                                             | L2 x -> x
+                                             | _ -> raise (V.Projection (v, L.T2.tname)))
+                       }
+           end
+           module L' = L.Make (Interp) (T1) (T2)
+           module S' = Shared.Make (Interp) (T1)
+           type state = Interp.V.state
+           let init g = S'.init g; L'.init g
+        end (* Make *)
+      end (* Hide *)
+  end (* Sharing_T *)
+@
+         
+
+
+<<combining modules>>=
+  module TS_TS (L1 : Client.TS) (L2 : Client.TS) : Client.TS = struct
+    type 'a ty = 
+      | L1 of 'a L1.T.t 
+      | L2 of 'a L2.T.t 
+    type 'a state = { l1 : 'a L1.S.t ; l2 : 'a L2.S.t }
+    module T = struct
+      type 'a t = 'a ty
+      let tname = L1.T.tname ^ " or " ^ L2.T.tname
+      let eq veq x y = match x, y with
+      | L1 x,    L1 y    -> L1.T.eq veq x y
+      | L2 x,    L2 y    -> L2.T.eq veq x y
+      | _, _ -> false
+      let to_string vs = function
+        | L1 x -> L1.T.to_string vs x
+        | L2 x -> L2.T.to_string vs x
+   end
+   module S = struct
+     type 'a t = 'a state
+     let state x = { l1 = L1.S.state x ; l2 = L2.S.state x }
+   end
+   module Make (Interp : INTERP) 
+               (T' : TYPEVIEW  with module U = T and module I = Interp)
+               (S' : STATEVIEW with module U = S and module I = Interp)
+               : INIT with type state = Interp.V.state =
+   struct
+      module V = Interp.V
+      module T1 = struct
+        module U = L1.T
+        module I = Interp
+        type 'a t = 'a L1.T.t
+        let map = { V.embed = (fun x -> T'.map.V.embed (L1 x))
+                  ; V.project = (fun v -> match T'.map.V.project v with
+                                        |L1 x -> x
+                                        | _ -> raise (V.Projection (v, L1.T.tname)))
+                  }
+      end
+      module S1 = struct
+        module U = L1.S
+        module I = Interp
+        type 'a t = 'a L1.S.t
+        let map s = (S'.map s).l1
+      end
+      module T2 = struct
+        module U = L2.T
+        module I = Interp
+        type 'a t = 'a L2.T.t
+        let map = { V.embed = (fun x -> T'.map.V.embed (L2 x))
+                  ; V.project = (fun v -> match T'.map.V.project v with
+                                        | L2 x -> x
+                                        | _ -> raise (V.Projection (v, L2.T.tname)))
+                  }
+      end
+      module S2 = struct
+        module U = L2.S
+        module I = Interp
+        type 'a t = 'a L2.S.t
+        let map s = (S'.map s).l2
+      end
+      module L1' = L1.Make (Interp) (T1) (S1)
+      module L2' = L2.Make (Interp) (T2) (S2)
+      type state = Interp.V.state
+      let init g = (L1'.init g; L2'.init g)
+  end
+end
+@
+
+
+<<newlib.ml>>=
+module ConvertType (T : USERTYPE) : Lua.USERDATA with type 'a t = 'a T.t = struct
+    type 'a t = 'a T.t
+    let tname = T.tname
+    let eq = T.eq
+    let to_string = T.to_string
+    type 'a state = int
+    let state () = 3
+end
+
+module Convert (T : Client.T) : Lua.Lib.FULL = struct
+    module U = ConvertType(T.T)
+    module M (This : Lua.Lib.FULL_VIEW with type 'a t = 'a T.T.t and type 'a
+state = 'a U.state) = struct
+        module Typeview : TYPEVIEW with module I.V = This.Interp.V and type
+'a U.t = 'a T.T.t = struct
+            module I = This.Interp
+            module U = T.T
+            let map = This.map
+        end
+        module Init = T.Make (This.Interp) (Typeview)
+
+        let init = Init.init
+    end
+end
+
+module EmptyT : Client.T = struct
+    module T : USERTYPE = struct
+        type 'a t = unit
+        let tname = "EMPTY Client.T"
+        let eq _ x y = x = y
+        let to_string _ _ = "EMPTY Client.T"
+    end
+
+    module Make (Interp : INTERP)
+                (T' : TYPEVIEW with module U = T and module I = Interp)
+                : INIT with type state = Interp.V.state = struct
+        type state = Interp.V.state
+        let init _ = ()
+    end
+end
+@
+

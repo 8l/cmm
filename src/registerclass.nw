@@ -1,0 +1,333 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+%-------------------------------------------------------------------
+\subsection{Register Class Trees}
+%-------------------------------------------------------------------
+A register class is simply a set of hardware registers.  We would like to 
+be able to ask things such as
+\begin{itemize}
+\item What is the alias set of a class, ie what is the set of registers that the
+class overlaps with in hardware?
+\item Are two classes alias equivalent?  ie $alias(C_1) = alias(C_2)$?
+\item Is one class a subset of another under aliasing?  ie 
+$alias(C_1) \subset alias(C_2)$?
+\item Is it possible two assignments from two different classes to alias?  ie 
+\[alias(class_{n1}) \cap class_{n2} \neq \emptyset \vee class_{n1} 
+\cap alias(class_{n2}) \neq \emptyset\] 
+\end{itemize}
+
+<<register class interface>>=
+module type REGISTERCLASS = sig
+  type t = Register.Set.t
+  val is_empty: t -> bool
+  val aliases: t -> t
+  val alias_eq: t -> t -> bool
+  val alias_contained:  t -> t -> bool
+  val may_alias: t -> t -> bool
+  val inter: t -> t -> t
+  val eq: t -> t -> bool
+  val to_string: t -> string
+  val cardinal: t -> int
+  val space_to_class: Rtl.space -> t
+  val map_class: Rtl.space -> t -> unit
+  val mkClass: Rtl.space -> ('a, 'b, 'c) Target.t -> t
+  val init: Register.t list -> unit
+end
+
+@
+
+<<register classes>>=
+
+module RegisterClass:REGISTERCLASS = struct
+  type t = RS.t 
+  let is_empty = RS.is_empty
+  let inter c1 c2 = RS.inter c1 c2
+  let eq c1 c2 = RS.equal c1 c2
+  let to_string = RS.to_string
+  let cardinal = RS.cardinal
+  let class_map = Spacetbl.create 5
+  let map_class s c = Spacetbl.add class_map s c
+  let space_to_class s = Spacetbl.find class_map s
+@
+
+We need to keep around the universe of registers.  Sigh.
+
+<<register classes>>=        
+  
+  let fromList l = List.fold_left (fun set reg -> RS.add reg set) RS.empty l      
+  let all_regs = ref RS.empty 
+  let init allregs = 
+    all_regs := List.fold_left (fun set reg -> RS.add reg set) RS.empty allregs
+@ 
+
+To get the aliases for one class, filter the global set of registers on
+whether or not there is a register in [[c]] that aliases.  This does result
+in scanning the register class set [[c]] quite a bit, but I think it should
+be better than creating several mostly equal sets (the set of registers
+that alias with each register in the class) and then unioning them.
+
+<<register classes>>=        
+
+  let aliases c = 
+    let alias_filter reg = RS.exists (fun elt -> RU.MayAlias.regs reg elt) c in
+    RS.filter alias_filter !all_regs
+	  
+  let alias_eq c1 c2 = RS.equal (aliases c1) (aliases c2)
+  let alias_contained c1 c2 = RS.subset (aliases c1) (aliases c2)
+       
+  let may_alias c1 c2 = not (is_empty (inter (aliases c1) (aliases c2)))
+      
+  let mkClass space target = 
+    RS.fold 
+      (fun reg set -> if Target.fits target space reg then 
+        RS.add reg set else set)
+      !all_regs RS.empty
+end
+@ 
+
+%-------------------------------------------------------------------
+\subsection{Register Class Trees}
+%-------------------------------------------------------------------
+
+We represent the register classes in a tree structure to better compute the 
+squeeze estimate.  I'm sure that the list operations I'm doing are horribly slow;
+if this worries you and you have suggestions please let me know!
+
+<<class tree interface>>=
+  module type CLASSTREE = sig
+    type t = Vertex of RegisterClass.t list ref * t list ref
+    val classes: t -> RegisterClass.t list
+    val down: t -> RegisterClass.t list
+    val children: t -> t list
+    val mkTree: RegisterClass.t list -> t
+    val mkTreeList:  Rtl.space list -> Register.t list ->('a, 'b, 'c) Target.t -> t list
+    val space_to_tree: Rtl.space -> t
+  end
+        
+@             
+
+<<class trees>>=  
+  module ClassTree:CLASSTREE = struct
+    type t = Vertex of RegisterClass.t list ref * t list ref
+    let tree_map = Spacetbl.create 5
+    let space_to_tree s = Spacetbl.find tree_map s
+    let classes = function Vertex(c, _) -> !c 
+    let rec down = function Vertex(c, kids) ->
+      List.flatten (!c::List.map down !kids)
+    let children = function Vertex(c, kids) -> !kids
+   <<make tree>>
+  end
+@
+
+A good class tree should have the following properties:
+\begin{itemize}
+\item Each vertex should contain \emph{only} alias equivalent classes
+\item There should be no empty vertex.
+\item If two vertices have the same parent, their alias sets are disjoint
+\item The alias set of a child node should be a subset of the alias set
+      of its parent node.
+\end{itemize}
+
+When classes can overlap without being equivalent or contained (with respect
+to aliasing), then we do not know how to construct a class tree that always
+gives the best approximation.  For now, we punt this issue (it is not a 
+realistic issue in actual architectures) since eventually we want to move
+the class tree construction to be part of the target.
+
+Alias equivalence is transitive, therefore we only check the head of 
+the vertex list.
+
+<<make tree>>=
+let mkTree (xs:RegisterClass.t list) = match xs with
+(x::classL) ->
+  let first = Vertex(ref [x], ref []) in 
+  let rec addToTree root c = match root with 
+    Vertex(classes, children) -> let rep = List.hd (!classes) in 
+    if RegisterClass.alias_eq c rep then begin
+      classes := c::(!classes);
+      root
+    end else if RegisterClass.alias_contained rep c then
+      Vertex (ref [c], ref [root])
+    else if RegisterClass.alias_contained c rep then begin
+      match (!children) with 
+        [] -> let () = children := [Vertex(ref [c], ref [])] in root
+      |  _ -> let eqNode = function Vertex(cs, _) -> 
+          RegisterClass.alias_eq c (List.hd !cs) in
+        let eqCd = function Vertex(cs, _) ->
+          RegisterClass.alias_contained c (List.hd !cs) in
+        let eqCs = function Vertex(cs, _) ->
+          RegisterClass.alias_contained (List.hd !cs) c  in
+        let newKids = 
+          if List.exists (fun n -> eqNode n || eqCd n || eqCs n) 
+              !children then
+            (List.map (fun r -> addToTree r c) !children)
+          else Vertex(ref [c], ref [])::!children in
+        children := newKids;
+        root
+    end
+    else begin 
+      Impossible.impossible "Adding a space to a class tree it doesn't belong in"
+    end
+  in List.fold_left addToTree first classL
+| [] -> Impossible.impossible "Cannot build class tree from empty list" 
+@
+
+[[mkTreeList]] initializes the class trees given a target. 
+The class trees and register classes
+should hold the information about what registers a temp can be assigned to now
+rather than cginfo.
+
+<<make tree>>=
+let mkTreeList spaces allRegs target = 
+  RegisterClass.init allRegs;
+  let splitAliases classLl space = 
+    let rClass = RegisterClass.mkClass space target in 
+    RegisterClass.map_class space rClass;
+    let belongs c l = List.exists 
+        (fun elt -> RegisterClass.is_empty (RegisterClass.inter c elt)) l in
+    let rec addToList l2 = match l2 with
+      [] -> [[rClass]]
+    | head::rest -> if belongs rClass head then 
+        let newList = rClass::head in newList::rest
+    else head::(addToList rest)
+    in
+    addToList classLl
+  in
+  let partitionedList = List.fold_left splitAliases [] spaces in
+  let treeList = List.map mkTree partitionedList in
+@
+
+It should always be the case that if [[c]] is alias contained in the
+register class of the root, then there is a vertex [[v]] in this
+tree that contains class [[c]].
+
+<<make tree>>=
+   List.iter 
+    (fun s -> let sClass = RegisterClass.space_to_class s in
+              let tree = List.find (fun aTree -> 
+                RegisterClass.alias_contained sClass 
+                  (List.hd (classes aTree))) treeList in
+              Spacetbl.add tree_map s tree) 
+  spaces;
+  treeList    
+@ 
+%-------------------------------------------------------------------
+\subsection{Utilities to implement}
+%-------------------------------------------------------------------
+
+We keep a mapping from each space to the register class for that space.
+
+<<tracked state>>=
+
+module HashableSpace = struct
+  type t = Rtl.space
+  let equal a b = Rtlutil.Compare.space a b = 0
+  let hash (name, _, size) = int_of_char name
+end
+
+module Spacetbl = Hashtbl.Make(HashableSpace)
+
+@ 
+%-------------------------------------------------------------------
+\subsubsection{Estimating worst}
+%-------------------------------------------------------------------
+
+In order to efficiently estimate $\mathit{worst}^m(N,C)$ we observe that
+\begin{math}\mathit{worst}^n(N,C) \leq \mathit{worst}^1(N,C)\end{math}
+or more simply, the number of registers that can be blocked for a node
+of class $N$ by $m$ temporaries is no more than the number of registers that
+can be blocked for a node of class $N$ by one temporary, multiplied by $m$.
+
+We need to create a table of $\mathit{worst}^1(N,C)$
+
+We don't want to form dependencies with the register allocation scheme, so
+perhaps the best interface is to present the node to measure and a list of 
+its neighbors, having the register allocator decide what set of neighbors
+to use for worst.
+
+First split the neighbors up by register class.  Since the classes in the tree
+were determined from the spaces on the target architecture, we know that for 
+any temporary, its space (and resulting class) is in the tree, and will
+get counted.
+
+If it turns out the [[eq]] comparison here is getting costly, we know that
+any two tmps coming from the same space have the same class.  We could either
+identify classes with an optional space tag, or associate each class with its
+space in some way.
+<<worst>>=
+let temp_to_space (s, _, _) = s
+
+let degree neighbors c = 
+  List.length 
+    (List.filter (fun tmp -> RegisterClass.eq 
+        (RegisterClass.space_to_class(temp_to_space tmp)) 
+        c) neighbors)
+@ 
+
+[[worst_1]] computes the worst case number of [[tmp]]'s
+registers that could be blocked by a coloring of 1 neighbor of class
+[[c]]. This needs to be cached once everything is working!
+
+We could compute this very early (static table in the target early) rather
+than computing it once and caching the result.  
+<<worst>>=
+let worst_1 (s,_,_) c = 
+  let n_ = RegisterClass.space_to_class s in
+  RS.fold (fun reg worst -> 
+    let blocked = RegisterClass.inter n_ (RegisterClass.aliases (RS.singleton reg)) in
+    max (RegisterClass.cardinal blocked) worst) 
+    c 0
+
+let bound (s,_,_) classes = 
+  let alias_sets = List.fold_left (fun union rClass -> RS.union (RegisterClass.aliases rClass) union) RS.empty classes in
+  RS.cardinal (RS.inter (RegisterClass.space_to_class s) alias_sets)
+
+
+let rec rawZ tmp neighbors vertex = 
+  let rawZ_sum tmp neighbors vertex = 
+    List.fold_left (fun sum c_ -> let degree_n_C = degree neighbors c_ in
+                                  let term = degree_n_C * (worst_1 tmp c_) in
+                                  sum + term)
+                   0 (ClassTree.classes vertex) in
+  let z tmp neighbors vertex =
+    min (bound tmp (ClassTree.down vertex)) (rawZ tmp neighbors vertex) in
+  let filtered_children tmp neighbors vertex = 
+    List.fold_left (fun sum v -> (z tmp neighbors v) + sum) 0 (ClassTree.children vertex) in
+  rawZ_sum tmp neighbors vertex + (filtered_children tmp neighbors vertex)
+@ 
+
+<<registerclass.mli>>=
+  <<register class interface>>
+  module RegisterClass : REGISTERCLASS 
+  <<class tree interface>>
+  module ClassTree:CLASSTREE
+@
+
+\subsection{Lua registration}
+
+<<registerclass.ml>>=
+module R   = Register
+module RM  = R.Map
+module RS  = R.Set
+module RSX = R.SetX
+module RU  = Rtlutil
+let imposs = Impossible.impossible
+
+let () = Debug.register "registerclass" "generalized register classes"
+@
+
+<<registerclass.ml>>=
+  <<tracked state>>
+  <<register class interface>>
+  <<register classes>>
+  <<class tree interface>>
+  <<class trees>>
+  <<worst>>
+@

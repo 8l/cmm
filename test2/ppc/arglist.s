@@ -1,0 +1,1122 @@
+.picsymbol_stub
+L_printf$stub:
+	.indirect_symbol _printf
+	mflr r0
+	bcl 20,31,Lprintf$pb
+Lprintf$pb:
+	mflr r11
+	addis r11,r11,ha16(Lprintf$lz-Lprintf$pb)
+	mtlr r0
+	lwz r12,lo16(Lprintf$lz-Lprintf$pb)(r11)
+	mtctr r12
+	addi r11,r11,lo16(Lprintf$lz-Lprintf$pb)
+	bctr
+.lazy_symbol_pointer
+Lprintf$lz:
+	.indirect_symbol _printf
+	.long dyld_stub_binding_helper
+.globl _main
+.globl _Cmm.global_area
+.globl _Cmm.globalsig.aQOYZWMPACZAJaMABGMOZeCCPY
+.section __DATA,data
+; memory for global registers
+_Cmm.globalsig.aQOYZWMPACZAJaMABGMOZeCCPY:
+_Cmm.global_area:
+.section __DATA,data
+_numbers:
+.long 1
+.long 2
+.long 3
+.long 4
+.long 5
+.long 6
+.long 7
+.long 8
+.long 9
+.long 10
+_ok:
+.byte 111
+.byte 107
+.byte 32
+.byte 40
+.byte 101
+.byte 120
+.byte 112
+.byte 101
+.byte 99
+.byte 116
+.byte 101
+.byte 100
+.byte 32
+.byte 37
+.byte 100
+.byte 44
+.byte 32
+.byte 114
+.byte 101
+.byte 99
+.byte 101
+.byte 105
+.byte 118
+.byte 101
+.byte 100
+.byte 32
+.byte 37
+.byte 100
+.byte 41
+.byte 10
+.text
+_f:
+	addi r1,r1,-96
+	mflr r2
+_Linitialize_continuations_l6:
+_Lproc_body_start_l5:
+	bl _Lpic_fun_l42
+_Lpic_l41:
+_Lpic_fun_l42:
+	mflr r9
+_Lpic_end_l43:
+	addis r10,0,ha16(_numbers-_Lpic_l41)
+	addi r10,r10,lo16(_numbers-_Lpic_l41)
+	add r10,r9,r10
+	lwz r10,0(r10)
+	cmpw cr0,r3,r10
+	beq _Ljoin_l36
+_Ljoin_l49:
+	b _Ljoin_l37
+_Ljoin_l36:
+	addis r10,0,ha16(_ok-_Lpic_l41)
+	addi r10,r10,lo16(_ok-_Lpic_l41)
+	add r10,r9,r10
+	stw r3,64(r1)
+	mr r3,r10
+	stw r4,68(r1)
+	lwz r4,64(r1)
+	addis r10,0,ha16(_numbers-_Lpic_l41)
+	addi r10,r10,lo16(_numbers-_Lpic_l41)
+	add r10,r9,r10
+	lwz r10,0(r10)
+	stw r5,72(r1)
+	mr r5,r10
+	stw r2,76(r1)
+	stw r6,80(r1)
+	stw r7,84(r1)
+	stw r8,88(r1)
+	stw r9,92(r1)
+	bl L_printf$stub
+_Ljoin_l35:
+	lwz r2,76(r1)
+	lwz r4,68(r1)
+	lwz r5,72(r1)
+	lwz r6,80(r1)
+	lwz r7,84(r1)
+	lwz r8,88(r1)
+	lwz r9,92(r1)
+	b _Ljoin_l37
+_Ljoin_l37:
+	addis r10,0,ha16(_numbers-_Lpic_l41)
+	addi r10,r10,lo16(_numbers-_Lpic_l41)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,4
+	add r10,r10,r11
+	lwz r10,0(r10)
+	cmpw cr0,r4,r10
+	beq _Ljoin_l31
+_Ljoin_l50:
+	b _Ljoin_l32
+_Ljoin_l31:
+	addis r10,0,ha16(_ok-_Lpic_l41)
+	addi r10,r10,lo16(_ok-_Lpic_l41)
+	add r3,r9,r10
+	addis r10,0,ha16(_numbers-_Lpic_l41)
+	addi r10,r10,lo16(_numbers-_Lpic_l41)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,4
+	add r10,r10,r11
+	lwz r10,0(r10)
+	stw r5,72(r1)
+	mr r5,r10
+	stw r2,76(r1)
+	stw r6,80(r1)
+	stw r7,84(r1)
+	stw r8,88(r1)
+	stw r9,92(r1)
+	bl L_printf$stub
+_Ljoin_l30:
+	lwz r2,76(r1)
+	lwz r5,72(r1)
+	lwz r6,80(r1)
+	lwz r7,84(r1)
+	lwz r8,88(r1)
+	lwz r9,92(r1)
+	b _Ljoin_l32
+_Ljoin_l32:
+	addis r10,0,ha16(_numbers-_Lpic_l41)
+	addi r10,r10,lo16(_numbers-_Lpic_l41)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,8
+	add r10,r10,r11
+	lwz r10,0(r10)
+	cmpw cr0,r5,r10
+	beq _Ljoin_l26
+_Ljoin_l51:
+	b _Ljoin_l27
+_Ljoin_l26:
+	addis r10,0,ha16(_ok-_Lpic_l41)
+	addi r10,r10,lo16(_ok-_Lpic_l41)
+	add r3,r9,r10
+	mr r4,r5
+	addis r10,0,ha16(_numbers-_Lpic_l41)
+	addi r10,r10,lo16(_numbers-_Lpic_l41)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,8
+	add r10,r10,r11
+	lwz r5,0(r10)
+	stw r2,76(r1)
+	stw r6,80(r1)
+	stw r7,84(r1)
+	stw r8,88(r1)
+	stw r9,92(r1)
+	bl L_printf$stub
+_Ljoin_l25:
+	lwz r2,76(r1)
+	lwz r6,80(r1)
+	lwz r7,84(r1)
+	lwz r8,88(r1)
+	lwz r9,92(r1)
+	b _Ljoin_l27
+_Ljoin_l27:
+	addis r10,0,ha16(_numbers-_Lpic_l41)
+	addi r10,r10,lo16(_numbers-_Lpic_l41)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,12
+	add r10,r10,r11
+	lwz r10,0(r10)
+	cmpw cr0,r6,r10
+	beq _Ljoin_l21
+_Ljoin_l52:
+	b _Ljoin_l22
+_Ljoin_l21:
+	addis r10,0,ha16(_ok-_Lpic_l41)
+	addi r10,r10,lo16(_ok-_Lpic_l41)
+	add r3,r9,r10
+	mr r4,r6
+	addis r6,0,ha16(_numbers-_Lpic_l41)
+	addi r6,r6,lo16(_numbers-_Lpic_l41)
+	add r6,r9,r6
+	addi r10,0,0
+	addi r10,r10,12
+	add r6,r6,r10
+	lwz r5,0(r6)
+	stw r2,76(r1)
+	stw r7,84(r1)
+	stw r8,88(r1)
+	stw r9,92(r1)
+	bl L_printf$stub
+_Ljoin_l20:
+	lwz r2,76(r1)
+	lwz r7,84(r1)
+	lwz r8,88(r1)
+	lwz r9,92(r1)
+	b _Ljoin_l22
+_Ljoin_l22:
+	addis r6,0,ha16(_numbers-_Lpic_l41)
+	addi r6,r6,lo16(_numbers-_Lpic_l41)
+	add r6,r9,r6
+	addi r10,0,0
+	addi r10,r10,16
+	add r6,r6,r10
+	lwz r6,0(r6)
+	cmpw cr0,r7,r6
+	beq _Ljoin_l16
+_Ljoin_l53:
+	b _Ljoin_l17
+_Ljoin_l16:
+	addis r6,0,ha16(_ok-_Lpic_l41)
+	addi r6,r6,lo16(_ok-_Lpic_l41)
+	add r3,r9,r6
+	mr r4,r7
+	addis r6,0,ha16(_numbers-_Lpic_l41)
+	addi r6,r6,lo16(_numbers-_Lpic_l41)
+	add r6,r9,r6
+	addi r7,0,0
+	addi r7,r7,16
+	add r6,r6,r7
+	lwz r5,0(r6)
+	stw r2,76(r1)
+	stw r8,88(r1)
+	stw r9,92(r1)
+	bl L_printf$stub
+_Ljoin_l15:
+	lwz r2,76(r1)
+	lwz r8,88(r1)
+	lwz r9,92(r1)
+	b _Ljoin_l17
+_Ljoin_l17:
+	addis r6,0,ha16(_numbers-_Lpic_l41)
+	addi r6,r6,lo16(_numbers-_Lpic_l41)
+	add r6,r9,r6
+	addi r7,0,0
+	addi r7,r7,20
+	add r6,r6,r7
+	lwz r6,0(r6)
+	cmpw cr0,r8,r6
+	beq _Ljoin_l11
+_Ljoin_l54:
+	b _Ljoin_l12
+_Ljoin_l11:
+	addis r6,0,ha16(_ok-_Lpic_l41)
+	addi r6,r6,lo16(_ok-_Lpic_l41)
+	add r3,r9,r6
+	mr r4,r8
+	addis r6,0,ha16(_numbers-_Lpic_l41)
+	addi r6,r6,lo16(_numbers-_Lpic_l41)
+	add r6,r9,r6
+	addi r7,0,0
+	addi r7,r7,20
+	add r6,r6,r7
+	lwz r5,0(r6)
+	stw r2,76(r1)
+	bl L_printf$stub
+_Ljoin_l10:
+	lwz r2,76(r1)
+	b _Ljoin_l12
+_Ljoin_l12:
+	mtlr r2
+	addi r1,r1,96
+	blr
+.section __DATA,pcmap_data
+_Lstackdata_l55:
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l35
+.long _Lframe_l56
+.section __DATA,pcmap_data
+_Lframe_l56:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l55
+.long 38
+.long 6
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0xffffffe4
+.long 0xffffffe8
+.long 0xfffffff0
+.long 0xfffffff4
+.long 0xfffffff8
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l30
+.long _Lframe_l57
+.section __DATA,pcmap_data
+_Lframe_l57:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l55
+.long 38
+.long 6
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0xffffffe8
+.long 0xfffffff0
+.long 0xfffffff4
+.long 0xfffffff8
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l25
+.long _Lframe_l58
+.section __DATA,pcmap_data
+_Lframe_l58:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l55
+.long 38
+.long 6
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0
+.long 0xfffffff0
+.long 0xfffffff4
+.long 0xfffffff8
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l20
+.long _Lframe_l59
+.section __DATA,pcmap_data
+_Lframe_l59:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l55
+.long 38
+.long 6
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0
+.long 0
+.long 0xfffffff4
+.long 0xfffffff8
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l15
+.long _Lframe_l60
+.section __DATA,pcmap_data
+_Lframe_l60:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l55
+.long 38
+.long 6
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0
+.long 0
+.long 0
+.long 0xfffffff8
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l10
+.long _Lframe_l61
+.section __DATA,pcmap_data
+_Lframe_l61:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l55
+.long 38
+.long 6
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0
+.long 0
+.long 0
+.long 0
+.long 0
+.text
+.text
+_g:
+	addi r1,r1,-96
+	mflr r2
+_Linitialize_continuations_l64:
+_Lproc_body_start_l63:
+	bl _Lpic_fun_l85
+_Lpic_l84:
+_Lpic_fun_l85:
+	mflr r6
+_Lpic_end_l86:
+	addis r7,0,ha16(_numbers-_Lpic_l84)
+	addi r7,r7,lo16(_numbers-_Lpic_l84)
+	add r7,r6,r7
+	addi r8,0,0
+	addi r8,r8,20
+	add r7,r7,r8
+	lwz r7,0(r7)
+	cmpw cr0,r3,r7
+	beq _Ljoin_l79
+_Ljoin_l92:
+	b _Ljoin_l80
+_Ljoin_l79:
+	addis r7,0,ha16(_ok-_Lpic_l84)
+	addi r7,r7,lo16(_ok-_Lpic_l84)
+	add r7,r6,r7
+	stw r3,64(r1)
+	mr r3,r7
+	stw r4,68(r1)
+	lwz r4,64(r1)
+	addis r7,0,ha16(_numbers-_Lpic_l84)
+	addi r7,r7,lo16(_numbers-_Lpic_l84)
+	add r7,r6,r7
+	addi r8,0,0
+	addi r8,r8,20
+	add r7,r7,r8
+	lwz r7,0(r7)
+	stw r5,72(r1)
+	mr r5,r7
+	stw r2,76(r1)
+	stw r6,80(r1)
+	bl L_printf$stub
+_Ljoin_l78:
+	lwz r2,76(r1)
+	lwz r4,68(r1)
+	lwz r5,72(r1)
+	lwz r6,80(r1)
+	b _Ljoin_l80
+_Ljoin_l80:
+	addis r7,0,ha16(_numbers-_Lpic_l84)
+	addi r7,r7,lo16(_numbers-_Lpic_l84)
+	add r7,r6,r7
+	addi r8,0,0
+	addi r8,r8,16
+	add r7,r7,r8
+	lwz r7,0(r7)
+	cmpw cr0,r4,r7
+	beq _Ljoin_l74
+_Ljoin_l93:
+	b _Ljoin_l75
+_Ljoin_l74:
+	addis r7,0,ha16(_ok-_Lpic_l84)
+	addi r7,r7,lo16(_ok-_Lpic_l84)
+	add r3,r6,r7
+	addis r7,0,ha16(_numbers-_Lpic_l84)
+	addi r7,r7,lo16(_numbers-_Lpic_l84)
+	add r7,r6,r7
+	addi r8,0,0
+	addi r8,r8,16
+	add r7,r7,r8
+	lwz r7,0(r7)
+	stw r5,72(r1)
+	mr r5,r7
+	stw r2,76(r1)
+	stw r6,80(r1)
+	bl L_printf$stub
+_Ljoin_l73:
+	lwz r2,76(r1)
+	lwz r5,72(r1)
+	lwz r6,80(r1)
+	b _Ljoin_l75
+_Ljoin_l75:
+	addis r7,0,ha16(_numbers-_Lpic_l84)
+	addi r7,r7,lo16(_numbers-_Lpic_l84)
+	add r7,r6,r7
+	addi r8,0,0
+	addi r8,r8,12
+	add r7,r7,r8
+	lwz r7,0(r7)
+	cmpw cr0,r5,r7
+	beq _Ljoin_l69
+_Ljoin_l94:
+	b _Ljoin_l70
+_Ljoin_l69:
+	addis r7,0,ha16(_ok-_Lpic_l84)
+	addi r7,r7,lo16(_ok-_Lpic_l84)
+	add r3,r6,r7
+	mr r4,r5
+	addis r7,0,ha16(_numbers-_Lpic_l84)
+	addi r7,r7,lo16(_numbers-_Lpic_l84)
+	add r6,r6,r7
+	addi r7,0,0
+	addi r7,r7,12
+	add r6,r6,r7
+	lwz r5,0(r6)
+	stw r2,76(r1)
+	bl L_printf$stub
+_Ljoin_l68:
+	lwz r2,76(r1)
+	b _Ljoin_l70
+_Ljoin_l70:
+	mtlr r2
+	addi r1,r1,96
+	blr
+.section __DATA,pcmap_data
+_Lstackdata_l95:
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l78
+.long _Lframe_l96
+.section __DATA,pcmap_data
+_Lframe_l96:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l95
+.long 38
+.long 3
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0xffffffe4
+.long 0xffffffe8
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l73
+.long _Lframe_l97
+.section __DATA,pcmap_data
+_Lframe_l97:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l95
+.long 38
+.long 3
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0xffffffe8
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l68
+.long _Lframe_l98
+.section __DATA,pcmap_data
+_Lframe_l98:
+.long 0xffffffb8
+.long 0x80000018
+.long 0xffffffec
+.long _Lstackdata_l95
+.long 38
+.long 3
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0
+.long 0
+.text
+.text
+_main:
+	addi r1,r1,-80
+	mflr r2
+_Linitialize_continuations_l101:
+_Lproc_body_start_l100:
+	bl _Lpic_fun_l113
+_Lpic_l112:
+_Lpic_fun_l113:
+	mflr r9
+_Lpic_end_l114:
+	addis r10,0,ha16(_numbers-_Lpic_l112)
+	addi r10,r10,lo16(_numbers-_Lpic_l112)
+	add r10,r9,r10
+	lwz r3,0(r10)
+	addis r10,0,ha16(_numbers-_Lpic_l112)
+	addi r10,r10,lo16(_numbers-_Lpic_l112)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,4
+	add r10,r10,r11
+	lwz r4,0(r10)
+	addis r10,0,ha16(_numbers-_Lpic_l112)
+	addi r10,r10,lo16(_numbers-_Lpic_l112)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,8
+	add r10,r10,r11
+	lwz r5,0(r10)
+	addis r10,0,ha16(_numbers-_Lpic_l112)
+	addi r10,r10,lo16(_numbers-_Lpic_l112)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,12
+	add r10,r10,r11
+	lwz r6,0(r10)
+	addis r10,0,ha16(_numbers-_Lpic_l112)
+	addi r10,r10,lo16(_numbers-_Lpic_l112)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,16
+	add r10,r10,r11
+	lwz r7,0(r10)
+	addis r10,0,ha16(_numbers-_Lpic_l112)
+	addi r10,r10,lo16(_numbers-_Lpic_l112)
+	add r10,r9,r10
+	addi r11,0,0
+	addi r11,r11,20
+	add r10,r10,r11
+	lwz r8,0(r10)
+	stw r2,64(r1)
+	stw r9,68(r1)
+	bl _f
+_Ljoin_l108:
+	addis r2,0,ha16(_numbers-_Lpic_l112)
+	addi r2,r2,lo16(_numbers-_Lpic_l112)
+	lwz r6,68(r1)
+	add r2,r6,r2
+	addi r7,0,0
+	addi r7,r7,20
+	add r2,r2,r7
+	lwz r3,0(r2)
+	addis r2,0,ha16(_numbers-_Lpic_l112)
+	addi r2,r2,lo16(_numbers-_Lpic_l112)
+	add r2,r6,r2
+	addi r7,0,0
+	addi r7,r7,16
+	add r2,r2,r7
+	lwz r4,0(r2)
+	addis r2,0,ha16(_numbers-_Lpic_l112)
+	addi r2,r2,lo16(_numbers-_Lpic_l112)
+	add r2,r6,r2
+	addi r6,0,0
+	addi r6,r6,12
+	add r2,r2,r6
+	lwz r5,0(r2)
+	bl _g
+_Ljoin_l105:
+	addi r3,0,0
+	lwz r12,64(r1)
+	mtlr r12
+	addi r1,r1,80
+	blr
+.section __DATA,pcmap_data
+_Lstackdata_l120:
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l108
+.long _Lframe_l121
+.section __DATA,pcmap_data
+_Lframe_l121:
+.long 0xffffffc8
+.long 0x80000018
+.long 0xfffffff0
+.long _Lstackdata_l120
+.long 38
+.long 2
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0
+.section __DATA,pcmap
+.long _Ljoin_l105
+.long _Lframe_l122
+.section __DATA,pcmap_data
+_Lframe_l122:
+.long 0xffffffc8
+.long 0x80000018
+.long 0xfffffff0
+.long _Lstackdata_l120
+.long 38
+.long 2
+.long 0
+.long 1
+.long 0x40000036
+.long 0x40000036
+.long 0x40000037
+.long 0x40000037
+.long 0x40000038
+.long 0x40000038
+.long 0x40000039
+.long 0x40000039
+.long 0x4000003a
+.long 0x4000003a
+.long 0x4000003b
+.long 0x4000003b
+.long 0x4000003c
+.long 0x4000003c
+.long 0x4000003d
+.long 0x4000003d
+.long 0x4000003e
+.long 0x4000003e
+.long 0x4000003f
+.long 0x4000003f
+.long 0x40000040
+.long 0x40000040
+.long 0x40000041
+.long 0x40000041
+.long 0x40000042
+.long 0x40000042
+.long 0x40000043
+.long 0x40000043
+.long 0x40000044
+.long 0x40000044
+.long 0x40000045
+.long 0x40000045
+.long 0x40000046
+.long 0x40000046
+.long 0x40000047
+.long 0x40000047
+.long 0x40000048
+.long 0x40000048
+.long 0
+.long 0
+.long 0
+.text

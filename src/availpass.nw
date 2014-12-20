@@ -1,0 +1,73 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+@
+\section{Dataflow pass for available expressions}
+
+For dependency reasions, this module has to be split from the
+[[Avail]] module.
+<<availpass.mli>>=
+val analysis : Avail.t Dataflow.F.analysis
+@ 
+
+\subsection{Implementation}
+
+
+<<availpass.ml>>=
+module D  = Dataflow
+module G  = Zipcfg
+module GR = Zipcfg.Rep
+module P  = Property
+let matcher = { P.embed = (fun a -> P.Avail a);
+                P.project = (function P.Avail a -> Some a | _ -> None);
+                P.is = (function P.Avail a -> true | _ -> false);
+              }
+
+let prop = Unique.Prop.prop matcher
+
+let _ = Debug.register "avail-changed" "show avail exps that change"
+
+let debug_smaller ~old ~new' =
+  let b = Avail.smaller ~old ~new' in
+  if b then
+    Printf.eprintf "** Available expressions have changed from %s\n** to new avail%s\n"
+      (Avail.to_string old) (Avail.to_string new');
+  b
+
+let debug_join a a' =
+  let a'' = Avail.join a a' in
+  Printf.eprintf "** Joined avails are %s\n" (Avail.to_string a'');
+  a''
+
+let smaller = if Debug.on "avail-changed" then debug_smaller else Avail.smaller
+let join    = if Debug.on "avail-changed" then debug_join    else Avail.join
+
+let fact = {
+  D.fact_name = "available expressions";
+  D.init_info = Avail.unknown;
+  D.add_info = join;
+  D.changed = smaller;
+  D.prop = prop;
+}
+
+let last_outs in' l set =
+  let out = Avail.forward (GR.last_instr l) in' in
+  let set_edge e =
+    let _out = Avail.invalidate e.G.defs  out in
+    let _out = Avail.invalidate e.G.kills out in
+    let out = Avail.unknown (* paranoia *) in
+    set (fst e.G.node) out in
+  G.iter_outedges l ~noflow:(fun u -> set u out) ~flow:set_edge 
+
+let comp = {
+  D.F.name = "avail";
+  D.F.middle_out = (fun a m -> Avail.forward (GR.mid_instr m) a);
+  D.F.last_outs = last_outs;
+}
+
+let analysis = fact, comp

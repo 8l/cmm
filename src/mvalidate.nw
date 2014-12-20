@@ -1,0 +1,153 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+\section{RTL Validation}
+
+[[Mvalidate.rtl]] checks that operators are used in ways consistent
+with the target-machine capability record.
+If we detect that an RTL cannot be
+compiled then the value returned from [[rtl]] is [[Some s]] where
+[[s]] is a string explaining why the RTL is invalid.  Otherwise the
+result is [[None]].
+<<mvalidate.mli>>=
+val rtl : ('a, 'b, 'c) Target.t -> Rtl.rtl -> string option
+@ 
+<<mvalidate.ml>>=
+module RP   = Rtl.Private
+module Down = Rtl.Dn
+module Up   = Rtl.Up
+@ 
+The exception [[RTLInvalid]] is used internally in this module to
+signal that a RTL cannot be compiled---users never see this.
+<<mvalidate.ml>>=
+exception RTLInvalid of string
+@ 
+<<mvalidate.ml>>=
+let () = Debug.register "mvalidate" "debug machine-environment validator"
+let rtl t r =
+  let remove_bits = function
+    | Types.Bits n -> n
+    | Types.Bool   -> 1
+  in
+  let impossf fmt = Printf.kprintf Impossible.impossible fmt in
+  let imposs = Impossible.impossible in
+  let m    = List.map Rtl.Dn.opr t.Target.capabilities.Target.operators in
+  let lops = List.map Rtl.Dn.opr t.Target.capabilities.Target.litops in
+  let w    = t.Target.wordsize in
+  let ns   = t.Target.capabilities.Target.literals in
+  Debug.eprintf "mvalidate" "ns is %d length\n" (List.length ns);
+  let spaces = Vfp.mk_space w :: t.Target.spaces in
+  let name   = t.Target.name in
+  let widths ops opname =
+    let all = List.find_all (fun (opname',_) -> opname =$= opname') ops in
+    List.map (fun (opname, ws) -> ws) all in
+  let machine_widths = widths m in
+  let literal_widths = widths lops in
+  let xy_or_z tostr xyz =
+    match List.rev xyz with
+    | []    -> impossf "No literal sizes specified for target '%s'" name
+    | [z]   -> tostr z
+    | z::yx ->
+        let xy  = List.rev (List.map tostr yx) in
+        let xy' = String.concat ", " xy in
+          xy'^" or "^tostr z in
+  let sprintf = Printf.sprintf in
+  let reject fmt = Printf.kprintf (fun s -> raise (RTLInvalid s)) fmt in
+  let spacename (s, _, _) = s in
+  let reg s n p1 p2 =
+    let space =
+      try List.find (fun x -> spacename x.Space.space =<= s) spaces
+      with Not_found -> reject "%s" (p1 s name) in
+    List.mem n space.Space.widths
+    || reject "%s" (p2 s (xy_or_z string_of_int space.Space.widths) n) in
+  let rec loc = function
+    | RP.Mem(_,n,e,_) -> exp e (* not clear what else to do *)
+    | RP.Reg((s,_,cell),_,c) ->
+        reg s (Cell.to_width cell c)
+          (sprintf "Space '%c' not found in target '%s'")
+          (sprintf "Space '%c' only supports width %s; asked for %d")
+    | RP.Var(x,_,n) -> n <= w || n mod t.Target.memsize == 0 
+      || reject 
+          "variable %s of type bits%d should either be at most %d bits wide or else have a width a multiple of %d bits" x n w t.Target.memsize
+    | RP.Global(s,_,n) ->
+        if s =$= "System.rounding_mode" || s =$= "rm" then
+          n = 2 || reject "System.rounding_mode must be 2 bits, not %d" n
+        else
+          reg 'r' n (fun c s -> imposs "Space 'r' must be available")
+            (fun c -> sprintf "Globals only available at %s bits; asked for %d bits")
+    | RP.Slice(n,_,l)  -> loc l (* what to check here? *)
+  and exp e = exp' None e
+  and exp' litcontext e =
+    let nonliteral = match litcontext with
+    | None -> (fun s -> s)
+    | Some op -> (fun s -> reject "operator %%%s may be applied only to \
+                                   compile-time constant expressions" op) in
+    let rec exp = function
+    | RP.Fetch(l, n) -> nonliteral (loc l)
+    | RP.App(("or", [resw]), [RP.App(("zx", _), [e]);
+                              RP.App(("shl", _), [RP.App(("zx",_), [e']); k])])
+        when resw mod w = 0 && exp e && exp e' && exp k -> true
+    | RP.App(("lobits", [argw; resw]), [RP.App(("shrl",_), [e; k])]) 
+        when resw mod w = 0 && exp e && exp k -> true
+        (* should also check that k is a constant multiple of wordsize *)
+    | RP.App(("lobits", [argw; resw]), [e]) when resw mod w = 0 && exp e -> true
+    | RP.App((opname, ws), es) ->
+        let str_of_opty (opname, ws) =
+          let (argw, resw) = Rtlop.mono (Rtl.opr opname ws) in
+          let argw = List.map remove_bits argw in
+          let resw = remove_bits resw in
+          String.concat "->" (List.map string_of_int (argw @ [resw])) in
+        (* like the widener, we give up on operations not in M *)
+        let wss' = machine_widths opname in
+        let op_possible wss =
+          (* An op is possible if some form exists where each argument is narrower than required.
+           * and if we have the right number of arguments. *)
+          try List.exists (List.for_all2 (fun w w' -> w <= w') ws) wss
+          with Invalid_argument _ -> false in
+        if Debug.on "mvalidate" then
+          (Printf.eprintf "Validating %%%s::%s..." opname (str_of_opty (opname, ws));
+           if op_possible wss' then
+             Debug.eprintf "mvalidate" "matches at %s\n"
+               (xy_or_z str_of_opty (List.map (fun x -> (opname, x)) wss'))
+           else Debug.eprintf "mvalidate" "impossible\n");
+        if op_possible wss' then
+           List.for_all exp es
+        else
+          let lit_wss = literal_widths opname in
+          if op_possible lit_wss then
+            List.for_all (exp' (Some opname)) es
+          else
+            reject "No acceptable widths for %%%s on target '%s'; \
+                    asked for %s, target accepts %s" opname name 
+              (str_of_opty (opname, ws))
+              (match wss' with [] -> "nothing!"
+                   | _ -> xy_or_z str_of_opty (List.map (fun x -> (opname, x)) wss'))
+    | RP.Const c -> const c
+  and const c =
+    let string c = Rtlutil.ToString.exp (Up.exp (RP.Const c)) in
+    match c with
+    | (RP.Link(_,_,n)) as c -> nonliteral (List.exists (fun w -> n <= w) ns)
+      || reject "Constant %s is %d bits but was expected at <= %s bits"
+          (string c) n (xy_or_z string_of_int ns)
+    | RP.Diff(x,y) -> nonliteral (const x && const y)
+    | (RP.Late(_,n)) as c -> nonliteral (List.exists (fun w -> n <= w) ns)
+      || reject "Constant %s is %d bits but was expected at <= %s bits"
+          (string c) n (xy_or_z string_of_int ns)
+    | (RP.Bits b) as c -> List.exists (fun w -> Bits.width b <= w) ns
+      || reject "Constant %s is %d bits but was expected at <= %s bits"
+          (string c) (Bits.width b) (xy_or_z string_of_int ns)
+    | RP.Bool _  -> true in
+    exp e in
+  let check (g, eff) =
+    let eff' =
+      match eff with
+      | RP.Store(l, r, w) -> loc l && exp r
+      | RP.Kill l -> loc l
+    in
+    eff' && exp g
+  in
+  let RP.Rtl es = Down.rtl r in
+  try
+    if List.for_all check es then None
+    else Some "No explanation"
+  with RTLInvalid s -> Some s
+@ 

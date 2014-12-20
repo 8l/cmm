@@ -1,0 +1,186 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+@
+\section{Available expressions}
+
+The purpose of this module is to help compute a set of ``available
+expressions.''
+This set is really a set of equalities that represent facts we know
+about the state of the machine at a program point.
+Each such equality identifies the contents of some location with the
+value of some expression.
+The equalities can drive both redundancy elimination and forward
+substitution (peephole optimization).
+
+Here are the constructors.
+If~[[a]] is the set of expressions available immediately before an
+RTL~[[r]], then [[forward a r]] is the set of expressions available
+immediately after~[[r]].
+<<avail.mli>>=
+type t   (* a set of available expressions *)
+val forward : Rtl.rtl -> t -> t
+val invalidate : Register.SetX.t -> t -> t  (* anything that depends on the set *)
+val unknown : t  (* the unknown set (aka the infinite set: top) *)
+val join : t -> t -> t (* effectively set intersection *)
+val smaller : old:t -> new':t -> bool  (* has a set shrunk? (unknown at top) *)
+@ 
+To observe for forward substitution, we need to know what expression a
+location holds.
+To observe for redundancy elimination, we need to know what location
+holds an expression.
+<<avail.mli>>=
+val in_loc  : t -> Rtl.Private.loc -> Rtl.Private.exp option
+val has_exp : t -> Rtl.Private.exp -> Rtl.Private.loc option
+@ 
+We can substitute for locations that are known to be available.
+When calling [[subst_exp a ls e]], it is a checked run-time error for
+list [[ls]] to contain a location that is not available in~[[a]].
+<<avail.mli>>=
+val subst_exp : t -> Rtl.Private.loc list -> Rtl.Private.exp -> Rtl.Private.exp
+@ 
+We can print a set for debugging:
+<<avail.mli>>=
+val to_string : t -> string
+@ 
+
+
+\subsection{Implementation}
+
+
+<<avail.ml>>=
+module R   = Rtl
+module RP  = Rtl.Private
+module RU  = Rtlutil
+module Up  = Rtl.Up
+module Dn  = Rtl.Dn
+module S   = RU.ToString
+let () = Debug.register "avail" "available expressions"
+let debug = Debug.on "avail"
+@ 
+The implementation is designed to try to maximize sharing and minimize
+allocation, not for fast lookup.
+Notice the lattice inversion!
+A~``smaller'' fact has \emph{more} equalities!
+<<avail.ml>>=
+type t = Unknown | Known of (RP.loc * RP.exp) list
+let unknown = Unknown
+let smaller ~old ~new' =
+  match old with
+  | Unknown -> (match new' with Unknown -> false | Known _ -> true)
+  | Known olds ->
+      (match new' with
+      | Unknown -> false
+      | Known news -> List.length news < List.length olds)
+@ 
+<<avail.ml>>=
+let in_loc t l = match t with
+| Unknown -> None
+| Known pairs -> try Some (List.assoc l pairs) with Not_found -> None
+
+let has_exp t e = match t with
+| Unknown -> None
+| Known pairs ->
+    try Some (fst (List.find (fun (_, e') -> RU.Eq.exp e e') pairs))
+    with Not_found -> None
+@ 
+<<avail.ml>>=
+let join a a' = match a, a' with
+| Unknown, a' -> a'
+| a, Unknown  -> a
+| Known ps, Known ps' ->
+    let primed (l, e) =
+      List.exists (fun (l', e') -> RU.Eq.loc l l' && RU.Eq.exp e e') ps' in
+    Known (List.filter primed ps)
+@ 
+THIS CODE IS BROKEN FOR THE CASE WHEN A LEFT-HAND SIDE ALSO APPEARS ON
+A RIGHT-HAND SIDE.
+IN SUCH A CASE, WE NEED TO SUBSTITUTE FOR THE EXISTING VALUE OF THE
+LHS OR WE NEED TO GIVE UP.
+(A less serious problem is that we may get multiple equivalents for
+the same expression, and it is not clear which one(s) to use.)
+<<avail.ml>>=
+<<kills>>
+<<substitution>>
+<<invalidation>>
+let forward rtl t =
+  let pairs = match t with Unknown -> [] | Known ps -> ps in
+  let locs = locs_killed rtl in
+  let alocs = List.map RU.MayAlias.locs' locs in
+  let aexps = List.map RU.MayAlias.exp'  locs in
+  let add_new_pair l r new_pairs =
+    if List.exists (fun aexp -> aexp r) aexps then
+      <<if all interfering locations can be substituted, keep [[l, r]]; otherwise not>>
+    else
+      (l, r) :: new_pairs in
+  let pairs = invalidate_pairs alocs aexps pairs in
+  (* massive pessimism: do registers only *)
+  let extend guarded pairs = match guarded with
+  | RP.Const (RP.Bool true), RP.Store(RP.Reg _ as l, r, _) -> add_new_pair l r pairs
+  | _ -> pairs in
+  let RP.Rtl effects = Dn.rtl rtl in
+  let pairs = List.fold_right extend effects pairs in
+  if debug then
+    begin
+      Printf.eprintf "avail: forwarding past %s yields\n" (S.rtl rtl);
+      List.iter
+        (fun (l, r) -> Printf.eprintf "avail:   %s == %s\n"
+                                      (S.loc (Up.loc l)) (S.exp (Up.exp r))) pairs;
+    end;
+  Known pairs
+@ 
+<<if all interfering locations can be substituted, keep [[l, r]]; otherwise not>>=
+let badlocs = List.filter (fun l -> RU.MayAlias.exp' l r) locs in
+if List.for_all (fun l -> List.mem_assoc l pairs) badlocs then
+  (l, subst_exp (Known pairs) badlocs r) :: new_pairs
+else
+  new_pairs
+@ 
+We never remember a memory location, so we need only to identify
+registers that are killed.
+<<kills>>=
+let locs_killed rtl =
+  let add l locs = if List.mem l locs then locs else l :: locs in
+  RU.FullReadWriteKill.fold ~write:add ~kill:add ~read:(fun _ locs -> locs)
+    rtl []
+@ 
+<<substitution>>=
+let subst_exp t ls e = match t, ls with
+| _, [] -> e
+| Known pairs, _ :: _ ->
+    RU.Subst.Fetch.exp' ~guard:(fun l -> List.mem l ls)
+      ~fetch:(fun l w -> List.assoc l pairs) e
+| Unknown, _ :: _ -> Impossible.impossible "substitution with no available expressions"
+@ 
+<<invalidation>>=
+let invalidate_pairs alocs aexps pairs =
+  let invalidated (l, r) =
+    List.exists (fun aloc -> aloc l) alocs || List.exists (fun aexp -> aexp r) aexps in
+  if List.exists invalidated pairs then
+    List.filter (fun p -> not (invalidated p)) pairs
+  else
+    pairs
+
+let invalidate locs_killed t = match t with
+| Unknown -> Unknown
+| Known pairs ->
+    let add l locs = Dn.loc (Rtl.regx l) :: locs in
+    let locs = Register.SetX.fold add locs_killed [] in
+    let alocs = List.map RU.MayAlias.locs' locs in
+    let aexps = List.map RU.MayAlias.exp'  locs in
+    Known (invalidate_pairs alocs aexps pairs)
+@ 
+<<avail.ml>>=
+let to_string = function
+  | Unknown -> "<?>"
+  | Known [] -> "<nothing-available>"
+  | Known les ->
+      let print (l, e) =
+        Printf.sprintf "\n  %s = %s"
+          (RU.ToString.loc (Up.loc l)) (RU.ToString.exp (Up.exp e)) in
+      String.concat "" (List.map print les)

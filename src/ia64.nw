@@ -1,0 +1,475 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+\section{Back end for IA-64}
+
+<<ia64.mli>>=
+val arch : string
+module Spaces : sig
+  val m : Space.t
+  val a : Space.t
+  val r : Space.t
+  val t : Space.t
+  val f : Space.t
+  val u : Space.t
+  val c : Space.t   (* PC at 0 *)
+  val v : Space.t
+end
+
+module Post   : Postexpander.S
+module X      : Expander.S
+
+val target    : Ast2ir.tgt
+val placevars : Ast2ir.proc -> Automaton.t
+@ 
+
+% ---------------------------------------------------------------------------
+\subsection{Name and Storage Spaces}
+% ---------------------------------------------------------------------------
+
+<<ia64.ml>>=
+module PX = Postexpander
+module R  = Rtl
+module RU = Rtlutil
+module SS = Space.Standard64
+
+let (<:>) = PX.(<:>)
+let rtl r = PX.Rtl r
+
+let arch  = "ia64"  (* architecture name *)
+@ 
+
+<<ia64.ml>>=
+module Spaces = struct
+  module S = Space
+  let bo = Rtl.LittleEndian
+  let id = Rtl.Identity
+  let m = Space.Standard64.m bo [8; 16; 32; 64]
+  let a = Space.Standard64.a 8   id [64]  (* these are branch registers *)
+  let r = Space.Standard64.r 128 id [64]
+  let t = Space.Standard64.t     id  64
+  let p = Space.Standard64.p 64  id [ 1]  (* these are predicate registers *)
+  let w = Space.Standard64.w     id   1
+  let f = S.checked { S.space = ('f', id, Cell.of_size 64)
+                    ; S.doc = "floating-point registers"
+                    ; S.indexwidth = 7 ; S.indexlimit = Some 127
+                    ; S.widths = [64]
+                    ; S.classification = S.Reg
+                    }
+  let all_floats = { S.stands_for = S.stands_for 'f' id 64
+                   ; S.set_doc = "all floating-point registers"
+                   } 
+  let u = S.checked { S.space = ('u', id, Cell.of_size 64)
+                    ; S.doc = "floating-point temporaries"
+                         (* What is the significance of a 31-bit indexwidth? *)
+                    ; S.indexwidth = 31; S.indexlimit = None
+                    ; S.widths = [64]
+                    ; S.classification = S.Temp all_floats
+                    }
+  let v = Space.Standard64.v   id  64
+  let c = Space.Standard64.c 1 id [64]
+end
+
+let (_, _, mcell) as mspace = Spaces.m.Space.space
+let rspace = Spaces.r.Space.space
+let fspace = Spaces.f.Space.space
+let aspace = Spaces.a.Space.space
+
+let locations = SS.locations Spaces.c
+let pc    = locations.SS.pc  (* instruction pointer / program counter *)
+let cc    = locations.SS.cc
+let sp    = R.reg (rspace, 12, R.C 1)
+let ra    = R.reg (aspace,  0, R.C 1)
+let raloc = R.fetch ra 64
+@ 
+
+% ---------------------------------------------------------------------------
+\subsection{Postexpander}
+% ---------------------------------------------------------------------------
+
+<<ia64.ml>>=
+module RP   = Rtl.Private
+module Up   = Rtl.Up
+module Down = Rtl.Dn
+
+module Post = struct
+  <<ia64 postexpander>>
+end
+@ 
+<<ia64 postexpander>>=
+let byte_order = Rtl.LittleEndian
+let exchange_alignment = 8
+let wordsize   = 64
+@ 
+The postexpander may need to allocate temporaries.
+<<ia64 postexpander>>=
+let talloc = Postexpander.Alloc.temp
+@ 
+\paragraph{Utility Functions}
+<<ia64 postexpander>>=
+let temploc  t = Rtl.reg t
+let tempwidth  = Register.width
+let tempval  t = R.fetch (temploc t) (tempwidth t)
+let mem addr = R.mem R.none mspace (R.C 8) addr
+
+let ui = Impossible.unimp
+@ 
+\paragraph{Contexts}
+Addresses go in the integer registers, so we use these contexts:
+<<ia64 postexpander>>=
+let icontext = Context.of_space Spaces.t
+let fcontext = Context.of_space Spaces.u
+let acontext = icontext
+let itempwidth = 64
+
+(* this is just bogus *)
+let rcontext = 
+  (fun x y -> Impossible.unimp "Unsupported soft rounding mode"),
+  (function (('d', _, _), 0, R.C 1) -> true | _ -> false)
+@ 
+\paragraph{Addressing modes}
+The only addressing mode is the obvious one.
+<<ia64 postexpander>>=
+module Address = struct
+  type t = Rtl.exp
+  let reg r = R.fetch (R.reg r) (Register.width r)
+end
+@ 
+There is no x86-like stack in the IA64.
+<<ia64 postexpander>>=
+include Postexpander.Nostack(Address)
+@ 
+
+\subsubsection{Data Movement}
+We treat the Itanium strictly as a 64-bit machine, so we assume the width of
+everything is~64.
+<<ia64 postexpander>>=
+let load ~dst ~addr assn =
+  assert (tempwidth dst = 64);
+  match Down.exp addr with
+  | RP.App(op, [RP.Fetch(RP.Reg r, _); opnd]) ->
+      rtl (R.store (temploc r) addr 64) <:>
+      rtl (R.store (temploc dst)
+             (R.fetch (R.mem assn mspace (R.C 8) (tempval r)) 64) 64)
+  | _ -> rtl (R.store (temploc dst) 
+		(R.fetch (R.mem assn mspace (R.C 8) addr) 64) 64)
+
+let store ~addr ~src assn =
+  assert (tempwidth src = 64);
+  rtl (R.store (R.mem assn mspace (R.C 8) addr) (tempval src) 64)
+@ 
+We also provide sign-extending loads and stores:
+NOTE THAT WE PROBABLY NEED TO FIX THIS UP TOO WITH RESPECT TO LOADS AND
+STORES FROM OFFSETS.
+<<ia64 postexpander>>=
+let extend opname n e = R.app (R.opr opname   [n; 64]) [e]
+let lobits        n e = R.app (R.opr "lobits" [64; n]) [e]
+let sxload ~dst ~addr n assn =
+  if tempwidth dst <> 64 then Impossible.unimp "widening of temporaries";
+  assert (Cell.divides mcell n);
+  rtl (R.store (temploc dst)
+     (extend "sx" n (R.fetch (R.mem assn mspace (Cell.to_count mcell n) addr) n)) 64)
+let zxload ~dst ~addr n assn =
+  assert (tempwidth dst = 64);
+  assert (Cell.divides mcell n);
+  rtl (R.store (temploc dst)
+     (extend "zx" n (R.fetch (R.mem assn mspace (Cell.to_count mcell n) addr) n)) 64)
+let lostore ~addr ~src n assn =
+  assert (tempwidth src = 64);
+  assert (Cell.divides mcell n);
+  rtl (R.store (R.mem assn mspace (Cell.to_count mcell n) addr) 
+               (lobits n (R.fetch (temploc src) 64)) n)
+                 (* we diverge from Pentium here; don't understand *)
+@ 
+This code comes from x86.nw, which is not sure of floating-point compatability:
+<<ia64 postexpander>>=
+let move_rtl dst src = rtl (R.store (temploc dst) (tempval src) (tempwidth src))
+let move ~dst ~src   = if Register.eq dst src then PX.Nop else move_rtl dst src
+
+let li  ~dst const = rtl (R.store (temploc dst) (Up.const const) (tempwidth dst))
+let lix ~dst e     = rtl (R.store (temploc dst) e                (tempwidth dst))
+let hwset ~dst ~src = Impossible.unimp "setting hardware register"
+let hwget ~dst ~src = Impossible.unimp "getting hardware register"
+let extract ~dst ~lsb ~src = Impossible.unimp "extract"
+let aggregate ~dst ~src = Impossible.unimp "aggregate"
+@ 
+
+\subsubsection{Operator Contexts}
+<<ia64 postexpander>>=
+let operators = Context.nonbool icontext fcontext rcontext []
+let arg_contexts, result_context = Context.functions operators
+let constant_context w = icontext
+
+let dblop ~dsthi ~dstlo op x y = Unsupported.mulx_and_mulux()
+let wrdop  ~dst op x y z = Unsupported.singlebit ~op:(fst op)
+let wrdrop ~dst op x y z = Unsupported.singlebit ~op:(fst op)
+@ 
+IT BEGS EXPLANATION WHY INTEGER MULTIPLY IS BEING TRANSLATED INTO A
+FLOATING-POINT MULTIPLY!
+<<ia64 postexpander>>=
+let rtlop ~dst op args =
+  rtl (R.store (temploc dst) (R.app (Up.opr op) (List.map tempval args)) (tempwidth dst))
+let binop ~dst op tmp1 tmp2 = match op with
+| ("mul", ws) ->
+    let f1 = talloc 'u' 64 in
+    let f2 = talloc 'u' 64 in
+    move_rtl f1 tmp1 <:>
+    move_rtl f2 tmp2 <:>
+    rtlop f1 ("fmul", ws) [f1; f2; (fspace,0,R.C 1)] <:>
+    move dst f1
+| _ -> rtlop dst op [tmp1;tmp2]
+
+let unop  ~dst op tmp       = rtlop dst op [tmp]
+let unrm  ~dst op x rm   = Impossible.unimp "floating point with rounding mode"
+let binrm ~dst op x y rm = Impossible.unimp "floating point with rounding mode"
+
+let block_copy ~dst assn1 ~src assn2 width = ui "block_copy"
+@
+\subsubsection{Control Flow}
+We hope there's only one PC on the Itanium.
+<<ia64 postexpander>>=
+let pc_lhs = pc
+let pc_rhs = pc
+
+(* note that instructions need to be specified in reverse order! *)
+let br ~tgt = 
+  let tempr = talloc 'v' 64 in
+  rtl (R.store (temploc tempr) (tempval tgt) 64), R.store pc_lhs (tempval tempr) 64
+
+let b  ~tgt = PX.Nop, R.store pc_lhs (Up.const tgt) 64
+
+let effects = List.map Up.effect
+let call  ~tgt ~others =
+  PX.Nop, R.par (R.store pc_lhs (Up.const tgt) 64 :: effects others)
+let callr ~tgt ~others =
+  PX.Nop, R.par (R.store pc_lhs (tempval tgt)  64 :: effects others)
+
+let cut_to effs = PX.Nop, R.par (effects effs)
+
+(* A FLAGRANT CHEAT HERE.  AT THE VERY LEAST, THE BITS/BOOL CONVERSIONS ARE MISSING*)
+let bc x (opr, ws) y ~ifso ~ifnot =
+  assert (ws =*= [64]);
+  let tempr = talloc 'w' 1 in
+  PX.Test (rtl (R.store (temploc tempr)
+                        (R.app (R.opr opr ws) [tempval x; tempval y]) 64),
+           (tempval tempr, ifso, ifnot))
+
+(* RRO FIX bnegate *)
+let bnegate r = match Down.rtl r with
+| RP.Rtl [g, (RP.Store(pc, tgt, 64) as eff)] when RU.Eq.loc pc (Down.loc pc_lhs) ->
+     Up.rtl (RP.Rtl [RP.App(("not", [64]), [g]), eff])
+| _ -> Impossible.impossible "ill-formed IA64 conditional branch"
+@
+\subsubsection{Other}
+<<ia64 postexpander>>=
+let don't_touch_me es = false
+@ 
+\subsection{Building the Target}
+We provide the IA64 postexpander as a parameter to the generic code expander.
+<<ia64.ml>>=
+module X = Expander.IntFloatAddr (Post)
+@ 
+Standard control flow.
+<<ia64.ml>>=
+module T = Target
+module F = Mflow.MakeStandard (
+  struct
+     let pc_lhs = Post.pc_lhs
+     let pc_rhs = Post.pc_rhs
+     let ra_reg    = ra
+     let ra_offset = 8  (* size of instruction -- THIS IS A GUESS! *)
+  end)
+@ 
+
+We find somewhere to store globals.
+<<ia64.ml>>=
+module A = Automaton
+let ( *> ) = A.( *> )
+let globals base = 
+  let width w = if   w <= 8 then 8 else if w <= 16 then 16 else if w <= 32 then 32
+                else Auxfuns.round_up_to 64 w in
+  let align = function 8 -> 1 | 16 -> 2 | _ -> 4 in
+  A.at mspace ~start:base 
+   (A.widen width *> A.align_to align *>
+    A.overflow ~growth:Memalloc.Up ~max_alignment:16)
+@ 
+We write a helper function to take care of expanding out load/stores through
+offsets.
+<<ia64.ml>>=
+<<a nicer version of [[ldst_expand]], which does not actually work>>
+let ldst_expand rtl =
+  let extract_reg_w op = function 
+	| [_; RP.Fetch((RP.Reg _) as r,w)] -> (r,w)
+	| [RP.Fetch((RP.Reg _) as r,w); _] -> (r,w)
+	| _ -> let (opname,_) = op in
+      Impossible.impossible ("could not find base register for ld/st") in
+  match Down.rtl rtl with
+  (* load from offset *)
+  |	RP.Rtl [g,RP.Store(dst,RP.Fetch(RP.Mem(ms,mc,
+					       (RP.App(op,exps) as e),assn),w'),w)
+           ] -> let (reg, regw) = extract_reg_w op exps in
+                List.map (fun x -> Up.rtl (RP.Rtl [g, x]))
+                    [ RP.Store(dst, e, regw)
+                    ; RP.Store(dst, RP.Fetch(RP.Mem(ms,mc,
+						    RP.Fetch(dst,regw),assn),
+					     w'), w) ]
+
+  (* store from offset *)
+  (* NOTE: right now, we have a hack to rewrite stores from offsets
+   * in the recognizer; the Right Way (seen in the next code chunk)
+   * doesn't seem to actually work because the temporaries assigned
+   * don't actually get mapped to hardware regs. for some reason
+   * perhaps because this is actually outside the postexpander *)
+
+  (* default case *)
+  |	_ -> [rtl]
+@ 
+<<a nicer version of [[ldst_expand]], which does not actually work>>=
+let ldst_expand rtl =
+  let extract_reg_w op = function 
+	| [_; RP.Fetch((RP.Reg _) as r,w)] -> (r,w)
+	| [RP.Fetch((RP.Reg _) as r,w); _] -> (r,w)
+	| _ -> let (opname,_) = op in
+      Impossible.impossible ("could not find base register for ld/st") in
+  match Down.rtl rtl with
+  (* load from offset *)
+  | RP.Rtl [g,RP.Store(dst,RP.Fetch(RP.Mem(s,ct,(RP.App(op,exps) as e),assn),w'),w)] ->
+      let (reg, regw) = extract_reg_w op exps in
+      List.map (fun x -> Up.rtl (RP.Rtl [g, x]))
+        [ RP.Store(dst, e, regw);
+          RP.Store(dst, RP.Fetch(RP.Mem(s,ct, RP.Fetch(dst,regw),assn), w'), w); ]
+
+  (* store from offset *)
+  | RP.Rtl [g,RP.Store(RP.Mem(s,ct,(RP.App(op,exps) as e),assn), src, w)] ->
+      let (reg, regw) = extract_reg_w op exps in
+      let tempr = Down.loc (Post.temploc (Post.talloc 't' 64)) in
+      List.map (fun x -> Up.rtl (RP.Rtl [g, x]))
+        [ RP.Store(tempr, e, regw);
+          RP.Store(RP.Mem(s, ct, RP.Fetch(tempr, regw), assn), src, w) ]
+
+  (* default case *)
+  | _ -> [rtl]
+@ 
+
+Spilling and reloading.
+<<ia64.ml>>=
+(* expansion here once caused infinite loop *)
+let spill_expand p r = (* [r] *) ldst_expand r
+let spill  p t l =
+  spill_expand p (Automaton.store l (Post.tempval t) (Post.tempwidth t))
+let reload p t l =
+  spill_expand p (R.store (Post.temploc t) (Automaton.fetch l (Post.tempwidth t)) (Post.tempwidth t))
+@
+JD: PREVIOUSLY, THE RETURN WAS THE FOLLOWING ASSIGNMENT DONE TWICE IN PARALLEL. WAS
+THERE A REASON FOR THAT?
+<<ia64.ml>>=
+let return_to this_ra = R.store pc raloc Post.wordsize
+@ 
+
+<<ia64.ml>>=
+let target =
+  let spaces = [ Spaces.m; Spaces.a; Spaces.r; Spaces.t; Spaces.f
+               ; Spaces.u; Spaces.v; Spaces.c; Spaces.p; Spaces.w ] in
+  { T.name = "ia64"
+  ; T.memspace    = mspace
+  ; T.max_unaligned_load  = R.C 1
+  ; T.byteorder   = Post.byte_order
+  ; T.wordsize    = Post.wordsize
+  ; T.pointersize = Post.wordsize
+  ; T.vfp         = SS.vfp
+  ; T.alignment   = 4
+  ; T.memsize     = 8
+  ; T.spaces      = spaces
+  ; T.reg_ix_map  = T.mk_reg_ix_map spaces
+  ; T.distinct_addr_sp = false
+  ; T.float       = Float.ieee754
+
+  ; T.spill       = spill
+  ; T.reload      = reload
+
+  ; T.bnegate     = F.bnegate cc
+  ; T.goto        = F.goto
+  ; T.jump        = F.jump
+  ; T.call        = F.call
+  ; T.return      = F.return
+  ; T.branch      = F.branch
+
+  ; T.cc_specs    = A.init_cc
+  ; T.cc_spec_to_auto = Ia64call.cconv ~return_to (F.cutto sp)
+  ; T.is_instruction  = Ia64rec.is_instruction
+  ; T.tx_ast = (fun secs -> secs)
+  ; T.capabilities = {T.memory = [64]; T.block_copy = false;
+                      T.itemps = [64]; T.ftemps = [64];
+                      T.iwiden = true; T.fwiden = false; T.litops=[];
+                      T.operators=List.map Up.opr [
+                         "sx",      [ 1; 64]
+                       ; "zx",      [ 1; 64]
+                       ; "lobits",  [64;  1]
+                       ; "add",     [64]
+                       ; "and",     [64]
+                       ; "com",     [64]
+                       ; "div",     [64]
+                       ; "divu",    [64]
+                       ; "mod",     [64]
+                       ; "modu",    [64]
+                       ; "mul",     [64]
+                       ; "mulx",    [64]
+                       ; "mulux",   [64]
+                       ; "neg",     [64]
+                       ; "or",      [64]
+                       ; "quot",    [64]
+                       ; "rem",     [64]
+                       ; "shl",     [64]
+                       ; "shra",    [64]
+                       ; "shrl",    [64]
+                       ; "sub",     [64]
+                       ; "xor",     [64]
+                       ; "eq",      [64]
+                       ; "ge",      [64]
+                       ; "geu",     [64]
+                       ; "gt",      [64]
+                       ; "gtu",     [64]
+                       ; "le",      [64]
+                       ; "leu",     [64]
+                       ; "lt",      [64]
+                       ; "ltu",     [64]
+                       ; "ne",      [64]
+                       ; "not",     []
+                       ; "bool",    []
+                       ; "disjoin", []
+                       ; "bit",     []
+                   ]; T.literals=[64]}
+  ; T.globals     = globals
+
+  (* there is bogosity below *)
+  ; T.rounding_mode = R.reg (('?', Rtl.Identity, Cell.of_size 64), 99, R.C 1)
+  ; T.named_locs    = Strutil.assoc2map []
+  ; T.data_section  = "data"
+  ; T.charset       = "latin1"
+  }
+@ 
+
+\subsection{Variable Placement}
+The machine accepts 32, 64, and 82-bit floating-point values.
+We deem any 82-bit value a float and examine the hints on all other values
+to classify them.
+
+<<ia64.ml>>=
+let warning s = Printf.eprintf "backend warning: %s\n" s
+let placevars = 
+  let is_float      w kind _ = w = 82 || (kind =$= "float" && (w = 32 || w = 64)) in
+  let strange_float w kind   = w = 82 && not (kind =$= "float") in
+  let strange_int   w kind   = kind =$= "float" && not (is_float w kind ()) in
+  let warn ~width:w ~alignment:a ~kind:k =
+      if strange_float w k then
+        warning "82-bit variable not kinded float but will go as float anyway"
+      else if strange_int w k then
+        warning
+          (Printf.sprintf "%d-bit variable kinded float but will go as integer" w) in
+  let mk_stage ~temps =
+    A.choice
+      [ is_float,               A.widen (Auxfuns.round_up_to ~multiple_of:64) *> temps 'u';
+        (fun w h _ -> w <= 64), A.widen (fun _ -> 64) *> temps 't';
+        A.is_any,               A.widen (Auxfuns.round_up_to ~multiple_of: 8);
+      ] in
+  Placevar.mk_automaton ~warn ~vfp:target.T.vfp ~memspace:target.T.memspace mk_stage
+@ 

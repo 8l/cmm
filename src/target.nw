@@ -1,0 +1,690 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+
+% ------------------------------------------------------------------ 
+\section{Target Platform Description}
+% ------------------------------------------------------------------ 
+
+{\qcc} is a cross compiler:  code can be generated for a target
+platform different from the platform the compiler is executed on.  The
+target platform can be chosen at run-time of the compiler. 
+Consequently, targets must be described by an {\ocaml} value that can
+be passed at run-time (rather than by a module, which can not). 
+
+<<target.mli>>=
+<<map and machine types>>
+val boxmach : unit machine
+<<type cc>>
+<<auxiliary types used to define type [[t]]>>
+<<type t>>
+
+<<exported functions>>
+val space : ('pr, 'au, 'cc) t -> Rtl.space -> Space.t
+@ The [[space]] function returns information about a particular space.
+It is a checked run-time error to ask about a space not on the list
+for the target.
+@ 
+<<type t>>=
+type ('proc, 'automaton, 'cc) t = { <<components of [[t]]>> }
+@
+Every target has a descriptive name.
+<<components of [[t]]>>=
+name: string;
+@
+A target is described by many small informations like pointer sizes
+and one bigger chunk that describe calling conventions.  A single
+platform can implement many calling conventions, which are identified
+by names.  Calling conventions are not only selected at run-time, we
+also intend to construct them at run-time.  For the time being,
+however, we will rely on a fixed set of calling conventions.  
+
+% ------------------------------------------------------------------ 
+\subsection{Calling Convention}
+% ------------------------------------------------------------------ 
+
+A calling convention includes specifications for automata that
+implement calling conventions.  In {\PAL} parameters are passed in
+three different contexts:  into procedures, into continuations, and
+out of both using [[return]].  Therefore, three different
+specifications exist.
+
+The [[allocatable]] field is mutable so that it can easily be modified by
+a backplane function. This is useful for running tests and specifying a set
+of registers.
+<<type cc>>=
+type 'automaton cc' =      
+    { sp:           Rtl.loc         (* stack pointer                      *)
+    ; return:       Rtl.rtl         (* machine instr passed to Cfg.return *)
+       (* NEEDS TO TAKE ALTS AND INDEX AS PARAMETER *)
+    ; proc:         'automaton  (* pass parameter to a procedure      *)
+    ; cont:         'automaton  (* pass parameter to a continuation   *)
+    ; ret:          'automaton  (* return values                      *)
+    ; mutable allocatable:  Register.t list (* regs for reg-allocation            *)
+    (* THIS TYPE SHOULD INCLUDE INFORMATION ABOUT ALTERNATE RETURN CONTINUATIONS,
+       IN PARTICULAR, HOW BIG IS EACH SLOT, AND DOES IT HOLD AN INSTRUCTION OR
+       AN ADDRESS? *)
+    ; stack_slots:  'automaton (* where private data go *)
+    }
+@ 
+Continuations, spill locations and other private data of a procedures
+lives on the run-time stack. These locations are issued by an
+[[Automaton2.t]] value. The specification for that automaton is
+determined by the calling convention.
+
+To obtain a calling convention, pass its name to the [[cc]] component
+which will return the convention response.  It is a checked run-time
+error to ask for an unknown calling convention.
+WOULD Not\_found BE A BETTER EXCEPTION TO RAISE? THE ERROR MODULE BELONGS
+TO THE FRONTEND.
+
+<<components of [[t]]>>=
+mutable cc_specs: Automaton.cc_specs;
+cc_spec_to_auto: string -> Automaton.cc_spec -> 'cc;
+@ 
+Even though the stack pointer depends on the calling convention, the
+virtual frame pointer is the same everywhere.
+(Its width is target-dependent.)
+<<components of [[t]]>>=
+vfp : Rtl.exp;   (* the (immutable) virtual frame pointer *)
+   (* always equal to Vfp.mk T.pointersize *)
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Bits and Pieces}
+% ------------------------------------------------------------------ 
+
+Many of the following characteristics of a target are more or less
+obvious.  A {\PAL} source can name hardware registers for variables. 
+The [[register]] component provides the location for a given name.  We
+could remember the width for type checking as well but we are wearing
+our assembler hats for now.
+
+Field [[alignment]] is the alignment required to load or store a word
+of size [[pointersize]].
+<<components of [[t]]>>=
+byteorder:      Rtl.aggregation   ; (* big/little endian, id *)
+wordsize:       int               ; (* bits *)
+pointersize:    int               ; (* bits *)
+alignment:      int               ; (* alignment of word access *)
+memsize:        int               ; (* smallest addressable unit, typically 8 *)
+memspace:       Rtl.space         ; (* redundant with byte order, word size *)
+float:          Float.t           ; (* floating pt name and semantics    *)
+charset:        string            ; (* "latin1"  character encoding      *)
+globals:        'automaton   ; (* Automaton to allocate global vars *)
+@
+We need to know how big a value can be loaded using an unaligned load
+instruction. 
+<<components of [[t]]>>=
+max_unaligned_load : Rtl.count;  (* how many cells to load unaligned *)
+@
+
+A target has many address spaces:  main memory, different register
+sets, temporaries.  A [[Rtl.loc]] value describes a location within
+such a space.  Each space is homogeneous in the sense that all its
+cells have the same width.  When cells within one space are aggregated,
+a common aggregation scheme is used, described by a space-specific
+[[Rtl.aggregation]] value.  The cells within a space are addressed by
+an integer expression denoting their \emph{address}.  All address
+expressions for a space share a common width.  For example, memory
+might by addressed by 32-bit wide addresses, registers by 5-bit wide
+addresses. 
+                
+The [[spaces]] list enumerates all spaces used to compile for the
+machine, including temporary spaces as well as the real hardware
+spaces.
+No space appears more than once on the list.
+<<components of [[t]]>>=
+spaces:          Space.t list;
+@
+The [[reg_ix_map]] tells us how many ($n$) fixed and hardware registers are in the
+target machine and provides a mapping from these registers to integers from
+$[0..n-1]$.
+<<components of [[t]]>>=
+reg_ix_map :     int * int Register.Map.t;
+@
+Variable placers may or may not need to distinguish between integer
+and address spaces, depending on this flag.
+<<components of [[t]]>>=
+distinct_addr_sp:  bool;
+@
+<<components of [[t]]>>=
+data_section:   string;          (* ASM section for global regs *)
+@
+
+Code goes into the \emph{text} section, memory allocated for global
+registers goes into the [[data_section]].
+
+% ------------------------------------------------------------------ 
+\subsection{Identify Special Locations}
+% ------------------------------------------------------------------ 
+
+We wish every target had a global register for the current
+floating-point rounding mode.
+The register is needed in the generic expander to deal with the
+so-called ``implicit rounding mode'' floating-point conversions.
+It must always be safe to compare [[rounding_mode]] for equality.
+
+The register may be available as a named hardware register.
+<<components of [[t]]>>=
+rounding_mode : Rtl.loc;
+@ On a machine without floating point, this register has to be defined
+to some bogus value, which probably would make things go horribly
+wrong.
+One possibility would be to make this value have 
+type [[Rtl.loc option]], but this might complicate the generic
+expander.
+Still, it's probably a good idea to do this, especially since the
+front end could then detect and complain about use of floating-point
+operators. 
+@
+
+
+% ------------------------------------------------------------------ 
+\subsection{Named Hardware Registers}
+% ------------------------------------------------------------------ 
+
+If a target provides names hardware registers, a user can request them
+for a global {\PAL} register. A target advertises a map of known
+hardware registers. 
+<<components of [[t]]>>=
+named_locs:    Rtl.loc Strutil.Map.t;
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Temporaries, Register indices, and Register Allocation}
+% ------------------------------------------------------------------ 
+
+The register allocator (see \module{ocolorgraph.nw}) needs
+target-specific informations about hardware registers and temporaries.
+In particular:
+<<exported functions>>=
+val is_tmp : ('pr, 'au, 'cc) t -> Rtl.space -> bool  (* partially apply me *)
+val fits:    ('pr, 'au, 'cc) t -> Rtl.space -> Register.t -> bool
+@
+\begin{itemize}
+\item [[fits t sp r]] is true, if (hardware) register [[r]] can hold any 
+      value from space [[sp]].  It is an unchecked run-time error
+      unless [[sp]] is a temporary space from the target~[[t]].
+
+\item [[is_tmp t sp]] is true, if [[sp]] denotes a {\rtl} space that
+      holds temporaries.  It should be partially applied for efficiency.
+\end{itemize}
+@
+We need to map hardware registers to small integers.
+The registers in fixed and hardware spaces are sorted in increasing alphanumeric order,
+first by the space identifier, then by index within the space.
+The sorted list of $n$ registers is then mapped to the integers $[0 ... n-1]$.
+The first element of the pair is the number $n$ of registers.
+<<exported functions>>=
+val mk_reg_ix_map : Space.t list -> (int * int Register.Map.t)
+@
+The RTLs should be returned in \emph{execution order}, i.e., the first
+element of the list is the first to be executed.  \emph{ALERT! Perhaps
+we ought to revisit these interfaces, since the role of the first
+argument is baffling. ---NR} 
+@
+
+\subsection{The recognizer}
+
+For optimization, we need to know what an instruction is.
+<<components of [[t]]>>=
+is_instruction: Rtl.rtl -> bool;
+@ 
+
+\subsection{Control-flow operations}
+Several modules, including the expander, need to produce control-flow instructions.
+For each target, we collect the control-flow functions in a [[machine]] record.
+The machine record is synthesized by the expander, which makes use of the functions
+  in the postexpander to fill out the machine record.
+<<map and machine types>>=
+type ('em, 'pr) map' = ('em, 'pr) Ep.pre_map =
+    { embed   : 'em
+    ; project : 'pr
+    }
+type brtl = Rtl.exp -> Rtl.rtl
+type ('a,'b) map  = ('a -> 'b -> brtl Dag.branch, Rtl.rtl -> 'b) map'
+type ('a,'b) mapc = ('a -> 'b -> brtl Dag.cbranch, Rtl.rtl -> 'b) map'
+
+type 'a machine = 'a Mflow.machine =
+  { bnegate:   Rtl.rtl -> Rtl.rtl
+  ; goto:      ('a, Rtl.exp) map
+  ; jump:      ('a, Rtl.exp) map
+  ; call:      ('a, Rtl.exp) map
+  ; branch:    ('a, Rtl.exp) mapc (* condition *)
+  ; retgt_br:  Rtl.rtl -> brtl Dag.cbranch
+  ; move:      'a -> src:Register.t -> dst:Register.t -> brtl Dag.block
+  ; spill:     'a -> Register.t -> Rtlutil.aloc -> brtl Dag.block
+  ; reload:    'a -> Rtlutil.aloc -> Register.t -> brtl Dag.block
+  ; cutto:     ('a, Mflow.cut_args) map    (* newpc * newsp map*)
+  ; return:    Rtl.rtl
+  ; forbidden: Rtl.rtl   (* causes a run-time error *)
+  }
+@
+<<components of [[t]]>>=
+machine : 'proc machine;
+@
+We also define a generic target record, which uses boxing to store the \rtl\ fragments.
+The branch negate operation of the boxed machine should never be called.
+Similarly, the [[return]] and [[forbidden]] \rtls\ are meaningless.
+<<boxed machine>>=
+let boxmach =
+  let fail _ = assert false in
+  let crmap = { embed = (fun () e -> (DG.Nop, Box.Exp.box e))
+              ; project = Box.Exp.unbox } in
+  let x = (Space.Standard32.x R.LittleEndian [32]).Space.space in
+  let bogus  = R.kill (R.reg (x, 0, (R.C 1))) in
+  { bnegate = (fun _ -> assert false)
+  ; goto = crmap
+  ; jump = crmap
+  ; call = crmap
+  ; cutto = { embed =
+                (fun _ ca -> (DG.Nop, Box.ExpList.box [ca.M.new_sp; ca.M.new_pc]))
+            ; project = (fun box -> match Box.ExpList.unbox box with
+                           | [sp; pc] -> {M.new_sp = sp; M.new_pc = pc}
+                           | _ -> assert false)}
+  ; branch = { embed   = (fun _ g -> DG.cond (fun _ -> Box.Guard.box g))
+             ; project = (fun box -> Box.Guard.unbox box)}
+  ; retgt_br  = fail
+  ; move      = fail
+  ; spill     = fail
+  ; reload    = fail
+  ; M.return  = bogus
+  ; forbidden = bogus
+  }
+@
+
+% ------------------------------------------------------------------
+\subsection{Code-generation assist}
+% ------------------------------------------------------------------
+@
+Some back ends (notably the \texttt{gcc} back end) want to transform
+an AST before translating to~IR.
+This translation is implemented by the [[tx_ast]] component.
+Such a component should be polymorphic; that is, the type 
+should actually be
+[[\/'a . 'a Nelab.compunit -> 'a Nelab.compunit]],
+but because this type isn't expressible in Caml, 
+we use [[Auxfuns.void]] instead, and [[Nelab.rewrite]] 
+will (unsafely) cast such a function back to a polymorphic type.
+<<components of [[t]]>>=
+tx_ast : Auxfuns.void Nelab.compunit -> Auxfuns.void Nelab.compunit;
+@ 
+% ------------------------------------------------------------------
+\subsection{Code-generation capabilities}
+% ------------------------------------------------------------------
+@
+The [[capabilities]] record explains the code-generation capabilities
+of the back end.
+It can be used for several purposes:
+\begin{itemize}
+\item
+ Tell Kevin's widener which operators can be widened and how far
+\item
+ Emit an informal explanation of what code a front end should generate
+\item
+ Emit code for helping to test implementations of operators.
+\end{itemize}
+The capability record says what source code a back end promises to handle.
+<<components of [[t]]>>=
+capabilities: capabilities;
+<<auxiliary types used to define type [[t]]>>=
+type capabilities = {
+    operators   : Rtl.opr   list;  (* operators that can be used *)
+    literals    : Rtl.width list;  (* literals that can be used *)
+    litops      : Rtl.opr   list;  (* operators usable on literals only *)
+    memory      : Rtl.width list;  (* memory refs that can be used *)
+    block_copy  : bool;            (* OK to copy large variables, large refs? *)
+    itemps      : Rtl.width list;  (* what integer temporaries can be computed with *)
+    ftemps      : Rtl.width list;  (* what floating temporaries can be computed with *)
+    iwiden      : bool;            (* use int ops and literals at narrow widths? *)
+    fwiden      : bool;            (* use float ops literals at narrow widths? *)
+  }
+@ 
+The capability record is intended as information for front ends.
+We also use it to generate test code.
+But information in the capability record also has implications for the
+promises made in a back end:
+\begin{itemize}
+\item
+[[itemps]] means the postexpander promises to handle integer
+operations on temporaries of these widths.
+\item
+[[ftemps]] means the postexpander promises to handle floating-point
+operations on temporaries of these widths.
+\item
+[[iwiden]] means we promise to widen integer operators up to the
+largest width in [[itemps]] (should be replaced with a list of
+operator names)
+\item
+[[fwiden]] means we promise to widen floating-point operators up to the
+largest width in [[ftemps]] (should be replaced with a list of
+operator names)
+\item
+[[block_copy]] means we can generate copies between any two locations
+of type [[bits]]$k$, where $k$~is a multiple of the target
+[[memsize]].
+By ``location'' we mean either a memory reference or a declared
+variable.
+\item
+[[memory]] lists the widths at which the postexpander promises to
+compile either ordinary loads and stores or extending loads and
+low-bit stores.
+\item
+[[literals]] presumably identifies what size literals the postexpander
+can handle in [[li]].
+\item
+[[operators]] means all the operators the postexpander can handle,
+\emph{plus} operators that are handled in the generic expander or the
+simplifier.
+For some ideas about what operator is what, see the [[Opshape]]
+module.
+\item
+[[litops]] lists operators that can't be handled by the postexpander,
+but that can be evaluated at compile time by the simplifier (and so
+can be applied to literals).
+\end{itemize}
+@
+An incapable back end has no capabilities whatever.
+<<target.mli>>=
+val incapable : capabilities  (* the completely useless back end *)
+
+@
+[[minimal_capabilities]] returns a minimal set of capabilities, given the word size.
+<<target.mli>>=
+val minimal_capabilities: int -> capabilities
+@ 
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+The implementation does not hold any surprises. We use module [[Map]]
+to implement lookup tables for registers and calling conventions.
+<<target.ml>>=
+<<map and machine types>>
+module DG = Dag
+module M  = Mflow
+module R  = Rtl
+module S  = Space
+module RP = Rtl.Private
+module RU = Rtlutil
+<<type cc>>
+<<auxiliary types used to define type [[t]]>>
+<<type t>>
+<<boxed machine>>
+let impossf fmt = Printf.kprintf Impossible.impossible fmt
+let incapable = { operators = []; literals = []; litops = []; memory = []; itemps = [];
+                  ftemps = []; block_copy = false; iwiden = false; fwiden = false; }
+let minimal_capabilities wordsize =
+	{ literals = [wordsize]
+        ; block_copy = false
+        ; itemps = [wordsize]
+        ; ftemps = []
+        ; iwiden = false
+        ; fwiden = false
+        ; litops = []
+	; memory = [wordsize]
+	; operators = List.map Rtl.Up.opr [
+                         "sx",      [ 1; wordsize]
+                       ; "zx",      [ 8; wordsize]
+		        (* for some reason, -interp always generates 8->32 zx instructions *)
+                       ; "lobits",  [wordsize;  1]
+                       ; "lobits",  [wordsize; wordsize]
+                       ; "add",     [wordsize]
+                       ; "addc",    [wordsize]
+                       ; "and",     [wordsize]
+                       ; "borrow",  [wordsize]
+                       ; "carry",   [wordsize]
+                       ; "com",     [wordsize]
+                       ; "div",     [wordsize]
+                       ; "divu",    [wordsize]
+                       ; "false", []
+                       ; "mod",     [wordsize]
+                       ; "modu",    [wordsize]
+                       ; "mul",     [wordsize]
+                       ; "mulx",    [wordsize]
+                       ; "mulux",   [wordsize]
+                       ; "neg",     [wordsize]
+                       ; "or",      [wordsize]
+                       ; "quot",    [wordsize]
+                       ; "popcnt",  [wordsize]
+                       ; "rem",     [wordsize]
+                       ; "rotl",    [wordsize]
+                       ; "rotr",    [wordsize]
+                       ; "shl",     [wordsize]
+                       ; "shra",    [wordsize]
+                       ; "shrl",    [wordsize]
+                       ; "sub",     [wordsize]
+                       ; "subb",    [wordsize]
+                       ; "true", []
+                       ; "xor",     [wordsize]
+                       ; "eq",      [wordsize]
+                       ; "ge",      [wordsize]
+                       ; "geu",     [wordsize]
+                       ; "gt",      [wordsize]
+                       ; "gtu",     [wordsize]
+                       ; "le",      [wordsize]
+                       ; "leu",     [wordsize]
+                       ; "lt",      [wordsize]
+                       ; "ltu",     [wordsize]
+                       ; "ne",      [wordsize]
+
+                       ;  "add_overflows",  [wordsize]
+                       ;  "div_overflows",  [wordsize]
+                       ;  "mul_overflows",  [wordsize]
+                       ;  "mulu_overflows", [wordsize]
+                       ;  "quot_overflows", [wordsize]
+                       ;  "sub_overflows",  [wordsize]
+                       ; "not",     []
+                       ; "bool",    []
+                       ; "disjoin", []
+                       ; "conjoin", []
+                       ; "bit",     []
+                   ];}
+
+@
+<<target.ml>>=
+let space t s = 
+  try List.find (fun x -> RU.Eq.space x.Space.space s) t.spaces
+  with Not_found ->
+    let (s, _, _) = s in
+    impossf "Space '%c' not found in target '%s'\n" s t.name
+@
+<<target.ml>>=
+let is_tmp { spaces = spaces } =
+  List.fold_right
+    (fun s rest ->
+      match s.Space.classification with
+      | Space.Temp _ -> (fun c -> RU.Eq.space c s.Space.space || rest c)
+      | _ -> rest)
+    spaces
+    (fun _ -> false)
+@ 
+Given a list of spaces, it is quite easy to map the fixed or hardware registers
+to small integers.
+<<target.ml>>=
+let mk_reg_ix_map spaces =
+  let space_to_regs space =
+    let rec list_to n =
+      if n <= 0 then [0]
+      else n :: list_to (n-1) in
+    List.map (fun i -> (space.S.space, i, R.C 1))
+             (list_to (match space.S.indexlimit with
+                       | Some l -> l
+                       | None   -> 1 lsl space.S.indexwidth)) in
+  let regspaces =
+    let keep s = match s.S.classification with S.Reg | S.Fixed -> true | _ -> false in
+    List.filter keep spaces in
+  Register.reg_int_map (List.concat (List.map space_to_regs regspaces))
+@
+<<target.ml>>=
+let space_fits tmp =
+  match tmp.Space.classification with
+  | Space.Temp {Space.stands_for=ok} -> ok
+  | _ -> let (sp, _, _) = tmp.Space.space in
+         impossf "space_fits called on non-temp of space '%c'" sp
+
+let fits t space =
+  try space_fits (List.find (fun s -> RU.Eq.space s.Space.space space) t.spaces)
+  with Not_found -> impossf "space not found in Target.fits"
+@ 
+\subsection{Lua support for exposing target capabilities}
+
+Our main goal here is to explain the target informally to a front-end writer.
+<<Lua utility functions written in Lua>>=
+function w (...)  -- a valuable abbreviation
+  write(Util.call(format, arg))
+end
+
+function Target.explain(t)
+  t = t or backend or error('default back end did not get set')
+  if type(t) == 'table' then t = t.target end
+  if type(t) ~= 'userdata' then
+    error(tostring(t) .. ' is not a target')
+  end
+  local cap = Target.capabilities(t)
+  local name = Target.name(t)
+
+  local ops = cap.operators
+  w('==== Advertised capabilities of target %s ====\n\n', name)
+
+  w('target %s has these metrics:\n', name)
+  Target.emitmetrics(t, '  ')
+  w('\n')
+
+  w('target %s supports memory references in these sizes:\n', name)
+  Target.showtypes('  %-6s[...]\n', cap.memory, '\n')
+
+  w('target %s supports literal bit vectors in these sizes:\n', name)
+  Target.showtypes('  nnnn :: %-6s\n', cap.literals, '\n')
+
+  w('target %s can compute with C-- variables declared at these sizes:\n', name)
+  Target.showtypes('  %-6s n;    // integer variable\n', cap.itemps);  
+  Target.showtypes('  %-6s x;    // floating-point variable\n', cap.ftemps, '\n');  
+
+  w('target %s implements these operators:\n', name)
+  local defined = { }
+  local i = 1
+  while ops[i] do
+    defined[ops[i].name] = 1
+    Target.showop(ops[i])
+    i = i + 1
+  end
+  w('\n')
+
+  w('target %s can apply these operators to compile-time constant expressions only:\n',
+    name)
+  local defined = { }
+  local i = 1
+  local litops = cap.litops
+  while litops[i] do
+    defined[litops[i].name] = 1
+    Target.showop(litops[i])
+    i = i + 1
+  end
+  w('\n')
+
+  w('target %s does *not* implement these operators:\n', name)
+  i = 1
+  local allops = Rtlop.opnames ()
+  while allops[i] do
+    if not defined[allops[i]] then
+      write(format('  %%%s\n', allops[i]))
+    end
+    i = i + 1
+  end
+
+  if cap.iwiden then Target.widen_ok (name, 'integer')        end
+  if cap.fwiden then Target.widen_ok (name, 'floating-point') end
+  if cap.block_copy then <<announce block-copy support>> end
+end
+@ 
+These utility functions help us emit repetitive messages.
+<<Lua utility functions written in Lua>>=
+function Target.showtypes(fmt, ts, s)
+  local i = 1
+  while ts[i] do
+    w(fmt, Target.showty(ts[i]))
+    i = i + 1
+  end
+  w(s or '')
+end
+<<Lua utility functions written in Lua>>=
+function Target.widen_ok(name, kind)
+  w([[
+The %s back end includes a 'widener' that allows you to declare %s
+variables and write %s computations at widths smaller than the
+natural widths shown above.  Your code is automatically rewritten to use
+the natural width of the machine.
+]], name, kind, kind)
+end
+<<announce block-copy support>>=
+w([[
+The %s back end supports block copies.  This means you can declare
+very wide variables and very wide memory references, but the only
+thing you can do with them is copy the bits from one place to another.
+For example, here is a mighty big swap operation:
+  bits128 n, m;
+  n = bits128[p];
+  m = bits128[p+16];
+  bits128[p]    = m;
+  bits128[p+16] = n;
+It should also be possible to pass such large variables as parameters
+and return them as results.  Attempts to do arithmetic or other operations
+very wide variables are doomed to failure.
+]], name)
+@ 
+Return the source-language representation of a type.
+<<Lua utility functions written in Lua>>=
+function Target.showty(t)
+  if type(t) == 'number' then
+    return 'bits' .. t
+  else
+    return t
+  end
+end
+@ 
+To show an operator, we show its argument and result types.
+If the argument is a width changer, we need to make the result width
+part of its name, so we build the set of width changers.
+<<Lua utility functions written in Lua>>=
+Target.width_changers =
+  Util.set { 'NaN', 'sx', 'zx', 'lobits', 'f2f', 'f2i', 'i2f' }
+
+function Target.showop(op)
+  local args, result = Rtlop.mono(op)
+  if result then
+    local ty = Target.showty
+    w('  %-6s %%%s', ty(result), op.name)
+    if Target.width_changers[op.name] then w(result) end
+    w('(')
+    local i = 1
+    local pfx = ""
+    while args[i] do
+      w('%s%s', pfx, ty(args[i]))
+      pfx = ', '
+      i = i + 1
+    end
+    w(')\n')
+  else
+    w('  nonstandard operator %%%s\n', op.name)
+  end
+end
+@ 
+<<Lua utility functions written in Lua>>=
+function Target.emitmetrics(t, pfx)
+  local m = Target.metrics(t)
+  pfx = pfx or ''
+  w('%starget byteorder %s;\n', pfx, m.byteorder)
+  w('%starget wordsize %d pointersize %d memsize %d;\n',
+    pfx, m.wordsize, m.pointersize, m.memsize)
+  w('%starget float "%s" charset "%s";\n', pfx, m.float, m.charset)
+end
+

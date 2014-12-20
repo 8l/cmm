@@ -1,0 +1,394 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*- %
+
+\ifx\nointro\undefined
+This document contains some code necessary for interaction with Lua from C.
+\fi
+
+% ----------------------------------------------------------------------------
+\interface{[[lualink]] : Lua / C Interactions}
+% ----------------------------------------------------------------------------
+
+<<lualink.h>>=
+#ifndef _LUALINK_H
+#define _LUALINK_H
+
+#include <lua.h>
+#include <luadebug.h>
+#include "table.h"
+
+#define LUA_INVALIDLINE (-1)
+
+<<[[extern]] declarations for exported globals>>
+<<macro definitions>>
+<<function prototypes>>
+#endif /* _LUALINK_H */
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Initializing a Lua Interpreter}
+% ----------------------------------------------------------------------------
+
+To initialize a Lua interpreter, there are several things to be done;
+we must register C functions with Lua, turn on certain Lua debugging options,
+create Lua tags, etc.
+
+[[init_lua_interp]] creates a new embedded Lua interpreter, performs all of
+these necessary initializations, and returns its [[lua_State *]].
+
+<<function prototypes>>=
+lua_State *init_lua_interp(void);
+@ 
+
+For ease of access, we export a global variable pointing to the Lua interpreter
+that [[lualink.nw]] uses.
+This could potentially reduce the need for the explicit argument passing of the
+same [[lua_State *]].
+
+<<[[extern]] declarations for exported globals>>=
+extern lua_State *lua_interpreter;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Functions and Macros}
+% ----------------------------------------------------------------------------
+
+\paragraph{Extensions to the Lua Interface}
+
+We provide [[lua_table_foreach]] to make it easier to apply a Lua function
+(named [[str]]) to the key and value for each entry in a [[table]].
+This function is the C equivalent of the Lua function [[foreach]], and behaves
+identically.
+
+<<function prototypes>>=
+int lua_table_foreach(lua_State *L, table t, const char *str);
+@ 
+
+[[lua_getfromref]] allows Lua code to access Lua tables that are not stored as
+globals, but rather referenced only by C [[table]] records.
+This function takes a Lua reference (an [[int]]) and returns a table on the
+Lua stack.
+
+<<function prototypes>>=
+int lua_getfromref(lua_State *L);
+@ 
+
+\paragraph{Accessing [[table]]s from Lua}
+
+We provide helper [[table_exporttolua]] to export a [[table]] as a Lua global.
+Although [[table]]s are represented as Lua tables, they are not necessarily
+visible in the Lua global environment.
+Note that a [[table *]] must be passed in, and not a [[table]] structure
+itself, because the [[table]] record may be updated as a result of the
+export operation.
+
+<<function prototypes>>=
+void table_exporttolua(lua_State *L, table *t, const char *name);
+@ 
+
+\paragraph{Debugging}
+
+For extra debugging information, we use the Lua debugging library in
+conjunction with the function [[lua_linehook]].
+
+<<function prototypes>>=
+void lua_linehook(lua_State *L, lua_Debug *ar);
+@
+
+\paragraph{Lua Type Assertions}
+
+To ease the notational burden of type-checking values on the Lua stack, we
+provide a small family of assertion macros.
+These macros assert that the specified value on the Lua stack is of the
+correct type; if a type mismatch occurs, an error is produced using the given
+error message ([[err_msg]]) and an appropriate error is signalled to the
+interpreter.
+
+<<faux prototypes>>=
+void lua_assert_isfunction(lua_State *L, int i, const char *err_msg);
+void lua_assert_isnumber  (lua_State *L, int i, const char *err_msg);
+void lua_assert_isstring  (lua_State *L, int i, const char *err_msg);
+void lua_assert_istable   (lua_State *L, int i, const char *err_msg);
+@ 
+
+% ----------------------------------------------------------------------------
+\implementation{Lua / C Interactions}
+% ----------------------------------------------------------------------------
+
+<<lualink.c>>=
+#include "lualink.h"
+
+#include <lualib.h>
+
+#include "interp.h" 
+#include "encoding.h"
+#include "operator.h" /* for use of operator_table */
+
+/* for exporting of tables to Lua */
+#include "label.h"
+#include "span.h"
+#include "assemblyunit.h"
+
+int lua_assembly_unit_tag;
+int lua_RBlock_tag;
+int lua_c_func_tag;
+int lua_c_sig_tag;
+int lua_operator_tag;
+int lua_CMM_label_tag;
+
+int lua_span_token_tag;
+int lua_span_tag;
+
+int lua_linenumber = LUA_INVALIDLINE;
+
+<<global variable definitions>>
+<<function definitions>>
+@
+
+% ----------------------------------------------------------------------------
+\subsection{Declarations for Exported Globals}
+% ----------------------------------------------------------------------------
+
+For each different kind of C data we treat as [[userdata]] in Lua, we define
+a new Lua [[userdata]] tag.
+These tag references are defined throughout the various modules in the
+interpreter, but we initialize them all within [[lualink]] when we initialize
+a new Lua interpreter.
+
+<<[[extern]] declarations for exported globals>>=
+extern int lua_assembly_unit_tag;
+extern int lua_RBlock_tag;
+extern int lua_c_func_tag;
+extern int lua_c_sig_tag;
+extern int lua_operator_tag;
+extern int lua_CMM_label_tag;
+
+extern int lua_span_token_tag;
+extern int lua_span_tag;
+
+extern int lua_linenumber;
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Initializing a Lua Interpreter}
+% ----------------------------------------------------------------------------
+
+We define global variable [[lua_interpreter]] so any function in the
+interpreter can easily get a reference to the Lua interpreter being used.
+
+<<global variable definitions>>=
+lua_State *lua_interpreter = NULL;
+@
+ 
+When we initialize a new Lua interpreter, we need to make sure that we also 
+open up interactions with the Lua base library so we can later use the Lua 
+function [[foreach]].
+
+<<function definitions>>=
+lua_State *init_lua_interp(void) {
+  lua_State *lua_interp;
+
+  /* FIX : for now, send lua_open 0; it will default to a stacksize of 1024 */
+  lua_interpreter = lua_interp = lua_open(0);
+
+  lua_baselibopen(lua_interp);
+  lua_iolibopen(lua_interp);
+  lua_strlibopen(lua_interp);
+  lua_mathlibopen(lua_interp);
+
+  lua_setlinehook(lua_interp, lua_linehook);
+
+  <<create Lua userdata tags>>
+  <<register C functions with lua>>
+  <<bind global tables to global Lua symbols>>
+  <<extend Lua initial basis>>
+
+  return lua_interp;
+}
+@ 
+
+We create user-defined Lua tags for the non-standard userdata we store in Lua 
+tables: [[RAddr]]s, [[RBlock]]s, [[RLabel]]s, etc.
+
+<<create Lua userdata tags>>=
+  lua_assembly_unit_tag  = lua_newtag(lua_interp);
+  lua_RBlock_tag         = lua_newtag(lua_interp);
+  lua_CMM_label_tag      = lua_newtag(lua_interp);
+  lua_c_func_tag         = lua_newtag(lua_interp);
+  lua_c_sig_tag          = lua_newtag(lua_interp);
+  lua_operator_tag       = lua_newtag(lua_interp);
+
+  lua_span_token_tag     = lua_newtag(lua_interp);
+  lua_span_tag           = lua_newtag(lua_interp);
+@ 
+
+The Lua initial basis consists of helper Lua functions that we wish had been
+included with Lua in the first place, as well as some {\PAL} specific Lua
+functions that allow the user to inspect interpreter internals (see
+[[inspect.nw]]).
+Note that we expect external file [[inspect.clua]] to contain a single C string
+representing Lua source code.
+
+<<extend Lua initial basis>>=
+  {
+    const char *lua_extension = "function copytable (t) \n"
+                                "  local newtable = {}  \n"
+                                "  for i, v in t do     \n"
+                                "    newtable[i] = v    \n"
+                                "  end                  \n"
+                                "  return newtable      \n"
+                                "end                    \n";
+    lua_error_handle(lua_dostring(lua_interp, lua_extension), 
+                     "<internal code>");
+  }
+
+  {
+    const char *lua_extension =
+                                #include "inspect.clua"
+	                            ;
+    lua_error_handle(lua_dostring(lua_interp, lua_extension),
+                     "<internal code>");
+  }
+@ 
+
+Now we must register all C functions that we wish to be exported to Lua.
+A call to [[ITERATE_CMM_FUNCS]] takes care of registering the encoding 
+functions (see [[encoding]] module), and two remaining calls register 
+[[lua_relocate_block]] and [[lua_copy_block_contents]].
+
+<<register C functions with lua>>=
+  /* register additional C functions with Lua */
+  lua_newtable(lua_interp);
+  lua_setglobal(lua_interp, "CMM");
+  ITERATE_CMM_FUNCS(LUA_FUNC_REGISTER)
+  lua_register(lua_interp,"relocate_block",(lua_CFunction) lua_relocate_block);
+  lua_register(lua_interp,"copy_block_contents",
+                                      (lua_CFunction) lua_copy_block_contents);
+  lua_register(lua_interp,"getfromref"    ,(lua_CFunction) lua_getfromref    );
+@ 
+
+To allow the user to inspect certain internal tables used in the interpreter,
+we bind some such tables to global Lua symbols.
+
+<<bind global tables to global Lua symbols>>=
+  /* store tables under CMM.tables */
+  lua_getglobal(lua_interp, "CMM");
+
+  lua_pushstring(lua_interp, "tables");
+  lua_newtable(lua_interp);
+  lua_settable(lua_interp, -3);
+
+  /* FIX export the tables (is there a better place to do this?) */
+  table_exporttolua(lua_interp, &exports_table       , "exports"       );
+  table_exporttolua(lua_interp, &assembly_units_table, "assembly_units");
+  table_exporttolua(lua_interp, &span_table          , "spans"         );
+
+  lua_pop(lua_interp, 1);
+@ 
+
+% ----------------------------------------------------------------------------
+\subsection{Utility Functions and Macros}
+% ----------------------------------------------------------------------------
+
+\paragraph{Extensions to the Lua Interface}
+
+[[lua_table_foreach]] runs the Lua function named in string [[str]] on each of
+the table elements in table [[t]]. 
+
+<<function definitions>>=
+int  lua_table_foreach(lua_State *L, table t, const char *str) {
+  if (t.data == LUA_NOREF || t.data == LUA_REFNIL) {
+    return 0;
+  }
+
+  assert(L == t.L);
+
+  lua_getglobal(L, "foreach");
+  lua_assert_isfunction(L, -1, "cannot find foreach function in Lua library");
+
+  lua_pushtable(L, t);
+  lua_getglobal(L, str);
+  lua_assert_isfunction(L, -1, "invalid argument to foreach");
+
+  lua_call(L, 2, LUA_MULTRET);
+
+  return 0;
+}
+@ 
+
+[[lua_getfromref]] simply wraps C function (from the Lua API) [[lua_getref]].
+
+<<function definitions>>=
+int lua_getfromref(lua_State *L) {
+  int i;
+
+  lua_assert_isnumber(L, -1, "getfromref expects an integer argument");
+  i = (int) lua_tonumber(L, -1);
+
+  lua_pop(L, 1);
+
+  if (lua_getref(L, i))
+    return 1;
+  else
+    return 0;
+}
+@ 
+
+\paragraph{Accessing [[table]]s from Lua}
+
+We require [[t]] to be a [[table *]] because we may need to implicitly update
+[[*t]] as a side effect of the [[lua_pushtable]] call.
+
+<<function definitions>>=
+void table_exporttolua(lua_State *L, table *t, const char *name) {
+  lua_error_handle(lua_dostring(lua_interpreter,
+         "CMM               = CMM               or {}   \n"
+         "CMM.tables        = CMM.tables        or {}   \n"),
+     "<internal code>");
+  lua_getglobal (L, "CMM"   );
+  lua_pushstring(L, "tables");
+  lua_gettable  (L, -2      );
+  lua_pushstring(L,  name   );
+  lua_pushtable (L,  *t     );
+  lua_settable  (L, -3      );
+  lua_pop       (L,  2      );
+}
+@ 
+
+\paragraph{Debugging}
+
+So we can provide the user with adequate error messages that precisely 
+pinpoint where we were in a Lua source file when an error was perceived, we
+hook into the Lua debugging library.
+[[lua_linehook]] is registered with Lua when we initialize the Lua interpreter
+(in [[cmm_interp_open]]) such that it will be called every time the Lua
+interpreter moves to a new line in the source files it reads.
+We simply grab the line number from the provided Lua debugging information
+and store it in global variable [[lua_linenumber]].
+
+<<function definitions>>=
+void lua_linehook(lua_State *L, lua_Debug *ar) {
+  lua_linenumber = ar->currentline;
+}
+@ 
+
+\paragraph{Lua Type Assertions}
+
+The [[lua_assert_is]]$type$ family of macros check to make sure that the
+specified value on a [[lua_State]]'s stack is of the correct type.
+If the type is not correct, the specified error message is displayed and
+program execution is aborted.
+We write a macro for the Lua types we use most.
+
+<<macro definitions>>=
+#define lua_assert_isfunction(L, I, ERR) \
+if (!lua_isfunction((L), (I))) (lua_pop(L, lua_gettop(L)),  cmm_err((ERR)));
+
+#define lua_assert_isnumber(L, I, ERR) \
+if (!lua_isnumber((L), (I)))   (lua_pop(L, lua_gettop(L)),  cmm_err((ERR)));
+
+#define lua_assert_isstring(L, I, ERR) \
+if (!lua_isstring((L), (I)))   (lua_pop(L, lua_gettop(L)),  cmm_err((ERR)));
+
+#define lua_assert_istable(L, I, ERR) \
+if (!lua_istable((L), (I)))    (lua_pop(L, lua_gettop(L)),  cmm_err((ERR)));
+@ 

@@ -1,0 +1,487 @@
+% -*- mode: Noweb; noweb-code-mode: c-mode -*- %
+
+% ------------------------------------------------------------------ 
+\section{An Exception-Dispatching Client}
+%  ------------------------------------------------------------------ 
+
+This file implements a simple exception-dispatching client of the {\PAL} 
+runtime system and interpreter.
+
+Implemented here is a front-end runtime system as well as some sample {\PAL}
+code to be run through the interpreter.
+
+% ------------------------------------------------------------------ 
+\subsection{Using the Client}
+% ------------------------------------------------------------------ 
+
+To run a {\PAL} program in file [[foo.c--]] through this client, the
+{\PAL} code must first be passed through the front-end of the {\qcc} compiler:
+
+\begin{verbatim}
+collie% qc-- -interp -o - > foo.lua
+collie% ./exn_client foo.lua
+\end{verbatim}
+
+or possibly:
+
+\begin{verbatim}
+collie% qc-- -interp -o - | ./exn_client -
+\end{verbatim}
+
+where [[foo.c--]] is the {\PAL} source file, [[qc--]] is the {\qcc} compiler
+executable, and [[exn_client]] is the compiled version of [[exn.c]] (which
+is implemented in this file).
+
+The [[-]] switch to [[exn_client]] tells [[exn_client]] to read from [[stdin]].
+
+% ------------------------------------------------------------------ 
+\section{Implementation}
+% ------------------------------------------------------------------ 
+
+Below is an implementation of an exception-dispatching {\PAL} client.
+It should be useful for demonstration as well as testing.
+
+Its implementation is split across files [[exn.h]] and [[exn.c]].
+
+<<exn.h>>=
+#ifndef _EXN_H
+#define _EXN_H
+
+#include <qc--interp.h>
+
+<<constant definitions>>
+<<type definitions>>
+
+<<function prototypes>>
+#endif /* _EXN_H */
+@ 
+
+<<exn.c>>=
+#include "exn.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+
+<<global variable definitions>>
+
+<<exception dispatching functions>>
+<<interpreter interaction functions>>
+<<utility functions>>
+
+<<application driver>>
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Type Definitions}
+% ------------------------------------------------------------------ 
+
+To manage threads returned by the {\PAL} runtime system, we use a [[typedef]]'d structure: [[Cmm_TCB]].
+A [[Cmm_TCB]] ({\PAL} thread control block) contains the actual thread given us by the {\PAL} runtime system, pointers to the space handed off to the system for use as an activation stack, and a ``cookie'' that points to the limit of the thread's activation stack.
+We use this cookie to tell if we've gone off the end of a stack (perhaps by returning or unwinding from the oldest activation on the stack).
+
+<<type definitions>>=
+typedef unsigned char u_int8;
+typedef unsigned int  u_int32;
+
+typedef struct {
+  Cmm_Cont  cont;
+
+  void     *stack_space;
+  unsigned  stack_space_size;
+
+  void     *limit_cookie;
+} Cmm_TCB;
+@ 
+
+% ------------------------------------------------------------------ 
+\subsection{Utility Functions}
+% ------------------------------------------------------------------ 
+
+We create a few helper functions to create and destroy [[Cmm_TCB]]s.
+
+<<function prototypes>>=
+Cmm_TCB *TCB_new(void);
+void     TCB_free(Cmm_TCB *tcb);
+@ 
+
+[[TCB_new]] allocates space for the interpreter to use as activation stack space; the space is of size [[stack_space]].
+
+<<utility functions>>=
+Cmm_TCB *TCB_new(void) {
+  Cmm_TCB     *tcb = (Cmm_TCB *) malloc(sizeof(Cmm_TCB));
+  assert(tcb != NULL);
+
+  tcb->stack_space       = (Cmm_Dataptr) malloc(STACK_SIZE);
+  mem_assert(tcb->stack_space);
+  tcb->stack_space_size  = STACK_SIZE;
+
+  return tcb;
+}
+@ 
+
+[[TCB_free]] frees the space [[TCB_new]] allocated for activation stack space.
+
+<<utility functions>>=
+void TCB_free(Cmm_TCB *tcb) {
+  free(tcb->stack_space);
+  free(tcb);
+}
+@ 
+ 
+% ------------------------------------------------------------------ 
+\subsection{Interpreter Interaction}
+% ------------------------------------------------------------------ 
+
+In this client, we register a printing function with the interpreter: a simple 
+C function that takes a 32-bit [[int]], prints it, and returns it.
+
+<<function prototypes>>=
+u_int32 cmmprint32(u_int32 i);
+@ 
+
+<<interpreter interaction functions>>=
+u_int32 cmmprint32(u_int32 i) {
+  printf("[CMMPRINT] %u\n", i);
+  return i;
+}
+@ 
+To register this function, the client simply calls [[register_c_func]].
+<<register needed C functions with the interpreter>>=
+  register_c_func("cmmprint32", (void(*)(void)) cmmprint32, "u_int32:u_int32");
+@ 
+
+Additionally, we register a few needed functions from the standard C library.
+<<register needed C functions with the interpreter>>=
+  register_c_func("exit"   , (void(*)(void)) exit   , "int:void"        );
+  register_c_func("malloc" , (void(*)(void)) malloc , "unsigned:pointer");
+  register_c_func("free"   , (void(*)(void)) free   , "pointer:void"    );
+@ 
+
+% ------------------------------------------------------------------ 
+\subsection{Exception Mechanism}
+% ------------------------------------------------------------------ 
+
+It is the exception-handling mechanism that comprises the interesting portion
+of this front-end runtime system.
+The process of raising an exception in {\PAL} code goes as follows:
+
+\begin{itemize}
+\item When {\PAL} code needs to signal an exception, it pushes an exception
+tag and an exception argument (or 0 if no argument is needed) onto some global
+exception stack.  This stack's maintenance (allocation, deallocation, etc.) is
+the responsibility of the {\PAL} code; additionally, the {\PAL} code must 
+place a pointer to the top of this stack in its first global variable so C 
+function [[pop_exn_info]] can find it and modify it (to pop it from the stack).
+
+\item After pushing the exception information atop the stack, the 
+{\PAL} code makes a foreign C call to C function [[dispatch_exn]].  This call
+should not be expected to make a local return to the immediately next statement
+in the {\PAL} code.
+\end{itemize}
+
+To handle an exception, {\PAL} code ensure the following:
+
+\begin{itemize}
+\item Within the handler's procedure must be a [[continuation]] for each 
+handler.
+
+\item To a call that may somehow raise an exception, annotations must be
+attached.  The [[also aborts]] annotation must be included, and there must
+be an [[also unwinds to]] annotation specifying all of the handlers'
+continuations.
+\end{itemize}
+
+See below for information on exception tags.
+
+% ------------------------------------------------------------------ 
+\subsubsection{Exception Descriptors}
+% ------------------------------------------------------------------ 
+
+We define type [[exn_descriptor]] to describe and layout an exception 
+descriptor.
+The idea is that an [[exn_descriptor]] is associated with each {\PAL} procedure
+that includes exception handlers (using [[span]]s with token [[1]]).
+Typically, the contents of a procedure's exception descriptor are stored as
+initialized {\PAL} data associated with some descriptively-named label
+(e.g., [[EXN_proc1]] for {\PAL} procedure [[proc1]]).
+
+<<type definitions>>=
+typedef struct {
+  u_int32 handler_count;
+  struct {
+    void    *exn_tag; 
+    u_int32  cont_num; 
+    u_int8   takes_arg; 
+  } handlers[1];
+} exn_descriptor;
+@ 
+
+[[handler_count]] is the number of exception handlers in this {\PAL} procedure.
+Following the [[handler_count]] there should be a contiguous array of
+[[handlers]].
+
+Each [[handler]] includes the following information: [[exn_tag]] -- a pointer 
+to the tag of the exception this handler catches, [[cont_num]] -- the index of
+the continuation that implements the handler (where this number is a 0-based
+index into the [[also unwinds to]] annotation at the call sites being handled
+in this procedure), and a boolean value (0 or 1) indicating whether or not
+the handler takes an argument.
+Note that this last boolean value is actually stored in an 8-bit integer.
+
+An [[exn_tag]] should generally be a pointer to a string describing the
+exception (for example, the [[exn_tag]] of [[Exn_DivByZero]] might point to
+[["Division by zero"]]).  
+These strings are typically stored in initialized {\PAL} data and associated
+with descriptively-named symbols.
+
+% ------------------------------------------------------------------ 
+\subsubsection{Exception Dispatcher}
+% ------------------------------------------------------------------ 
+
+The exception dispatcher is implemented here in two functions.
+[[pop_exn_info]] pops exception info (an exception tag and an exception
+argument) off the {\PAL} code's global exception stack and stores it in
+the variables to which it is given pointers.
+[[dispatch_exn]] does the actual control-flow work and resumes {\PAL} code
+execution in the scope of the correct exception handler; if no handler is
+found, an error is sent to the user to indicate an uncaught exception and
+program execution is terminated.
+
+<<function prototypes>>=
+void pop_exn_info(void **exn_tag, void **exn_arg);
+void dispatch_exn(Cmm_Cont *k);
+@ 
+
+We define a few constants that must be similarly defined in {\PAL} code.
+We assume that the exception information stack is pointed to by the first
+global register in the {\PAL} code ([[EXN_TOP =]] index number [[0]]).
+We also assume that the [[span]]s used to associated {\PAL} procedures with
+exception handling descriptors will use a token value of [[EXN_DESC = 1]].
+
+<<constant definitions>>=
+#define EXN_TOP  0
+#define EXN_DESC 1
+@ 
+
+We simply use and modify global variable number [[EXN_TOP]] to pop the
+exception information.
+
+<<exception dispatching functions>>=
+void pop_exn_info(void **exn_tag, void **exn_arg) {
+  /* find 'exn_base' : for now, we assume it is the first global variable */
+  void ***exn_top = (void ***) Cmm_FindGlobalVar(globals_backup, EXN_TOP);
+
+  *exn_top -= 2;
+  *exn_tag  = (*exn_top)[0];
+  *exn_arg  = (*exn_top)[1];
+}
+@ 
+
+[[dispatch_exn]] pops exception information, and then locates the topmost
+activation in the current {\PAL} thread of execution that is associated with
+an [[exn_descriptor]] including a handler that catches the current exception.
+If we walk off the stack, then we are dealing with an uncaught exception; in
+this case, we print an error and abort.
+
+<<exception dispatching functions>>=
+void dispatch_exn(Cmm_Cont *k) {
+  Cmm_Activation  a;
+  void           *exn_tag, *exn_arg;
+
+  pop_exn_info(&exn_tag, &exn_arg);
+  a = Cmm_YoungestActivation(k);
+
+  for (;;) {
+    exn_descriptor *d;
+    d = (exn_descriptor *) Cmm_GetDescriptor(&a, EXN_DESC);
+
+    if (d) {
+      int i;
+      for (i = 0; i < d->handler_count; i++) {
+        if (d->handlers[i].exn_tag == exn_tag) {
+          <<resume code execution at this exception handler>>
+        }
+      }
+    }
+    if (!Cmm_ChangeActivation(&a)) {
+	  printf("uncaught exception: %s\n", (char *) exn_tag);
+      abort();  /* unhandled exception; abort! */
+    }
+  }
+}
+@ 
+
+If we do find a handler for the exception, we call on [[Cmm_GetUnwindCont]]
+to get a [[Cmm_Cont]] handle for the handler's implementing continuation.
+We then resume code execution at this continuation.
+
+\emph{Note that this currently works, but is not well-coded.  Ultimately, some code might need to be revised in [[interp.nw]] so we can instruct [[run_interp]] to resume at an arbitrary PC instead of dangerously calling [[RunThread]] again.}
+
+<<resume code execution at this exception handler>>=
+  {
+    Cmm_Cont new_k;
+    new_k = Cmm_GetUnwindCont(&a, (Cmm_Word) d->handlers[i].cont_num);
+
+    printf("-- caught and handled exception : %s\n", (char *) exn_tag);
+
+    if (d->handlers[i].takes_arg) {
+      /* exn expects value */
+      assert(0);  /* we can't handle this now!!! */
+    } else {
+      Cmm_RunThread(&new_k);
+      assert(0); /* FIX this */
+    }
+  }
+@
+
+% ------------------------------------------------------------------ 
+\subsubsection{Interfacing with {\PAL}}
+% ------------------------------------------------------------------ 
+
+To let {\PAL} code call the exception handler, we export C functions to {\PAL}
+using [[register_c_func]].
+
+<<register needed C functions with the interpreter>>=
+  register_c_func("dispatch_exn", (void(*)(void))dispatch_exn, "pointer:void");
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Application Driver}
+% ------------------------------------------------------------------ 
+
+To drive our application, we do some simple tests, print some results, and
+quit--at least for now.
+
+<<constant definitions>>=
+#define VALSTACK_SIZE   256
+#define ARGSPACE_SIZE   256
+#define STACK_SIZE      65536
+@
+
+<<global variable definitions>>=
+static char     *filename     = NULL;
+static int       src_selected = 0;
+@ 
+
+The driver opens transactions with the {\PAL} interpreter (passing it sizes 
+for the interpreter's value stack and argument-passing space), registers a 
+few C functions with the interpreter, flexes its muscles a bit, and closes 
+interaction with the interpreter.
+
+<<application driver>>=
+int main(int argc, char *argv[]) {
+  assert(sizeof(void *) * 8 == 32);
+
+  if (Cmm_open(VALSTACK_SIZE, ARGSPACE_SIZE) != 0) {
+    exit(1);
+  }
+
+  <<register needed C functions with the interpreter>>
+
+  if (argc > 1) {
+    <<process command line arguments>>
+  }
+
+  <<run {\PAL} code>>
+
+  Cmm_close();
+
+  return 0;
+}
+@ 
+
+% ------------------------------------------------------------------ 
+\subsubsection{Command Line Arguments}
+% ------------------------------------------------------------------ 
+
+This client allows the specification of source files on the command line.
+Alternatively, a [[-]] may be used as an argument to specify that source code
+will be found on [[stdin]].
+
+<<process command line arguments>>=
+{
+  int i;
+  for (i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-") == 0) {
+      if (src_selected) {
+        fprintf(stderr, "error: canot load from more than one source\n");
+        exit(1);
+      }
+      filename     = NULL;
+      src_selected = 1;
+    } else {
+      if (src_selected) {
+        fprintf(stderr, "error: cannot load more than one file\n");
+        exit(1);
+      }
+      filename     = argv[i];
+      src_selected = 1;
+    }
+  }
+}
+@ 
+
+% ------------------------------------------------------------------ 
+\subsubsection{Flexing the {\PAL} Muscles}
+% ------------------------------------------------------------------ 
+
+Here, we simply load the code specified on the command-line, [[malloc]]
+enough space to hold a backup of its global registers, and run {\PAL} procedure
+[[main]] in the code.
+Note that we pass a pointer to this global backup space to procedure [[main]]
+of the {\PAL} code, and handle de-allocation of this space from here within C.
+
+<<global variable definitions>>=
+static void     *globals_backup = NULL;
+@ 
+
+<<run {\PAL} code>>=
+if (!src_selected) {
+  fprintf(stderr, "error: nothing to do\n");
+  exit(1);
+}
+
+if (filename == NULL && load_assembly_unit(NULL, SRC_STDIN) != 0)
+  exit(1);
+else if (load_assembly_unit(filename, SRC_FILE) != 0)
+  exit(1);
+
+<<lookup and run procedure [[main]] in {\PAL} code>>
+@ 
+
+To run procedure [[main]] in the given {\PAL} code, we use interpreter
+function [[cmm_find_export]] and runtime functions [[Cmm_CreateThread]]
+and [[Cmm_RunThread]].
+
+We create a TCB (thread control block) even though we do not intend to use
+more than one {\PAL} thread.
+
+<<lookup and run procedure [[main]] in {\PAL} code>>=
+{
+  Cmm_Codeptr  loc = cmm_find_export("main");
+  Cmm_TCB     *tcb;
+
+  if (loc == NULL) {
+    fprintf(stderr, "error: cannot find procedure main\n");
+    exit(1);
+  }
+
+  /* allocate space to store globals backup */
+  globals_backup = malloc(Cmm_GlobalSize());
+  assert(globals_backup);
+
+  tcb            = TCB_new();
+  tcb->cont      = Cmm_CreateThread( loc 
+                                   , (void *) (&globals_backup)
+                                   , tcb->stack_space
+                                   , tcb->stack_space_size
+                                   , &(tcb->limit_cookie)
+                                   );
+  tcb->cont      = Cmm_RunThread(&(tcb->cont));
+
+  free(globals_backup);
+  TCB_free(tcb);
+}
+@ 

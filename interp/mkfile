@@ -1,0 +1,432 @@
+##############################################################################
+#
+# Quick C-- Interpreter
+#
+# This mkfile is used to build qc--interp, the Quick C-- Interpreter.
+#
+# IMPORTANT BUILD TARGETS ::
+#
+#   all         : builds qc--interp
+#   update      : builds qc--interp and copies binary to $BINDIR
+#   depend      : updates dependencies for proper compilation
+#   gc          : builds experimental garb. collecting interp client gc_client
+#   exn         : builds experimental exn. dispatching interp client exn_client
+#   clean       : cleans object files (*.o)
+#   clobber     : cleans all binaries, object files, and source code that can
+#                 be regenerated from .NW files
+#
+# IMPORTANT DOCUMENTATION TARGETS ::
+#
+#   doc.dvi     : builds main documentation file for entire interpreter;
+#                 includes formalization, module interfaces and implementations
+#
+#   client.dvi  : builds DVI doc. of client.nw, the included interp. client
+#   runtime.dvi : builds DVI doc. of runtime.nw, the C-- runtime system
+#
+
+NAME      = qc--interp
+LIBNAME   = lib$NAME.a
+VERSION   = `date +%Y%m%d`
+
+# ------------------------------------------------------------------
+# paths
+# ------------------------------------------------------------------
+
+TOP       = ..
+BINDIR    = $TOP/bin
+LIBDIR    = $TOP/lib
+QCC       = $TOP/bin/qc--
+MODE      = user
+# change to MODE=developer to turn on Toolkit features
+
+# LCC_INSTALLDIR : directory where lcc binary and liblcc.a are installed
+LCC_INSTALLDIR = /usr/local/lcc
+
+# LCC_SRCDIR : directory containing include/ subdirectory with lcc header files
+LCC_SRCDIR     = /home/nr/lcc/lcc-4.2
+
+# ------------------------------------------------------------------
+# main targets
+# ------------------------------------------------------------------
+
+INTERP    = evaluating
+
+all:V:      $NAME $LIBNAME libinclude gc exn prs
+all.opt:V:  all
+
+update:V:     $BINDIR/$NAME $LIBDIR/$LIBNAME libinclude gc exn prs
+update.opt:V: update
+
+install:V: all $install_bin $install_lib
+	cp $NAME    $install_bin/$NAME
+	cp $LIBNAME $install_lib/$LIBNAME
+	(cd libinclude ; mk $MKFLAGS install)
+
+install.opt:V: install
+
+libinclude:V:
+	(cd libinclude ; mk all)
+
+test:VQ:
+	(cd test; mk $MKFLAGS test)
+
+clean:V:
+	rm -f *.o *.cmm.qs $NAME DEPEND
+	rm -f *.cmm-x86-linux.c-- *.cmm-sparc-solaris.c--
+	(cd clients; mk clean)
+
+clean.opt:V: clean
+
+clobber:V:  clean
+	rm -f *.blg *.log *.dvi *.inc *.toc *.aux 
+	rm -f $NWTEXFILES
+	rm -f prof.out core *~
+	rm -f $NAME $LIBNAME
+	rm -f *.m *.i decode.fetch bytecode.sled
+	rm -f $INTERPHDRS $INTERPSRCS cmmfloat-*.c
+	rm -f underflowhandler.c-- underflowhandler.qs
+	rm -f $CLIENTHDRS $CLIENTSRCS
+	rm -f inspect.lua inspect.clua
+	rm -f mkfile.bak
+	rm -f booted-interp booted-interp.opt
+	(cd clients   ; mk clobber)
+	(cd libinclude ; mk clobber)
+
+# cleani does _not_ remove mclib.o or the CII *.o (which don't change often)
+cleani:V:
+	rm -f $INTERPOBJS client.o
+	(cd clients ; mk clean)
+
+
+# ------------------------------------------------------------------
+# rules and tools 
+# ------------------------------------------------------------------
+
+<mkfile.$MODE
+<$TOP/config/config.mk
+B=""
+<$TOP/config/c.mk
+<$TOP/config/lua.mk
+<$TOP/config/noweb.mk
+<$TOP/config/man.mk
+
+LIBS         = -lm $LUALIBS
+INCLUDES     = -I./include -I./include/cii -I. $LUAINCLUDES
+
+CFLAGS       = -g -ansi -pedantic -Wall -Wno-long-long $INCLUDES
+
+NOTANGLEOPTS = -L
+
+
+# ------------------------------------------------------------------
+# important file sets
+# ------------------------------------------------------------------
+
+NWFILES    = `echo *.nw`
+
+INTERPHDRS = activation.h \
+             assemblyunit.h \
+             ccall.h \
+             cmmfloat.h \
+             controlflow.h \
+             disasm.h \
+             encoding.h \
+	     fe_prs.h \
+             interp.h \
+             intervals.h \
+             label.h \
+             lualink.h \
+             machine.h \
+             operator.h \
+             runtime.h \
+             span.h \
+             stack.h \
+             table.h \
+             thread.h \
+             types.h \
+             uid.h \
+	     underflowhandler.h \
+             util.h \
+             value.h
+
+GENHDRS    = encode.h
+
+EXTSRCS    = arena.c \
+             assert.c \
+             atom.c \
+             except.c \
+             fmt.c \
+             mclib.c \
+             mem.c \
+             mp.c \
+             xp.c
+
+INTERPSRCS = activation.c \
+             assemblyunit.c \
+             ccall.c \
+	     cmmfloat-$config_float_impl.c \
+             controlflow.c \
+             encoding.c \
+	     fe_prs.c \
+             intervals.c \
+             label.c \
+             lualink.c \
+             operator.c \
+             runtime.c \
+             span.c \
+             stack.c \
+             table.c \
+             thread.c \
+             uid.c \
+	     underflowhandler.c \
+	     util.c \
+             value.c
+
+GENSRCS    = interp-dec.c \
+             disasm-dec.c \
+             encode.c
+
+INTERPOBJS = ${INTERPSRCS:%.c=%.o} ${GENSRCS:%.c=%.o}
+
+CORESRCS   = $EXTSRCS $INTERPSRCS $GENSRCS
+COREHDRS   = $INTERPHDRS $GENHDRS
+COREOBJS   = ${CORESRCS:%.c=%.o}
+
+CLIENTHDRS = client.h
+CLIENTSRCS = client.c
+CLIENTOBJS = ${CLIENTSRCS:%.c=%.o}
+
+HDRS       = $COREHDRS $CLIENTHDRS inspect.clua
+SRCS       = $CORESRCS $CLIENTSRCS
+
+code:V:      $SRCS $HDRS
+
+# ------------------------------------------------------------------
+# copy files to their official directories
+# ------------------------------------------------------------------
+
+$BINDIR/$NAME:  $NAME
+	cp $prereq $target
+
+$LIBDIR/$LIBNAME: $LIBNAME
+	cp $prereq $target
+
+# ------------------------------------------------------------------
+# binaries
+# ------------------------------------------------------------------
+
+interp:V: $NAME
+gc:V:     clients/gc_client
+exn:V:    clients/exn_client
+prs:V:    clients/prs_client
+
+float:V: cmmfloat-$config_float_impl.o
+
+$NAME:    $COREOBJS client.o
+	$CC $CFLAGS -o $target $COREOBJS client.o $LIBS
+
+# $LIBNAME: $COREOBJS $LIBLUA $LIBLUALIB
+$LIBNAME: $COREOBJS
+
+clients/%: libinclude $LIBDIR/$LIBNAME
+	(cd clients ; mk $stem)
+
+### alternately built binaries (for sparc, lcc, etc.)
+
+atac-interp:VQ:
+	mk interp $MKFLAGS MODE=$MODE NOTANGLEOPTS= CC='atac gcc' 
+
+## bootstrapped binary
+
+LCC      = $LCC_INSTALLDIR/lcc
+LCC_INC  = -I$LCC_SRCDIR/include/x86/linux $INCLUDES
+LCC_LIBS = -L$LCC_INSTALLDIR -llcc
+#### need to capture LCC_ARGS based on config
+LCC_COMMON_ARGS = -target=c-- -Wf-c--segLIT=data ${LCC_INC:%=-Wp%}
+
+%.cmm-sparc-solaris.c--:D: %.c
+  $LCC -S $LCC_COMMON_ARGS -Wf-c--=sparc/solaris -o $target $prereq
+
+%.cmm-x86-linux.c--:D: %.c
+  $LCC -S $LCC_COMMON_ARGS -Wf-c--=x86/linux -o $target $prereq
+
+
+BOOTED_CORESRCS   = ${CORESRCS:%.c=%.cmm-$config_arch.c--}
+BOOTED_CLIENTSRCS = ${CLIENTSRCS:%.c=%.cmm-$config_arch.c--}
+BOOTED_COREOBJS   = ${BOOTED_CORESRCS:%.c--=%.o}
+BOOTEDBC_COREOBJS = ${BOOTED_CORESRCS:%.c--=%.qs}
+
+booted-cmm:V: $BOOTED_CORESRCS $BOOTED_CLIENTSRCS
+
+'^'cmmfloat-(iec60559|solaris|none)'\.c$':RD: cmmfloat.nw
+	notangle -L -R$target $prereq > $target
+
+%.cmm-$config_arch.o:D: %.cmm-$config_arch.c--
+  $QCC -c -o $target $prereq
+
+%.cmm-$config_arch.qs:D: %.cmm-$config_arch.c--
+  $QCC -interp -stop .qs -o $target $prereq
+
+boot:V: booted-interp.opt
+
+booted-interp.opt:D: $QCC $BOOTED_COREOBJS $BOOTED_CLIENTSRCS
+  $QCC -globals -o $target $BOOTED_COREOBJS $BOOTED_CLIENTSRCS $LCC_LIBS $LIBS 
+
+# cannot actually run booted-interp because of missing imports from libraries;
+# if actually interested in this, someone could write a version of client.c
+# that registers with the interpreter all functions imported from the libraries
+# in $LCC_LIBS and $LIBS
+#
+booted-interp:D: $QCC $BOOTEDBC_COREOBJS $BOOTED_CLIENTSRCS
+  $QCC -interp -globals -o $target $BOOTEDBC_COREOBJS $BOOTED_CLIENTSRCS
+
+# ------------------------------------------------------------------
+# dependency recalculation
+# ------------------------------------------------------------------
+
+DEPEND    = -MM
+depend:V: DEPEND
+  (cd libinclude; mk depend)
+  (cd clients; mk depend)
+
+DEPEND:D:  DEPEND.raw
+	sed 's@gc\.o:@clients/gc.o:@;s@exn\.o:@clients/exn.o:@' $prereq > $target
+DEPEND.raw:D:  $SRCS $HDRS
+	$CC $DEPEND $INCLUDES $SRCS > $target
+
+
+# ------------------------------------------------------------------
+# documentation-related files
+# ------------------------------------------------------------------
+
+NWTEXFILES = ${NWFILES:%.nw=%.tex}
+NWINCFILES = ${NWFILES:%.nw=%.inc}
+
+# INTERFACES should be in a sensible order so the print-out makes sense
+INTERFACES = cmmfloat.nw \
+	     util.nw \
+             types.nw \
+             value.nw \
+             stack.nw \
+             lualink.nw \
+             table.nw \
+             intervals.nw \
+             uid.nw \
+             activation.nw \
+             controlflow.nw \
+             label.nw \
+             thread.nw \
+             assemblyunit.nw \
+             encoding.nw \
+             operator.nw \
+             ccall.nw \
+             span.nw \
+             disasm.nw \
+             inspect.nw \
+             runtime.nw \
+	     fe_prs.nw \
+
+interfaces:V: interfaces.dvi
+
+interfaces.tex: interfaces.nw
+	$NOWEAVE -delay -autodefs c -index $prereq > $target
+
+interfaces.dvi: ${INTERFACES:%.nw=%.inc}
+
+doc.tex: doc.nw
+	$NOWEAVE -delay -autodefs c -index $prereq > $target
+
+doc.dvi:  $NWINCFILES
+
+### some old documentation files
+
+design.tex: design.inc
+	echo "\input{design.inc}" > $target
+
+state.tex: state.inc
+	echo "\input{state.inc}" > $target
+
+# ------------------------------------------------------------------ 
+# source code targets
+# ------------------------------------------------------------------ 
+
+bytecode.sled:D: interp.nw
+	$NOTANGLE $NOTANGLEOPTS -R$target $prereq | $CPIF $target
+
+decode.fetch:D:  interp.nw
+	$NOTANGLE $NOTANGLEOPTS -R$target $prereq | $CPIF $target
+
+machine.h:D:     interp.nw
+	$NOTANGLE $NOTANGLEOPTS -R$target.${MACHINE-x86} $prereq | $CPIF $target
+
+'(([^/]*/)*)(.*)\.h$':RD:       '\1\3.nw'
+	$NOTANGLE $NOTANGLEOPTS -R$stem3.h $prereq | $CPIF $target
+
+#'(([^/]*/)*)(.*)\.c$':RD:       '\1\3.nw'
+#	$NOTANGLE $NOTANGLEOPTS -R$stem3.c $prereq | $CPIF $target
+
+%.m:D: %.nw
+	$NOTANGLE -R$target $prereq | $CPIF $target
+
+inspect.lua:D:  inspect.nw
+	$NOTANGLE -R$target $prereq > $target
+
+inspect.clua:D: inspect.lua
+        sed -e 's/\\/\\\\/g' \
+          -e 's/"/\\"/g'   \
+          -e 's/^/"/'      \
+          -e 's/$/\\n"/'   $prereq > $target
+
+#	sed -e 's/\\/\\\\/g' \
+#	  -e 's/"/\\"/g'   \
+#	  -e 'i \'         \
+#	  -e '\"\\'        \
+#	  -e 's/$/\\n"/'   $prereq > $target
+
+# ------------------------------------------------------------------ 
+# intermediate code targets
+# ------------------------------------------------------------------ 
+#
+# for development and debugging only
+
+'(([^/]*/)*)(.*)\.i$':RD:       '\1\3.c' $HDRS
+	$CC -P -E $INCLUDES $stem3.c > $target
+
+# ------------------------------------------------------------------ 
+# operator generator targets (experimental, and not currently used)
+# ------------------------------------------------------------------ 
+
+opgen:	opgen.icn
+	icont -o $target $prereq
+
+%.icn:D: %.nw
+	$NOTANGLE -L'#line %-1L "%F"%N' -R$target $prereq > $target
+
+optest:V: opgen
+	echo "v1:f32 v2:f32 feq32 -- v1 == v2 : bool" | ./opgen
+
+%-ops.c:D: %.ops opgen
+	./opgen $stem.ops > $target
+
+# ------------------------------------------------------------------ 
+# underflow handler
+# ------------------------------------------------------------------ 
+
+underflowhandler.c--:D: underflowhandler.nw
+	notangle -L -R$target $prereq > $target
+
+underflowhandler.qs: underflowhandler.c--
+	$QCC -interp -S underflowhandler.c--
+
+underflowhandler.c: underflowhandler.qs
+	echo -n "char* Cmm_underflow_handler=\"" > underflowhandler.c; sed -e 's/$/\\n\\/' -e 's/"/\\"/g' underflowhandler.qs >> underflowhandler.c; echo '";' >> underflowhandler.c
+
+#
+# -- end of mkfile --
+#
+
+#
+# [dependencies]
+
+<DEPEND
+<$TOP/config/install.mk

@@ -1,0 +1,559 @@
+
+% vim: ts=8 sw=4 et:
+
+\documentclass[11pt]{article}
+\usepackage{path}
+
+\author{Christian Lindig\\ Norman Ramsey}
+\title{Roadmap to a Working Quick C-{}- Compiler}
+\date{Early June, 2002}
+
+\newcommand\status[2]{\marginpar{\raggedright\small\textbf{#1: #2}\par}\ignorespaces}
+
+\newcommand\sjul{\status{July~'02}}
+
+\newcommand\PAL{{\small C-{}-}}
+\newcommand\AST{{\small AST}}
+\newcommand\CFG{{\small CFG}}
+\newcommand\qcc{{\small QC-{}-}}
+\newcommand\rtl{{\small RTL}}
+\newcommand\burg{{\small BURG}}
+\newcommand\cfg{{\small CFG}}
+\newcommand\ocaml{{\small OCAML}}
+
+\newdimen\whoskip
+\whoskip=2.5em
+\newcommand\who[1]{{\unskip\nobreak\hfil\penalty50
+    \hskip\whoskip\hbox{}\nobreak\hfil\textsl{#1}\parfillskip=0pt
+    \finalhyphendemerits=0 \par}}
+
+\parindent0pt
+\parskip1.5ex
+
+\renewcommand\b[1]{\leavevmode\llap{\rlap{[$\mathbf{#1}$]}\hskip 6em}}
+
+% ------------------------------------------------------------------ 
+\begin{document}
+% ------------------------------------------------------------------ 
+
+\maketitle
+
+The purpose of this document is to explain what needs to be done by
+whom to lead to a working Quick~{\PAL} compiler.
+This document emphasize pieces that are missing, broken, or
+incomplete.
+Pieces that need refactoring are covered in the 
+\textit{Roadmap to a Better Quick C-{}- Compiler}.
+
+
+\begin{enumerate}
+\item\b{A}
+The control-flow graph should be refactored, as  outlined in \textit{Roadmap to
+a Better Quick C-{}- Compiler}.
+This is a major item to be covered by the ``control-flow graph working
+group.'' 
+In addition to the problems listed in that other document, the working
+group should also address the following problems.
+\sjul{Well under way}
+\begin{enumerate} 
+\item
+At least one operation in the current implementation of the {\cfg}
+requires the introduction of a new label together with a new symbol for
+that label. Symbols are issued by an assembler, but this context is
+missing. As a hack, a symbol is created locally. However, this is wrong
+because it does not reflect the rules of the actual assembler. I would
+like to see a design where new branches can be introduced without
+worries about target specific symbols. This plays into the observation,
+that {\PAL} has really two classes of labels: local labels introduced by
+the translation of statements like \path|if|, and global labels that are
+define in a {\PAL} source file. At least local branches should not
+depend on symbols.
+\item
+When the control-flow graph changes, what clients should be re-done
+first?
+Picking the right clients means we get good early feedback on the
+redesign.
+Possible clients might include \texttt{ast2ir}, a register allocator,
+and a code expander (especially for short-circuit Booleans).
+\end{enumerate}
+\who{Christian, Glenn, John, Kevin, and Norman.}
+\item\b{B+}
+\sjul{Largely done}
+\emph{Identify suitable technology for writing machine-dependent
+components}.  
+ Generating everything from a machine is a research
+problem, and the solutions are not ready for use in the compiler.
+We must identify techniques that will produce solid code, which
+we expect to be primarily hand-written code.
+\who{Norman.}
+\item\b{B+}
+\sjul{Largely done}
+Build a \emph{back end for a new target}, developing detailed porting
+instructions on the way.
+This process will include solutions to the following problems:
+\begin{enumerate}
+\item 
+A target description provides {\rtl}s for instructions that change the
+control flow, like \path|jump|, \path|branch|, or \path|return|.  These
+{\rtl}s have the strange property that they are target specific on one
+hand, but are not representable as a single machine instruction on the
+other. The reason is, that they include complex expressions. The
+invariant of these {\rtl}s should be clearly defined.
+
+\emph{The solution is likely to involve reading the PC from a
+conventional location, writing a PC to a conventional location, and
+possibly a private invariant shared with the code expander. ---NR}
+\item
+\sjul{Req'd by expander}
+How does the optimizer know if it is safe to negate the condition on a
+conditional branch without violating the machine invariant?
+And if it not safe, what can the optimizer do?
+\item
+\sjul{Open}
+Figure out how to \emph{reserve a stack slot in the code expander}.
+The {\small SPARC} cannot move a value from an integer register to a
+floating-point register. 
+The code expander, which must implement such a move, needs a memory
+cell as temporary storage. 
+What is the address of this cell?
+In principle, we need only one such cell per program.  (Or one per
+thread, if scheduling is pre-emptive.)
+We might wish to allocate one per activation, in the stack slot of
+the current frame, because getting to a cell on the stack is faster
+and doesn't cost a register.
+\item
+\sjul{Done}
+\emph{Stack-frame layout} should be part of the target specification.
+Currently the overall stack layout is hardcoded into the \path|freeze|
+function in the \path|Ast3IR| module. 
+\end{enumerate}
+  \who{Norman.}
+\item\b{B}
+\sjul{Open}
+Write \emph{variable placers} by hand.  \who{Kevin.}
+\item\b{B}
+\sjul{Open (preliminary in x86)}
+Develop either hand-written or machine-generated
+\emph{operator context charts} to guide selection of temporaries.
+For use both in variable placement and in code expansion.
+\who{Kevin.}
+\item\b{D}
+\sjul{Open}
+{\rtl} operators describe compile-time, link-time, and run-time
+operations. The list of \emph{operators available at compile time} is extremely
+limited.
+Someone should analyze the situation and work on the following items.
+\begin{itemize}
+\item
+We need precise documentation (perhaps even formal, via Lua?) of what
+ operators are supported at compile time.
+N.B. an ``operator'' means a fully instantiated operator at a
+ particular type, not a polymorphic promise that can be redeemed at
+ any type.
+\item
+We need actual implementations of the compile-time operators.
+\item
+ Some current implementations are dummies that return constant
+results; these implementations must be removed.
+\end{itemize}
+\who{Kevin.}
+\item\b{A}
+\sjul{Open}
+Identify the \emph{critical compile-time operators} and make sure they
+are implemented correctly.
+These might include add and subtract, bit insert, bit extract, and
+shifts.
+\who{Christian.}
+\item\b C
+\sjul{Incomplete?}
+Partial \emph{map of variables and callee-saves registers to locations} at
+each call site.
+\who{John or Kevin.}
+\item\b C 
+\sjul{Partial}
+Implement \texttt{span}, with support for lookup at each call site.
+\who{John or Kevin.}
+\item \b B
+\sjul{Partial}
+Specify and implement \emph{calling conventions.}
+Christian is quite interested in this problem.
+\who{John or Christian.}
+\item \b A
+\sjul{No longer relevant?}
+Develop and successfully compile a small \emph{test suite} for SPARC,
+including some C~programs.
+Because of limitations of the compiler, it is likely that any
+C~programs we can successfully compile and run will be carefully
+crafted for this purpose.
+It is OK if these programs don't do anything useful.
+\who{Christian.}
+\item \b{B+}
+\sjul{Incomplete}
+Implement \emph{small arithmetic}. 
+The compiler currently lacks a comprehensive plan how to deal with values of
+smaller than the size of a register. 
+\who{Kevin and Norman.}
+\item \b A
+\sjul{Open}
+Support a \emph{complete set of RTL operators}, probably with new
+representation.
+Minimum here is to make sure that we have all 60+ operators and that
+everything typechecks. 
+A new representation could be a bonus.
+\who{Kevin.}
+\item\b{A-}
+\sjul{Done}
+Identify, allocate, and initialize escaping \emph{continuations}.
+This entails repairing the following problems:
+\begin{enumerate} 
+\item
+Document the representation of a continuation, including space set
+aside for incoming overflow parameters.
+Some internal abstraction for a
+continuation's run-time representation, similar to \path|Automaton.loc|
+might be appropriate.
+\item
+Identify which continuations escape.
+\item
+The translation of continuations in \path|Ast3ir| is bogus. A
+continuation \emph{value} is a pointer into the stack where two values
+are stored: a pointer to the code of the continuation, and a stack
+pointer. The current representation of a continuation value is a
+link-time constant, which is wrong. A continuation \emph{value} is a
+late compile-time expression: a sum of the stack pointer value and some
+late compile-time constant. The stack pointer in turn, depends on the
+currently active calling convention. \emph{I have introduced a new
+abstraction \path|Contn| that addresses some of the problems. However,
+most things are not yet integrated and the translation of expressions
+with included continuation values is still wrong. -- CL}
+\end{enumerate}
+Here are some notes on this problem:
+\begin{itemize}
+\item
+The target must hide the representation of a continuation.
+\item
+The target will provide these values:
+\begin{itemize}
+\item
+A block for continuations
+\item
+Function from parameter list to block (or size/alignment) for a
+particular continuation
+\item
+Function from stack location, code label to RTLs that initialize a
+continuation
+\item
+An implementation of \texttt{cut to}.
+\end{itemize}
+The front end will
+\begin{enumerate}
+\item
+Find which continuations escape
+\item
+Allocate space for each one, managing the name of a continuation
+exactly as we manage a label in \texttt{stackdata}
+\item
+Emit initialization code obtained from the target
+\end{enumerate}
+\end{itemize}
+\who{Christian.}
+\item\b{B+}
+\sjul{Done}
+Implement \texttt{cut to} correctly.
+The implementation of \path|cut to| currently expects to put overflow
+parameters into the  \emph{incoming} area for the procedure containing
+the continuation.
+This is a bad plan; it is better for each continuation to have its own
+overflow area reserved on the stack.
+We believe this strategy will perform acceptably well because we
+expect most continuations to take at most one or two parameters, which
+can easily be passed in registers. 
+(Consider that any callee-saves registers is fair game for a
+continuation parameter.)
+\who{Christian.}
+\item \b{B}
+\sjul{In progress}
+Solve the following problem, which NR does not understand: \emph{The
+control-flow graph 
+lacks proper edges to indicate the data flow in the presence of
+continuations.}
+The first step is to identify exactly what the problem is, which
+Christian will do.
+\who{Christian.}
+\item \b C
+\sjul{Unknown}
+Add a target-specific map for hardware registers, and ensure that the
+front end rejects named hardware registers that do not appear in the
+map.
+Might require changes in structure of front end to make it aware of
+target, or the front end might accumulate a set of such registers and
+have the checking done as an intermediate step.
+N.B.~Christian recommends that exposing the target to the front end
+will solve this and some other problems.
+\who{Christian.}
+\item \b C
+\sjul{Unknown}
+Ensure that the front end rejects a named calling convention that is
+not known to the back end.
+\who{Christian.}
+\item \b A
+\sjul{Open}
+Targets provide code that spills and reloads registers. This code must
+respect the machine invariant, but currently does not. Machine specific
+spilling and reloading code must be defined. 
+\who{John or Norman.}
+
+(This code might be tied to
+the question how small values of 8 or 16 bit widths are handled. Are
+these values ever spilled?)
+\item \b {B-}
+\sjul{Done}
+Support \texttt{also cuts to k} on \texttt{cut to}. 
+Here's an example use:
+\begin{verbatim}
+import put_ready, get_ready;
+yield () {
+  bits32 r;
+  put_ready(k);
+  r = get_ready();
+  cut to r() also cuts to k;
+  continuation k:
+  return;
+}
+\end{verbatim}
+\who{Christian}
+\item \b{B-}
+\sjul{Unknown}
+The \emph{semantics of the assembler interface} needs to be defined
+clearly. The problem stems for an anticipated use for both textual
+assemblers and binary emitters. Especially the role of symbols is not
+clear and should be explained with respect to the better known textual
+assemblers. 
+The first step is to \emph{review the assembly interface}, which
+should happen after the redesign of the flow graph.
+\who{Norman.}
+\item
+\sjul{Open}
+In the assembler interface, there is a problem with the functions used
+to emit initialized data---some ambiguity about how they are supposed
+to be used.
+Christian will identify the problem more precisely so it can be fixed.
+\who{Christian and Norman.}
+\item\b C
+\sjul{Open}
+The semantics of \texttt{fcmp} should be specified precisely.
+In particular, it is not known how the results map to two-bit values.
+If the answer is target-specific, then the \texttt{Target} module should be
+adapted accordingly.
+This item has relatively low priority because the new floating-point
+comparisons are more convenient than \texttt{fcmp}.
+\who{?????}
+\item \b{B+}
+\sjul{Open}
+Alter the \texttt{lcc} back end to use the new floating-point
+comparisons.
+\who{????}
+\item
+\sjul{In progress}
+The function \path|proc| that controls the translation of a procedure
+in module \path|Ast3ir| must be broken up and cleaned up. 
+The proper time to do this is \emph{after} the flow-graph revision.
+\who{Christian}
+\item\b{A-}
+\sjul{Unknown}
+The treatment of the \texttt{*} operator in {\PAL} source code must be
+corrected.
+For purposes of type checking, 
+this operator can be treated as a single polymorphic operator of that takes
+two operands of width~$n$ and returns a result also of width~$n$.
+For purposes of translation, however, the front end must generate a
+composition of operators: first apply \path|mulu| to produce a result
+of size~$2n$, then apply \path|lobits|$n$ to the result.\footnote
+{We need to check the manual to see whether \texttt{*}~abbreviates a
+signed or an unsigned multiply.}
+
+For some reason, it appears to be difficult to handle this problem in
+the front end.  
+In that case, it will be reasonable to invent a new RTL operator, a
+truncating multiply, perhaps to be called \texttt{mulu\_trunc}.
+\who{Christian.}
+\item \b A
+\sjul{In progress}
+The algorithm that linearizes the control-flow graph does not work
+properly. It fails to detect the difference between nodes that fall into
+a label and those that jump to a label. A probable fix to the problem is
+always to jump to a label and never to fall into it. When the design of
+the {\cfg} is reconsidered, this problem should be addressed, too.
+\textit{I have worked around the problem by never falling into a label,
+but using an explicit \path|goto|. This revealed some more problems with
+the {\cfg} design: it is neccessary to create new nodes inside the
+{\cfg} and thus no target-specific knowledge should be needed. I had to
+give up the polymorphism of the {\cfg} which wasn't working anyway. --CL
+(Tue May  7 16:44:58 EDT 2002)}.
+\item \b C
+\sjul{Open}
+We need support for IEEE 754 floating-point literals.
+Mapping a literal to a bit vector is quite complicated and involved
+(see papers from PLDI'96), but there should be reliable C~code on the
+net to solve this problem, so that all we have to do is integrate it
+into the compiler.
+David Gay or Will Clinger may know where to find such code.
+\who{Christian.}
+\item \b C
+\sjul{Open}
+We need a policy decision about whether to support floating-point
+operations at compile time.
+Someone will have to investigate to see if there is suitable ``soft
+floating-point'' code available.
+
+In the process, we should remove the suspect code from  \path|rtl/unit64p.c|.
+This code provides casting of 64 bit floating point
+values to 64 bit integer values, but it is platform
+sensitive and maybe the wrong way.
+\who{Christian.}
+\item \b D
+\sjul{Open}
+Implement support for string literals (low priority).
+In order to support Unicode, we might need changes to the {\PAL}
+language definition.
+\item \b D
+\sjul{Open}
+Identify a principled way to reject programs that a particular back
+end cannot successfully compile.
+Reasons for rejection might include use of {\PAL} variables or
+operators at unsupported widths.
+
+This problem is more important than a priority of \textbf{D} may
+suggest, but it is a far-future item.
+We will have a much better idea how to handle this problem after we
+have built a few back ends.
+\item\b{B-}
+\sjul{Open}
+Ensure that \emph{global-variable declarations are consistent} across
+modules. 
+When multiple compilation units share their global variables one of them
+must define them, while the other import them on an assembler level. No
+mechanism exists to mark the ``main'' compilation unit that defines all
+global variables.
+
+N.B.~There is already code to compute a suitable MD5 signature.
+Primarily what needs to be done is arrange suitable import/export and
+implement a command-line option that designates the ``main''
+compilation unit.
+\item\b D
+\sjul{Open}
+Implement \texttt{switch}.
+\item\b C
+\sjul{Unknown}
+Export substitution of late compile-time constants and constant folding
+as finalizing step of a procedure translation to Lua. Currently these
+steps are hard-coded into the \path|freeze| function in module
+\path|Ast3IR|.
+\end{enumerate}
+
+
+
+
+
+
+Expression evaluation needs to be unified. The correct way is to
+\sjul{Open}
+translate an expression into an {\rtl} expressions and then to evaluate
+it. Currently the constant evaluation phase of the \path|Elab| module
+evaluates constant expressions directly. See also the reasons for this
+in module \path|Elab.Const.Eval|:
+\begin{quote}\it
+    Several reasons: We would need a translation from {\AST} to
+    \path|Rtl.env|. The existing one in \path|ast3ir| is written against
+    the \path|Fenv.Clean| interface, but we need one written against the
+    \path|Fenv.Dirty| interface. The translation of an application needs
+    the widths of its arguments. Therefore type-checking using
+    \path|Expcheck| would be done twice: once before translation and then
+    again during translation. Detailed error messages are simpler to
+    generate with the existing approach. 
+\end{quote}
+
+
+
+
+\paragraph{Old problems that have been solved}
+After an {\rtl} has left the register allocator, it may still contain
+late compile-time constants. After these are substituted by bit vectors,
+the {\rtl} must undergo a constant folding process to make sure it
+respects the machine invariant. Such a constant folding routine
+currently does not exist.  Since the front end also needs to evaluate
+compile-time and link-time {\rtl} expression, one general {\rtl}
+evaluation mechanism would be appropriate. The current module
+\path|rtleval| can only handle compile-time and link-time {\rtl}s. 
+\textit{I hope this problem is solved in \path|Rtleval2|. --CL}
+
+
+
+\paragraph{Items whose status is unclear}
+It is not clear whether this is a problem that needs immediate
+attention or a suggestion for refactoring.
+\begin{itemize} 
+\item Relocatable addresses have undergone several changes in their
+representation.  There are still two slightly different representations
+used in the compiler that wait to be unified: \path|Reloc| and one in
+\path|Sledlib|.  
+\end{itemize}
+
+
+\paragraph{Obsolete items}
+\nobreak
+\begin{itemize}
+\item Integration of machine generated code. Basically it does not work
+because machine generated code is not flexible enough to handle
+temporaries and late compile-time constants. Adjusting the machine
+generated code manually is time-consuming and error prone. Machine
+generated code provides {\rtl} constructors for machine instructions, a
+recognizer for machine instructions in {\rtl} form, and an emitter of
+assembly code.
+\emph{This item will be delayed until after we have a working
+compiler.}
+\end{itemize}
+
+
+
+\paragraph{Suggestions for refactoring}
+
+The main overall problem is complexity. The development of the compiler
+will benefit from trying to cut down the number of modules,
+abstractions, and moving parts in general. 
+\begin{itemize}
+\item
+There is some confusion in the way {\PAL} primitive operators are
+translated to {\rtl} operators. {\PAL} operators are monomorphic in
+their result type, whereas {\rtl} operators are not. A polymorphic
+{\rtl} operator takes an additional argument compared to its monomorphic
+{\PAL} counter part. This argument should be supplied first to take
+advantage of currying: the a polymorphic {\rtl} operator supplied with
+its first argument implements the monomorphic {\PAL} operator. Currently
+the additional argument is the last argument. \textit{I hope this
+problem is solved in \path|Rtlop|. The above explanation of operator
+specialization is not entirely correct. The specializing parameter is
+not a formal argument of a primitive, but part of its \emph{width list}.
+--CL}
+\item
+The semantics of assembler symbols have leaked into the front end, the
+fat environment, and the {\cfg}. Symbols are handed out by an assembler
+which means, a reference to the current assembler must be available to
+create new symbols. Because the {\cfg} does not include such a
+reference, it is difficult to create \path|goto| nodes (during {\cfg}
+manipulation) outside the \path|Ast3IR| module.  This is related both to
+the point above, and the unclear semantics of the assembler interface,
+and symbols in particular.  I would like to avoid dealing with target
+specific symbols as much as possible and would like to delegate their
+creation into the last phases of compilation. Upon further reflection I
+now believe that the \emph{construction} of a {\cfg} should not require
+any machine-specific knowledge to allow for the easy implementation of
+{\cfg} transformations.
+\end{itemize}
+
+
+
+% ------------------------------------------------------------------ 
+\end{document}
+% ------------------------------------------------------------------ 
+

@@ -1,0 +1,184 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+% ------------------------------------------------------------------ 
+\section{Abstract Assembler Interface}
+% ------------------------------------------------------------------ 
+
+The code generators use this interface to access text-based and binary
+assemblers. Assembler aspects like symbols and relocatable addresses
+(from module \module{symbol}) escape the assembler and become part of
+symbol tables and expressions.  To avoid that all aspects of the
+compiler must be functorized over the different assemblers we have
+chosen to use a very polymorphic interface that uses Objective Caml's
+object system.
+<<asm.mli>>=
+<<exported type definitions>>
+
+val map : ('a -> 'b) -> 'b assembler -> 'a assembler
+val reloc_string : (Bits.bits -> string) -> Reloc.t -> string
+     (* make string form of relocatable address using mangled text of symbols *)
+<<exported type definitions>>=
+class type ['proc] assembler = object
+    <<assembler methods>>
+end
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Assembler Methods}
+% ------------------------------------------------------------------ 
+
+The assembler interface has an imperative flavor: a client emits a
+program by invoking a sequence of methods that mutate an [[assembler]]
+object. Most methods result in some side effects, like emitting code to
+a file, that cannot be observed directly.
+
+We want an assembler to be our single access point to the back end.
+Therefore the assembler contains some methods that are not strictly
+related to an assembler per se. We group these functions under [[etc]]
+below.
+<<assembler methods>>=
+(* declarations *)
+method import : string -> Symbol.t        (* any name is legal *)
+method export : string -> Symbol.t        (* any name is legal *)
+method local  : string -> Symbol.t        (* any name is legal *)
+
+(* definitions *)
+method label  : Symbol.t -> unit  (*bind symbol to current location counter*)
+method const  : Symbol.t -> Bits.bits -> unit (*bind symbol to constant*)
+
+(* section, location counter *)
+method section : string -> unit
+method current : string                 (* req: section called *)
+
+method org     : int -> unit            (* set location counter       *)
+method align   : int -> unit            (* align location counter     *)
+method addloc  : int -> unit            (* increment location counter *)
+
+(* size (bytes) of long jump instruction *)
+method longjmp_size : unit -> int
+
+(* emit instructions - add more methods for different instr types *)
+method cfg_instr   : 'proc -> unit
+
+(* emit data *)
+method value  : Bits.bits -> unit
+method addr   : Reloc.t -> unit  
+method zeroes : int -> unit             (* n bytes of zeroes *)
+
+(* announce number of global variables -- used only in interpreter *)
+method globals : int -> unit            (* allocate space for n globals (not bytes) *)
+
+(* comment *)
+method comment: string -> unit 
+
+(* emit *)
+method emit: unit                       (* finalize *)
+    (* should probably be called progend *)
+@
+
+The most important abstraction is the symbol: a symbol \emph{must be
+declared before it can be used}. Later a value is bound to the value.
+The assembler must accept any name to declare a symbol for and hide the
+idiosyncrasies of a possibly underlying real assembler.
+
+Symbols are most commonly used for labels.  The scope of a symbol
+depends on its definition:
+
+\begin{enumerate}
+\item [[local]]:  the value of the symbol is defined exactly once
+      inside the compilation unit (program) at hand and not visible
+      outside of it.
+
+\item [[import]]: the value of the symbol is defined once in another
+      compilation unit but made visible in the compilation unit at hand
+      by an import declaration. No symbol exported from the module at
+      hand can be imported.
+
+\item [[export]]: a [[local]] symbol is additionally exported such that
+      other compilation units can import it. No imported symbol can be
+      exported.
+\end{enumerate}      
+
+An assembler maintains named \emph{sections} and for each section a
+\emph{location counter}.  The [[section]] method announces the start
+of a new section, the [[current]] method returns the currently active
+section. It is an unchecked run-time error to call [[current]] before
+[[section]].  
+
+The [[label]] method binds the current value of the location counter to
+a symbol. In a textual assembler this typically done by emitting a
+label. The [[const]] method binds a symbol to an explicitly given value.
+
+The location counter of the current section can be manipulated: [[align
+n]] aligns to the next multiple of [[n]], [[addloc n]] increments it,
+and [[org n]] sets it to [[n]]. In all cases [[n]] must be positive.
+
+The main task of an assembler is to emit data and instructions. 
+To emit data into the current section, use [[value]] to emit an
+arbitrary value, [[addr]] to 
+emit a relocatable address, or [[zeroes]] to emit a string of zeroes.
+While [[value]] could be subsumed by [[addr]] and is therefore not
+strictly necessary, it is a convenient special case.
+Clients should use it when possible and should expect to realize a
+small gain in efficiency.
+
+The method [[cfg_instr]] emits all the instructions and labels for a
+procedure; the bytes go into the current section.
+
+
+Comments are emitted using [[comment]]. It is an unchecked run-time
+error if the string argument contains a newline. 
+
+After all instructions and data has been passed to an [[assembler]]
+object the [[emit]] method must be called. It finishes any remaining
+business. It is an unchecked run-time error to invoke any [[assembler]]
+method subsequently.
+@
+<<asm.ml>>=
+<<exported type definitions>>
+
+class ['proc] mapped_asm f (asm : 'a assembler) : ['proc] assembler =
+object
+    (* declarations *)
+    method import s = asm#import s
+    method export s = asm#export s
+    method local  s = asm#local s
+
+    (* sections *)
+    method section s = asm#section s
+    method current   = asm#current 
+
+    (* definitions *)
+    method label s   = asm#label s
+    method const s b = asm#const s b
+
+    (* locations *)
+
+    method org n    = asm#org n
+    method align n  = asm#align n
+    method addloc n = asm#addloc n
+
+    (* instructions *)
+    method longjmp_size () = asm#longjmp_size ()
+    method cfg_instr proc = asm#cfg_instr (f proc)
+
+    method globals n = asm#globals n
+    method zeroes n = asm#zeroes n
+    method value v = asm#value v
+    method addr  a = asm#addr a
+    method comment s = asm#comment s
+    method emit = asm#emit
+end
+let map f asm = new mapped_asm f asm
+@ 
+<<asm.ml>>=
+let reloc_string const =
+  let sym (s, _) = s#mangled_text in
+  let infix op a b = String.concat "" [a; " "; op; " "; b] in
+  Reloc.fold ~const ~sym ~add:(infix "+") ~sub:(infix "-")

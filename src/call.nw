@@ -1,0 +1,546 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 sw=4 et sts=4
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+%%Grades: C Peripheral Soon
+
+\emph{On the Alpha, caller and callee do not seem to agree where the
+stack pointer points after a return. Can this inconsistency be avoided?}
+
+\section{Calling conventions}
+
+\subsection{Discussion}
+
+Here's what needs to be done at various sorts of places in the code.
+\begin{itemize}
+\item
+\emph{Outgoing parameters at a call site}
+\begin{enumerate}
+\item
+Run convention feeding widths/kinds/alignments and get locations plus block.
+(Stack layout must fit block into frame in the right place.)
+\item
+Provide binding of where stack pointer must be just before the call
+instruction. 
+\item
+Emit conditional assignment to the stack pointer.
+The move is required if it will enlarge the stack, and to compute the
+condition we must know the direction of stack growth.
+For example, if the stack is to point at~$L$ and the stack is growing
+down, we emit the conditional assignment 
+$\sp>L \rightarrow \sp \gets L$. 
+Although the condition mentions the contents of a run-time location
+($\sp$), it should be possible to evaluate the condition once late
+compile-time constants are known.
+It may
+help the simplifier to write the condition as as $\sp-L>0$. 
+\item
+Emit shuffle for putting actuals into locations.
+\item
+Take locations defined by shuffle and retain them so we can create a
+dataflow node asserting that these locations are used by the call.
+(Will go on the call's \emph{outgoing} edges for reasons I've
+forgotten.) 
+\item
+Unconditionally set the stack pointer to where it must be.
+In the example above, this means $\sp \gets L$.
+\end{enumerate}
+\item
+\emph{Normal return from a call site.}
+\begin{enumerate}
+\item
+Run convention feeding widths/kinds/alignments and get locations plus block.
+(Stack layout must fit block into frame in the right place.)
+\item
+Provide binding of where stack pointer will be left just after return.
+\item
+Emit conditional assignment to the stack pointer.
+\item
+Emit shuffle for putting result locations into LHS variables.
+\item
+Take locations read during the shuffle and retain them so we can
+assert (on the edge out of the call) that these locations are defined
+by the call.
+\item
+Emit assertion node asserting location of stack pointer where left by
+callee. 
+\end{enumerate}
+\item
+\emph{Alternate return to a continuation}.
+Each continuation will have one entry point for each calling
+convention for which it is used as an alternate return continuation.
+On this entry point:
+\begin{enumerate}
+\item
+Dataflow node asserting definition of locations in which incoming parameters
+are delivered.
+\item
+Shuffle to move actuals from the conventional locations into their
+variables.
+\item
+Flow into the code following the continuation label.
+\end{enumerate}
+\item
+\emph{Unwind to a continuation}.
+If unwound to, a continuation will have an entry point unwinding calls.
+On this entry point:
+\begin{enumerate}
+\item
+Dataflow node asserting definition of the variables that are the
+continuation's formal parameters.
+\item
+No shuffling code is needed; it is up to the {\PAL} run-time system to
+put parameters in their conventional locations.
+\item
+Flow into the code following the continuation label.
+\end{enumerate}
+\item
+\emph{Cut to a continuation}.
+If cut to, a continuation will have an entry point that goes into the
+PC/SP pair that represents the continuation.
+On this entry point:
+\begin{enumerate}
+\item
+Run convention feeding widths/kinds/alignments and get locations plus block.
+(Stack layout must fit block into frame in the right place.)
+\item
+Provide binding of where stack pointer must be just before the call
+instruction.  (????? senseless?????)
+\item
+Emit shuffle for putting actuals into locations.
+\item
+Take locations defined by shuffle and retain them so we can create a
+dataflow node asserting that these locations are used by the call.
+(Will go on the call's \emph{outgoing} edges for reasons I've
+forgotten.) 
+\item
+Set stack pointer to where it must be.
+MORE TO COME.
+\end{enumerate}
+\end{itemize}
+@
+\subsection{Interface}
+<<call.mli>>=
+<<exported type definitions>>
+@ 
+<<exported type definitions>>=
+type kind    = string
+type width   = int
+type aligned = int
+type types = (width * kind * aligned) list
+
+type 'insp answer =
+  { 
+(* locs     : Automaton2.loc list *)  (* where passed values reside *)
+    overflow : Block.t              (* includes all locs for values passed in mem *)
+(*    ; sploc    : Rtl.exp              (* where sp is required when values are passed *) *)
+  ; insp     : 'insp                (* specify sp when overflow block is introduced;
+                                       used in assertions entries from calls, cuts *)
+  ; regs     : Register.Set.t       (* set of locations defined (used) by partner *)
+  ; pre_sp   : Rtl.rtl              (* conditional SP adjustment pre-shuffle *)
+  ; shuffle  : Rtl.rtl              (* shuffle parms where they go *)
+  ; post_sp  : Rtl.rtl              (* unconditional SP adjustment post-shuffle *)
+  }
+@ 
+Responsibility for actions on the stack is split between the caller and
+the callee. A [[party]] value identifies one of them.
+<<exported type definitions>>=
+type party = Caller | Callee
+@
+In particular, either one can allocate a block for results or deallocate
+the parameter overflow block. Who does what has implications for tail
+calls.
+<<exported type definitions>>=
+type overflow = 
+    { parameter_deallocator:    party
+    ; result_allocator:         party
+    }
+@
+When parameters have a choice of allocation or deallocation, we keep
+records of both.
+<<exported type definitions>>=
+type ('a, 'b) split_blocks = { caller : 'a; callee : 'b }
+@ 
+<<exported type definitions>>=
+type outgoing = types -> Rtl.exp       list -> unit    answer
+type incoming = types -> Automaton.loc list -> (Block.t -> Rtl.rtl) answer
+type ('inc, 'out) pair' = { in' : 'inc ; out : 'out }
+type pair     = (incoming, outgoing)              pair'
+type cut_pair = (incoming, (Rtl.exp -> outgoing)) pair'
+
+type t = (* part of a calling convention *)
+  (* we get 3 dual pairs *)
+  { name           : string   (* canonical name of this cc *)
+  ; overflow_alloc : overflow
+  ; call_parms     : pair
+  ; results        : pair
+  ; cut_parms      : cut_pair
+       (* exp is continuation val; used to address overflow block *)
+                  
+  ; stable_sp_loc : Rtl.exp
+       (* address where sp points after prolog, sits between calls,
+          and should be set to on arrival at a continuation *)
+
+  ; jump_tgt_reg : Rtl.loc
+       (* When jumping through a register, we need a hardware register -- otherwise
+          we might try to spill a temp after moving the sp, which would be very bad. *)
+
+  ; stack_growth   : Memalloc.growth
+  ; sp_align       : int             (* alignment of stack pointer at call/cut *)
+  <<fields to support the return address>>
+  <<fields to support jumps>>
+  ; sp_on_unwind   : Rtl.exp -> Rtl.rtl
+  ; pre_nvregs     : Register.Set.t          (* registers preserved across calls *)
+  ; volregs        : Register.Set.t          (* registers not preserved across calls *)
+  ; saved_nvr      : Talloc.Multiple.t -> Register.t -> Rtl.loc (* where to save NVR *)
+  ; return         : int -> int -> ra:Rtl.exp -> Rtl.rtl    (* alternate return *)
+(*  ; alt_return_table : node list -> node *)
+  (* these next two encapsulate knowledge of which reg. is sp *)
+  ; replace_vfp    : Zipcfg.graph -> Zipcfg.graph * bool
+  } 
+@ N.B. the [[pre_nvregs]] are all possible nonvolatile registers.
+The actual nonvolatile registers are those [[pre_nvregs]] that are not
+used for parameters.
+@
+The return address has to be supported throughout its life cycle.
+To know where to find it on entry, we might have to supply an overflow
+block.
+<<fields to support the return address>>=
+; ra_on_entry     : Block.t -> Rtl.exp
+@ Next, we have to decide where to save it.
+For that, we say where we found it and we provide a supply of temps.
+<<fields to support the return address>>=
+; where_to_save_ra : Rtl.exp -> Talloc.Multiple.t -> Rtl.loc
+@ Finally we need to say where to put it on exit.  This probably means
+leaving it where it is, putting it near an overflow block, or
+allocating it to a fresh temporary.
+(The reason a fresh temporary is useful is that it will have a very
+short lifetime and will therefore be unlikely to be spilled. 
+The problem with reusing the temporary from [[where_to_save_ra]] is
+that it is quite likely to be spilled, and the register allocator has
+been observed to insert the reload \emph{after} the stack frame has
+been deallocated, which is bad.)
+<<fields to support the return address>>=
+; ra_on_exit      : Rtl.loc -> Block.t -> Talloc.Multiple.t -> Rtl.loc
+@ 
+The [[sp]] may need special handling on a tail call, in particular if the return
+address is maintained on the stack.
+For example, the [[x86]] stores the return address on the stack
+and uses the call and return instructions to push and pop it from the stack.
+Because of this implicit push and pop, the callee expects the return address to be
+on the stack, below the incoming overflow block.
+This setup breaks down with tail calls because we no longer use the call instruction,
+so we have to set the [[sp]] and place the [[ra]] in its conventional location before
+the jump instruction.
+<<fields to support jumps>>=
+; sp_on_jump      : Block.t -> Talloc.Multiple.t -> Rtl.rtl
+@ 
+EXTENSIONS:
+\begin{itemize}
+\item
+Type [[t]] to have [[grow_stack_to]] and [[set_stack_to]], which
+conditionally adjust the stack pointer.
+\item
+Trim the answer to have just one piece of information about the stack
+pointer: its location.  On incoming, this is asserted, and on
+outgoing, it is first grown to and then set.
+\item
+For outgoing answers, there's no need for both [[autosp]] and
+[[postsp]], since the only value we use is 
+[[postsp $ autosp $ freeze $ a]].
+(N.B.  [[epilog]] use [[postsp]] that subtracts~4, but it could be
+done in [[autosp]].)
+\item
+For incoming prolog, [[postsp]] gives the standard stack-pointer
+location. 
+Also true for incoming results and incoming cuts to.
+\item
+In default spec for calling convention, stack pointer should point to
+young end of overflow block, plus~$k$, where $k$~is a parameter.
+\item
+Calls must agree on the direction of stack growth.
+\item
+In the current implementation, calls must also agree on which register
+is the stack pointer.
+\end{itemize}
+
+@
+We have the beginnings of an implementation that computes incoming and
+outgoing stuff.  The [[relative_to]] parameter is pure hell and not obvious
+to the amateur.  The [[postsp]] parameter is a bit tricky too.
+PROBLEM: [[autosp]] SEEMS TO BE RELEVANT ONLY FOR INCOMING CASE??
+NOT CLEAR.
+<<call.mli>>=
+val outgoing :
+     growth:Memalloc.growth -> sp:Rtl.loc -> mkauto:valpass ->
+     autosp:(Automaton.result -> Rtl.exp) ->
+     postsp:(Automaton.result -> Rtl.exp -> Rtl.exp) -> outgoing
+val incoming : 
+     growth:Memalloc.growth -> sp:Rtl.loc -> mkauto:valpass ->
+     autosp:(Automaton.result -> Rtl.exp) ->
+     postsp:(Automaton.result -> Rtl.exp -> Rtl.exp) ->
+     insp:(Automaton.result -> Rtl.exp -> Block.t -> Rtl.exp) -> incoming
+<<exported type definitions>>=
+type valpass = unit -> Automaton.t
+@ 
+
+\subsection{Registration of Calling Conventions from Lua}
+We also now have some code to allow the registration of new calling conventions
+from Lua.
+<<call.mli>>=
+type 'a tgt = ('a, (Rtl.exp -> Automaton.t), t) Target.t
+
+val register_cc : 
+    'a tgt -> string -> call:Automaton.stage ->
+    results:Automaton.stage ->
+    cutto:Automaton.stage -> unit
+
+(* val get_cc : ('a, 'cc) Target.t -> string -> 'cc *)
+val get_cc : ('p, 'a, 'cc) Target.t -> string -> 'cc
+@
+
+We provide a general mechanism for analyzing calling convention automata.
+<<call.mli>>=
+val dump_proc      : 'a tgt -> string -> types -> unit
+val dump_return    : 'a tgt -> string -> types -> unit
+val dump_cutto     : 'a tgt -> string -> types -> unit
+val paths_proc     : 'a tgt -> string -> types -> unit
+val paths_return   : 'a tgt -> string -> types -> unit
+val paths_cutto    : 'a tgt -> string -> types -> unit
+val summary_proc   : 'a tgt -> string -> types -> unit
+val summary_return : 'a tgt -> string -> types -> unit
+val summary_cutto  : 'a tgt -> string -> types -> unit
+
+val path_2_in_overflow : 'a tgt -> string -> unit
+@ 
+Diagnostic procedures.
+Both look up a convention in a target by name.
+Both then take a signature.
+The first returns a list of locations used to pass values;
+a value may occupy more than one location.
+The second prints this information in suitable diagnostic form.
+<<call.mli>>=
+val run_cc_on_sig_and_return :
+  (Automaton.cc_spec -> Automaton.stage) -> 'a tgt -> string -> types -> string list list
+val run_cc_on_sig_and_print :
+  (Automaton.cc_spec -> Automaton.stage) -> 'a tgt -> string -> types -> unit
+@ 
+
+\subsection{Implementation}
+
+A consummation most devoutly to be wished.
+<<call.ml>>=
+module A  = Automaton
+module Dn = Rtl.Dn
+module R  = Rtl
+module RP = Rtl.Private
+module RS = Register.SetX
+module RU = Rtlutil
+module Up = Rtl.Up
+<<exported type definitions>>
+@ 
+<<call.ml>>=
+let ignore r s = s
+
+let too_small growth sp target =
+  let w = RU.Width.loc sp in
+  let ( >* ) x y = R.app (R.opr "gt" [w]) [x; y] in
+  let ( <* ) x y = R.app (R.opr "lt" [w]) [x; y] in
+  match growth with
+  | Memalloc.Down -> RU.fetch sp >* target
+  | Memalloc.Up   -> RU.fetch sp <* target
+
+let ne sp target = R.app (R.opr "ne" [RU.Width.loc sp]) [RU.fetch sp; target]
+
+let outgoing ~growth ~sp ~mkauto ~autosp ~postsp types actuals =
+    let a = mkauto () in
+    let crank effects' (w, k, aligned) actual =
+      let l = A.allocate a ~width:w ~kind:k ~align:aligned in
+      A.store l actual w :: effects' in
+    let shuffle = R.par (List.rev (List.fold_left2 crank [] types actuals)) in
+    let a = A.freeze a in
+    let autosp = autosp a in
+    let postsp = postsp a autosp in
+    let setsp  = RU.store sp postsp in
+    { overflow = a.A.overflow
+    ; insp     = ()
+    ; regs     = a.A.regs_used
+    ; shuffle  = shuffle
+    ; post_sp  = R.guard (ne sp postsp)               setsp
+    ; pre_sp   = R.guard (too_small growth sp postsp) setsp
+    }
+
+let incoming ~growth ~sp ~mkauto ~autosp ~postsp ~insp types formals =
+    let a = mkauto() in
+    let crank effects' (w, k, aligned) formal =
+      let l = A.allocate a ~width:w ~kind:k ~align:aligned in
+      A.store formal (A.fetch l w) w :: effects' in
+    let shuffle = R.par (List.rev (List.fold_left2 crank [] types formals)) in
+    let a = A.freeze a in
+    let autosp = autosp a in
+    let postsp = postsp a autosp in
+    let insp   = insp a autosp in
+    let setsp  = RU.store sp postsp in
+    { overflow = a.A.overflow
+    ; insp     = (fun b -> RU.store sp (insp b))
+    ; regs     = a.A.regs_used
+    ; shuffle  = shuffle
+    ; post_sp  = R.guard (ne sp postsp)               setsp
+    ; pre_sp   = R.guard (too_small growth sp postsp) setsp
+    }
+@
+
+Some utilities.  DOCO HERE.
+<<call.ml>>=
+type 'a tgt = ('a, (Rtl.exp -> Automaton.t), t) Target.t
+
+let add_cc specs name ~call ~results ~cutto = 
+  let base = List.remove_assoc name specs in
+    (name, { A.call    = call
+           ; A.results = results
+           ; A.cutto   = cutto
+           }
+    ) :: base
+
+let register_cc t name ~call ~results ~cutto =
+   let newspecs = add_cc t.Target.cc_specs name ~call ~results ~cutto
+   in t.Target.cc_specs <- newspecs ; ()
+
+let get_ccspec tgt name =
+  try  List.assoc name tgt.Target.cc_specs
+  with Not_found -> Unsupported.calling_convention name
+
+let get_cc tgt name =
+  tgt.Target.cc_spec_to_auto name (get_ccspec tgt name)
+
+let dump what autofun target ccname =
+  let wordsize  = target.Target.wordsize  in
+  let automaton = autofun (get_ccspec target ccname) in
+  what ~mk:(fun () -> 
+            A.at ~start:(R.bits (Bits.zero wordsize) wordsize) 
+                  target.Target.memspace  automaton)
+        
+let dump_proc    x = dump Automatongraph.print (fun s -> s.A.call) x
+let dump_return  x = dump Automatongraph.print (fun s -> s.A.results) x
+let dump_cutto   x = dump Automatongraph.print (fun s -> s.A.cutto) x
+let paths_proc   x = dump Automatongraph.paths (fun s -> s.A.call) x
+let paths_return x = dump Automatongraph.paths (fun s -> s.A.results) x
+let paths_cutto  x = dump Automatongraph.paths (fun s -> s.A.cutto) x
+let summary_proc x =
+  dump (Automatongraph.summary ~what:"parameters") (fun s -> s.A.call) x
+let summary_return x =
+  dump (Automatongraph.summary ~what:"results")    (fun s -> s.A.results) x
+let summary_cutto  x =
+  dump (Automatongraph.summary ~what:"cont parms") (fun s -> s.A.cutto) x
+@ 
+
+And now we generate signatures that cause 1 and 2 parameters, respectively,
+to end up in an overflow block.
+<<call.ml>>=
+let findpath_1_in_overflow autofun target ccname =
+  let wordsize  = target.Target.wordsize  in
+  let automaton = autofun (get_ccspec target ccname) in
+  let rec find_overflow_1 tys =
+    let an  = A.at ~start:(R.bits (Bits.zero wordsize) wordsize) 
+                   target.Target.memspace automaton in
+    let tys = (wordsize, "unsigned") :: tys in
+    let _   = List.map (fun (w,h) -> A.allocate an ~width:w ~kind:h) tys in
+    let res = A.freeze an in
+    if res.A.mems_used == [] then find_overflow_1 tys else tys in
+  find_overflow_1 []
+
+let findpath_2_in_overflow autofun target ccname =
+  (target.Target.wordsize, "unsigned") :: 
+  (findpath_1_in_overflow autofun target ccname)
+
+let path_2_in_overflow target ccname =
+  List.iter (fun (h,w) -> Printf.printf "%d/int " target.Target.wordsize)
+    (findpath_2_in_overflow (fun s -> s.A.call) target ccname);
+  Printf.printf "\n"
+
+let locs aloc w =
+  let RP.Rtl gs = Dn.rtl (A.store aloc (Rtl.bits (Bits.zero w) w) w) in
+  let getloc = function RP.Store (l, _, _) -> l | RP.Kill l -> l in
+  let rec add_locs l locs = match l with
+  | RP.Reg (s, n, RP.C c) when c <= 0 -> locs
+  | RP.Reg (s, n, RP.C c) -> Up.loc l :: add_locs (RP.Reg (s, n+1, RP.C (c-1))) locs
+  | l -> Up.loc l :: locs in
+  List.fold_right (fun (_,  e) locs -> add_locs (getloc e) locs) gs []
+
+let run_cc_on_sig_and_return autofun target ccname tys =
+  let loc2strs l (w, k, a) = List.map Rtlutil.ToString.loc (locs l w) in
+  let wordsize = target.Target.wordsize  in
+  let auto   = autofun (get_ccspec target ccname) in
+  let an     = A.at ~start:(Rtl.late "ovflw" wordsize) target.Target.memspace auto in
+  let allocs = List.map (fun (w,k,a) -> A.allocate an ~width:w ~kind:k ~align:a) tys in
+  List.map2 loc2strs allocs tys
+
+let run_cc_on_sig_and_print autofun target ccname tys =
+  let locs = run_cc_on_sig_and_return autofun target ccname tys in
+  let print (w, k, a) ls =
+    Printf.printf "\"%s\":%d@%d => { %s }\n" k w a (String.concat "," ls) in
+  List.iter2 print tys locs
+@ 
+\subsection{Potential new constructors for \texttt{Call.t}}
+
+The idea is to have an easier way for a client to build a value of
+type [[Call.t]].
+The hope is we need change nothing above this line.
+
+THIS STUFF IS PARTIALLY MIGRATED TO \module{Callspec}.
+CLONED AND MODIFIED BROKEN WINDOWS!  HOW EMBARRASSING\ldots
+@
+<<call.ml>>=
+<<specification for a calling convention>>
+@ 
+<<specification for a calling convention>>=
+type call_t = t
+module type SPEC = sig
+  type party = Caller | Callee
+  type overflow = { parm_deallocator : party
+                  ; result_allocator : party
+                  } 
+  val c_overflow    : overflow
+  val tail_overflow : overflow
+  type nvr_saver    = Talloc.Multiple.t -> Register.t -> Rtl.loc
+  val save_nvrs_anywhere : Space.t list -> nvr_saver
+     (* save h/w register in suitable temp space from the list *)
+     (* one day: add [[save_nvrs_in_conventional_locations]] *)
+
+  module ReturnAddress : sig
+    type style =
+      | KeepInPlace       (* leave the RA where it comes in --- probably on stack *)
+      | PutInTemporaries  (* put the RA in temporaries *)
+
+    (* values for the three RA-related functions in the Call.t *)
+    (* these functions are not needed by a client but will be used to convert
+       a Spec.t into a Call.t.  Some client may want to use such functions to 
+       modify a Call.t *)
+    val enter_in_loc : Rtl.loc -> Block.t -> Rtl.exp (* in_loc l b = fetch l *)
+    
+    val save_in_temp : Rtl.exp -> Talloc.Multiple.t -> Rtl.loc
+    val save_as_is   : Rtl.exp -> Talloc.Multiple.t -> Rtl.loc
+
+    val exit_in_temp : Rtl.exp -> Block.t -> Talloc.Multiple.t -> Rtl.loc
+    val exit_as_is   : Rtl.exp -> Block.t -> Talloc.Multiple.t -> Rtl.loc
+  end
+
+  type t =
+    { name          : string   (* canonical name of this cc *)
+    ; stack_growth  : Memalloc.growth
+    ; sp            : Register.t
+    ; sp_align      : int             (* alignment of stack pointer at call/cut *)
+    ; allregs       : Register.Set.t           (* registers visible to the allocator *)
+    ; nvregs        : Register.Set.t           (* registers preserved across calls *)
+    ; saved_nvr     : nvr_saver
+    ; ra            : Rtl.loc * ReturnAddress.style
+                                        (* where's the RA and what to do with it *)
+    } 
+
+  val to_call : t -> call_t
+end

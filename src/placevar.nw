@@ -1,0 +1,347 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+%%Grades: D Peripheral Later
+
+@
+\section{Placing variables into suitable temporary locations}
+The [[mk_automaton]] function generates an automaton for placing variables,
+given a warning function and a function that returns temporaries.
+The [[context]] variable placer gives an automaton stage the opportunity to put
+a variable into a temporary; if the opportunity is not used (i.e. the stage
+passes the buck to its successor), the variable goes into the private block on
+the stack.
+<<placevar.mli>>=
+val mk_automaton : warn:(width:int -> alignment:int -> kind:string -> unit) ->
+                   vfp:Rtl.exp ->
+                   memspace:Rtl.space ->
+                   (temps:(char -> Automaton.stage) -> Automaton.stage) ->
+                   (Ast2ir.proc -> Automaton.t)
+val context : (Ast2ir.proc -> Automaton.t) -> 'e -> Ast2ir.proc -> Ast2ir.proc * bool
+@ 
+The [[replace_globals]] placer replaces global variables with the
+locations in the procedure's [[global_map]], and otherwise it does
+nothing. 
+<<placevar.mli>>=
+val replace_globals : 'a -> Ast2ir.proc -> Ast2ir.proc * bool
+@
+Boilerplate for linking to Lua.
+<<placevar.ml>>=
+module A  = Automaton
+module G  = Zipcfg
+module GR = Zipcfg.Rep
+module P  = Proc
+module PA = Preast2ir
+module R  = Rtl
+module RT = Runtimedata
+module RU = Rtlutil
+module RP = Rtl.Private
+
+<<replace var>>
+@ 
+<<fetch and store globals>>=
+let store_global exp (s, i, w) = proc.P.global_map.(i).A.store (R.Up.exp exp) w in
+let fetch_global     (s, i, w) = proc.P.global_map.(i).A.fetch                w in
+@    
+We use a higer-order function to allow different variable placers to replace a variable
+and take advantage of the rtl-walk.
+<<replace var>>=
+let replace_var store_var fetch_var store_global fetch_global r =
+  <<walk RTL>>
+  walkRtl r
+@
+A standard recursive tree walk.
+The interesting case is [[RP.Fetch]] in [[walkExp]]; we apply the function.
+<<walk RTL>>=
+let rec walkLoc loc =
+  match loc with
+  | RP.Mem   (sp, w, e, ass) -> RP.Mem (sp, w, walkExp e, ass)
+  | RP.Reg   (sp, i, w) as r -> r
+  | RP.Var   (s, i, w)       -> Impossible.unimp "slice of variable"
+  | RP.Global(s, i, w)       -> Impossible.unimp "slice of global variable"
+  | RP.Slice (w, i, l)       -> RP.Slice (w, i, walkLoc l)
+
+and walkExp exp = match exp with
+  | RP.Const _                      -> exp
+  | RP.Fetch (RP.Var    (s,i,w), _) -> R.Dn.exp (fetch_var    (s,i,w))
+  | RP.Fetch (RP.Global (s,i,w), _) -> R.Dn.exp (fetch_global (s,i,w))
+  | RP.Fetch (l, w)                 -> RP.Fetch (walkLoc l, w)
+  | RP.App   (op, exps)             -> RP.App(op, List.map walkExp exps)
+and upExp e = R.Up.exp (walkExp e)
+and upLoc l = R.Up.loc (walkLoc l)
+  
+and walkEffect effect = match effect with
+  | RP.Store (RP.Var    (s,i,w), e, _) -> store_var    (walkExp e) (s,i,w)
+  | RP.Store (RP.Global (s,i,w), e, _) -> store_global (walkExp e) (s,i,w)
+  | RP.Store (l, e, w)        -> R.store (upLoc l) (upExp e) w
+  | RP.Kill  (RP.Var _ | RP.Global _) -> Impossible.unimp "killing variables"
+  | RP.Kill  l -> R.kill (upLoc l) in
+
+let walkGuard (exp, effect) = R.guard (upExp exp) (walkEffect effect) in
+
+let walkRtl r = match Rtl.Dn.rtl r with
+  | RP.Rtl gs -> R.par (List.map walkGuard gs) in
+@
+\subsection{Variable Placement by Execution Estimate}
+This variable placer bases its decisions on how often a variable is used in each
+context.
+We use a table of operator contexts to find the context in which a variable is used
+in each instruction.
+We weight each context of a variable by the number of times the instruction is
+executed.
+We place the variable in the context in which it is used most often in the procedure.
+<<placevar.ml>>=
+module IntMod  = struct type t = int            let compare = compare end
+module IM = Map.Make (IntMod)
+module NM = Unique.Map
+module SM = Strutil.Map
+@
+The first argument to the variable placer is a function that takes a [[proc.t]] and
+returns an automaton.
+The automaton provides locations for variables.
+The automaton must return unsplit locations.
+In the variable placer, we rely on this guarantee; for an automaton used in calling
+conventions, we have no such guarantees.
+<<placevar.ml>>=
+<<define context count structures>>
+let context autmtn _ (g, ({ Proc.target = PA.T tgt; Proc.formals = formals;
+                            Proc.var_map = tMap} as proc)) =
+  let changed = ref false in
+  let autmtn  = autmtn (g, proc) in
+  <<initialize context count structures>>
+  <<get operator contexts>>
+  <<estimate [[exec_counts]] for graph nodes>>
+  <<count uses in each context>>
+  <<choose a context for each variable>>
+  <<replace variables with temps>>
+  <<freeze [[autmtn]] and make sure its overflow block is empty>>
+  <<add variable placements to spans>>
+  (g, proc), !changed
+@
+For each variable, we keep track of how many times it is used in each context.
+We use mutable state to store the counts for each variable, and we keep the records
+in an array indexed by the variable number.
+<<define context count structures>>=
+type counts = { mutable intc   : float
+              ; mutable floatc : float
+              ; mutable addrc  : float
+              ; mutable boolc  : float
+              }
+@
+<<initialize context count structures>>=
+let new_count _ = { intc = 0.0; floatc = 0.0; addrc = 0.0; boolc = 0.0}        in
+let var_counts = Array.init proc.Proc.vars new_count                           in
+let inc_int   i f = let record = var_counts.(i)                                in
+                    record.intc <- record.intc +. f                            in
+let inc_float i f = let record = var_counts.(i)                                in
+                    record.floatc <- record.floatc +. f                        in
+let inc_addr  i f = let record = var_counts.(i)                                in
+                    record.addrc <- record.addrc +. f                          in
+let inc_bool  i f = Error.warningPrt "variable found in boolean context"       in
+let inc_rm    i f = Error.warningPrt "variable found in rounding mode context" in
+@
+A call to [[Context.standard]] returns a list of (operator, parameter list, result)
+triples, where the argument list and result tell us in what context the arguments and 
+results are expected by the operator.
+To speed lookup, we use a map to hold this information.
+THERE IS A LATENT BUG HERE.  WE SHOULD BE USING A TARGET-DEPENDENT CONTEXT.
+<<get operator contexts>>=
+let ops =
+  let context = Context.full inc_int inc_float inc_rm inc_bool [] in
+  let add map (op, parms, res) = SM.add op (parms, res) map in
+  List.fold_left add SM.empty context in
+let ctxt_parms  op = try Some (fst (SM.find op ops)) with Not_found -> None in
+let ctxt_result op = try Some (snd (SM.find op ops)) with Not_found -> None in
+@
+For now, we don't estimate execution counts; we assume each node is executed once.
+<<estimate [[exec_counts]] for graph nodes>>=
+let exec_counts = G.fold_blocks (fun b map -> NM.add (GR.id b) 1.0 map) NM.empty g  in
+let get_exec_count b = try NM.find (GR.id b) exec_counts
+                       with Not_found -> Impossible.impossible "node not counted" in 
+@
+We use the execution counts and the table of operator contexts to estimate how many
+times each variable is used in each context.
+The function [[count]] calls [[count_rtl]] to walk the rtl's and count uses.
+<<count uses in each context>>=
+let count (block : GR.block) =
+  <<define counting functions>>
+  let rec count = function
+    | GR.Tail (m, t) -> begin count_rtl (GR.mid_instr m); count t end
+    | GR.Last l -> count_rtl (GR.last_instr l) in
+  let (first, tail) = block in
+  count tail in
+let () = G.iter_blocks count g in
+@
+The function [[count_rtl]] walks an rtl in a top-down fashion, looking for the use of
+an operator.
+If an operator is found and its argument or result is a variable, we increment the
+number of times the variable has been used in its current context (as determined by the
+operator).
+Counting arguments to an operator is easy (see [[count_exp]]), but counting the result
+of the operator requires a special case in [[count_effect]].
+<<define counting functions>>=
+let rec count_loc loc ctxt = match loc with
+  | RP.Mem   (_, _, e, _) -> count_exp e (Some inc_addr)
+  | RP.Slice (_, _, l)    -> count_loc l ctxt
+  | RP.Reg    _           -> ()
+  | RP.Global _           -> ()  (* cannot be placed based on context *)
+  | RP.Var   (_, i, _)    ->
+    (match ctxt with
+     | None   -> ()
+     | Some c -> c i (get_exec_count block))
+
+and count_exp exp ctxt = match exp with
+  | RP.Const _        -> ()
+  | RP.Fetch (l, _)   -> count_loc l ctxt
+  | RP.App ((op, _), exps) ->
+    let ctxts = match ctxt_parms op with
+                | None    -> List.map (fun s -> None)   exps
+                | Some cs -> List.map (fun c -> Some c) cs   in
+    try List.iter2 count_exp exps ctxts
+    with Invalid_argument _ -> Impossible.impossible "bad context in placevar" in
+
+let count_effect effect = match effect with
+  | RP.Store (l, (RP.App ((op, _), _) as e), _) ->
+      (count_exp e None ; count_loc l (ctxt_result op))
+  | RP.Store (l, e, _) -> (count_exp e None ; count_loc l None)
+  | RP.Kill   l        -> count_loc l None in
+
+let count_guard (exp, effect) = (count_effect effect ; count_exp exp None) in
+
+let rec count_rtl r = match Rtl.Dn.rtl r with
+  | RP.Rtl gs -> List.iter count_guard gs in
+@
+For each variable, we choose the context with the most votes.
+The default context is "int".
+<<choose a context for each variable>>=
+let default_kind = "int" in
+let ctxt_map =
+  let elect i =
+    let cnts = var_counts.(i) in
+    let icnt = cnts.intc      in
+    let fcnt = cnts.floatc    in
+    let acnt = cnts.addrc     in
+    let (cnt,ctxt) = if icnt >=. fcnt then (icnt,"int") else (fcnt, "float") in
+    if cnt >=. acnt then ctxt else "address" in
+  Array.init proc.Proc.vars elect in
+@
+To replace a variable, we use the automaton to allocate a new fetch of the variable,
+and we extract the location.
+The automaton relies on a kind to return an appropriate location.
+If the variable is a formal argument with a kind, we use that kind and issue a warning
+if it is different from the elected kind.
+The function [[choose_kind]] is responsible for detecting and handling formal
+arguments.
+We do not issue a warning if the elected kind is the default, with zero votes.
+
+WE DON'T INFER ANY ALIGNMENT.  SHOULD WE WORRY?
+<<context replace var>>=
+let formal_arr = Array.make proc.Proc.vars None in
+let () = List.iter (fun (i,v) -> formal_arr.(i) <- Some v) formals in
+let choose_ty i elected_kind = 
+  let space_name = function "signed" | "unsigned" | "" -> "int"
+                          | n                          -> n     in
+  match formal_arr.(i) with
+  | Some (Some ("address" as h), _, _, n, a) when elected_kind =$= "int" ->
+    if tgt.Target.distinct_addr_sp then
+      Impossible.unimp "Var placer does not distinguish addr and int spaces"
+    else h, a
+  | Some (Some h, _, _, n, a) when Pervasives.(<>) (space_name h) elected_kind ->
+    let votes = var_counts.(i) in
+    begin
+      (if not (elected_kind =$= default_kind) || votes.intc <>. 0.0 then
+        let error_str =
+          ( Printf.sprintf
+              "Kind \"%s\" on formal parameter %s differs from inferred kind \"%s\":\n"
+              h n elected_kind
+          ^ Printf.sprintf "  {int: %f, float: %f, addr: %f}"
+                           votes.intc votes.floatc votes.addrc) in
+        Debug.eprintf "placevar" "%s" error_str);
+      h, a
+    end
+  | _ -> elected_kind, None in
+  
+let get_placer i w =
+  match tMap.(i) with
+  | Some a -> a
+  | None   -> let kind, aligned = choose_ty i ctxt_map.(i) in
+              let alloc = A.allocate autmtn w kind (Auxfuns.Option.get 1 aligned) in
+              (changed := true;
+               tMap.(i) <- Some alloc;
+               alloc) in
+let store_var exp (s, i, w) = (get_placer i w).A.store (R.Up.exp exp) w in
+let fetch_var     (s, i, w) = (get_placer i w).A.fetch                w in
+@
+We fold over the nodes, replacing variables with each variable with a temp for the
+proper context.
+<<replace variables with temps>>=
+<<context replace var>>
+<<fetch and store globals>>
+let update rtl = replace_var store_var fetch_var store_global fetch_global rtl in
+let g = G.map_rtls update g in
+<<verbosely dump [[tMap]]>>
+@ 
+<<verbosely dump [[tMap]]>>=
+let () =
+  if Debug.on "placevar" then
+    let loc = function
+      | None -> "<??none??>"
+      | Some l -> RU.ToString.exp (l.A.fetch 99) in
+    Printf.eprintf "Varmap: Var i -> Loc\n";
+    Array.iteri (fun i l -> Printf.eprintf "  %d -> %s\n" i (loc l)) tMap in
+<<placevar.ml>>=
+let () = Debug.register "placevar" "variable placer"
+@
+<<freeze [[autmtn]] and make sure its overflow block is empty>>=
+let aresult = A.freeze autmtn in
+let _ = if Block.size aresult.A.overflow <> 0 then
+          Impossible.impossible "nonempty overflow from placing variables" in
+@
+<<placevar.ml>>=
+let ( *> ) = A.( *> )
+
+let from_temps proc space = (* stage to allocate a temporary location *)
+  let allocator = Talloc.Multiple.loc proc.Proc.temps space in
+  let alloc ~width:w ~alignment:a ~kind:h = A.of_loc (allocator w) in
+  A.wrap (fun methods -> {A.allocate = alloc; A.freeze = methods.A.freeze})
+
+let debug lbl w h a ctr =
+  Printf.eprintf "Placevar %s w=%d h=%s a=%d ctr=%d\n" lbl w h a ctr
+
+let mk_automaton ~warn ~vfp ~memspace mk_stage (g, proc) =
+  let warn methods =
+    let alloc ~width:w ~alignment:a ~kind:h =
+      warn ~width:w ~alignment:a ~kind:h;
+      methods.A.allocate w a h in
+    {A.allocate = alloc; A.freeze = methods.A.freeze} in
+  Block.srelative vfp "variables placed in memory" (A.at memspace)
+  ( A.wrap warn *> mk_stage ~temps:(from_temps proc) *> A.as_stage proc.Proc.priv )
+@
+After we have placed the variables, we record their locations in the spans.
+<<add variable placements to spans>>=
+let upd_var e = match R.Dn.loc e with
+  | RP.Var (_,i,_) -> (match tMap.(i) with
+                       | None   -> raise RT.DeadValue
+                       | Some l -> (Automatonutil.aloc l tgt.Target.wordsize))
+  | _              -> e in
+RT.upd_all_spans upd_var g;
+@
+<<placevar.ml>>=
+let replace_globals _ (g, ({ Proc.target = tgt; Proc.global_map = gmap} as proc)) =
+  let subst = RU.Subst.aloc ~guard:(function RP.Global _ -> true | _ -> false)
+                ~map:(function RP.Global (_, i, _) -> gmap.(i)
+                             | l -> Impossible.impossible "global replacement") in
+  let subst =
+    if Debug.on "placevar" then
+      (fun rtl ->
+        let rtl' = subst rtl in
+        Printf.eprintf "Placing vars maps\n  %s\nto\n  %s\n"
+          (RU.ToString.rtl rtl) (RU.ToString.rtl rtl');
+        rtl')
+    else
+      subst in
+  (G.map_rtls subst g, proc), true (* probably changed :-) *)

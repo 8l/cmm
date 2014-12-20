@@ -1,0 +1,32 @@
+
+
+target byteorder little;
+
+section "text" {
+        p () {
+            bits32 ii, ij, ik, iitotal, il;
+            ii = 1;
+	        ij = 2;
+			ik = 0;
+			il = 0;
+			if(ij >= 2::bits32) {
+				ik = 3;
+				il = 4;
+			}
+
+			iitotal = ii + ij + ik + il;
+			return (iitotal);
+        }
+}
+export main; import printf;
+foreign "C" main (bits32 argc, "address" bits32 argv) {
+  bits32 n;
+  n = p();
+  foreign "C" printf("address" fmt, n);
+  foreign "C" return (0);
+}
+
+section "data" {
+  fmt: bits8[] "total is %d\n\0";
+}
+

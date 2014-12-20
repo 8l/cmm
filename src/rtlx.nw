@@ -1,0 +1,90 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+%
+% vim: ts=8 sw=4 et:
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+%
+
+%%Grades: C Peripheral Later
+
+% ------------------------------------------------------------------ 
+\section{Export of RTLs}
+% ------------------------------------------------------------------ 
+
+To allow external software to read {\rtl}s we have generated we export
+them using {\asdl}. Since the {\rtl} data type is defined as a {\ocaml}
+data type and not as a {\asdl} data type, we create an additional
+definition of an {\rtl} using the {\asdl} specification language. We
+then convert an existing {\rtl} into an \asdl-based {\rtl} which we can
+export.
+
+<<rtlx.mli>>=
+val rtl:        Rtl.rtl       -> out_channel -> unit
+val rtls:       Rtl.rtl list  -> out_channel -> unit
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+We translate the internal {\rtl} representation to the {\asdl} generated
+representation from module \module{rtlasdl} and write it to a file.
+
+<<rtlx.ml>>=
+module R  = Rtl
+module RP = Rtl.Private
+module X  = Rtlasdl
+
+let aggregation = function
+    | R.LittleEndian         -> X.LittleEndian
+    | R.BigEndian            -> X.BigEndian
+    | R.Identity             -> X.Identity
+
+let rec const = function
+    | RP.Bool(b)             -> X.Bool (if b then 1 else 0)
+    | RP.Bits(b)             -> X.Bits ( Printf.sprintf "0x%Lx"
+                                            (Bits.U.to_int64 b)
+                                       , Bits.width b
+                                       )
+    | RP.Link(sym,k,width)   -> X.Link (sym#mangled_text, kind k,width)
+    | RP.Diff(c1,c2)         -> X.Diff (const c1, const c2)
+    | RP.Late(name,width)    -> X.Late (name, width)  
+
+and kind = function RP.Data -> X.Data | RP.Code -> X.Code | RP.Imported -> X.Imported
+
+let rec loc = function
+    | RP.Mem((s,agg,ms),c,e,a) -> X.Mem ( Char.code s
+                                        , aggregation agg
+                                        , Cell.to_width ms c
+                                        , exp e
+                                        , a
+                                        )
+    | RP.Reg((sp,_,ms),i,c)    -> X.Reg(Char.code sp,i,Cell.to_width ms c)
+    | RP.Var   (n,index,width) -> X.Var    (n, index, width)
+    | RP.Global(n,index,width) -> X.Global (n, index, width)
+    | RP.Slice(width,index,l)  -> X.Slice (width, index, loc l)
+
+and exp = function
+    | RP.Const(c)            -> X.Const (const c)
+    | RP.Fetch(l, w)         -> X.Fetch (loc l, w)
+    | RP.App(o, e)           -> X.App (o, List.map exp e)
+
+
+and effect = function
+    | RP.Store(l,e,w)        -> X.Store(loc l, exp e, w)
+    | RP.Kill(l)             -> X.Kill(loc l)
+
+let guarded (ex,eff)         = (exp ex, effect eff)
+let rtl' r                   = match R.Dn.rtl r with
+                               | RP.Rtl(gs) -> List.map guarded gs
+
+let rtl r   file = RtlasdlUtil.sexp_wr_rtl  (rtl' r)           file
+let rtls rs file = RtlasdlUtil.sexp_wr_rtls (List.map rtl' rs) file
+@
+
+
+                            

@@ -1,0 +1,62 @@
+% l2h macro module 1 <a href="#$1.html"><tt>#1.nw</tt></a>
+
+% ------------------------------------------------------------------ 
+\section{Runtime Module \texttt{Camlburg}}
+% ------------------------------------------------------------------ 
+
+The code genreated by module \module{Burg} relies on a few functions
+that are provided by its runtime system. All code resides in this
+module and must be shipped with any generated code.
+
+<<camlburg.mli>>=
+(* $Id: camlburg.nw,v 1.8 2002-03-27 16:58:54 lindig Exp $ *)
+
+exception Uncovered                     (* if no action defined *)
+
+type cost = int                         (* matching cost for a rule *)
+type 'a nt =                            (* cost/action pair for a nonterm *)
+    { cost : cost
+    ; action : unit -> 'a               (* Uncovered *)
+    } 
+val inf_cost : int                      (* maximal cost *)
+val infinity : 'a nt                    (* the least defined nt *)
+val choice : 'a nt list -> 'a nt        (* find cheapest nt *)
+val matches : 'a -> 'a -> int           (* cost function for literals *)
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+<<camlburg.ml>>=
+(* $Id: camlburg.nw,v 1.8 2002-03-27 16:58:54 lindig Exp $ *)
+
+type cost = int
+exception Uncovered
+
+
+type 'a nt = 
+    { cost:     cost
+    ; action:   unit -> 'a
+    }
+@
+
+Several [[inf_cost]] might be added up. We have to make sure we do not
+overflow. Previously we had [[max_int / 2]] which is obviously too low
+and caused subtle bugs.
+
+<<camlburg.ml>>=
+let inf_cost = 65536    (* 2^16 *)
+let infinity = 
+    { cost = inf_cost
+    ; action = (fun () -> raise Uncovered) 
+    }
+
+let min x y     = if x.cost < y.cost then x else y
+let choice nts  = List.fold_left min (List.hd nts) (List.tl nts)
+let matches x y = if x = y then 0 else inf_cost
+@
+
+
+
+

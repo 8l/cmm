@@ -1,0 +1,88 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+
+% ------------------------------------------------------------------ 
+\section{Automaton-Based Memory Allocation}
+% ------------------------------------------------------------------ 
+
+This module provides an applicative abstraction [[t]] to allocate a
+memory block incrementally by a sequence of [[allocate]] and [[align]]
+directives.  The abstraction is similar to a pointer that is advanced
+and aligned to reserve memory. At any point the value of the  pointer
+can be used as an address. After allocation is complete, the automaton
+is [[frozen]] and the allocated block is returned. A [[t]] value should
+not be used after it was frozen (allthough it is technically possible
+and safe).
+N.B. [[size]] is measured in units of [[memsize]].
+<<memalloc.mli>>=
+type t          (* immutable *)
+
+type growth = Up | Down
+
+val at :            start:Rtl.exp -> growth -> t       (* provide start address *)
+val relative :      anchor:Rtl.exp -> dbg:string -> growth -> t (* unknown addr relative to anchor *)
+val allocate :      t -> size:int -> t      (* increase block *)
+val align :         t -> int -> t           (* align cursor *)
+val alignment :     t -> int                (* max alignment ever requested *)
+val current :       t -> Rtl.exp            (* obtain cursor *)
+val freeze :        t -> Block.t            (* return allocated, aligned block *)
+val num_allocated : t -> int
+@
+
+% ------------------------------------------------------------------ 
+\subsection{Implementation}
+% ------------------------------------------------------------------ 
+
+<<memalloc.ml>>=
+type growth = Up | Down
+type unchanging = 
+    { start  : Rtl.exp     (* start address of block *)
+    ; growth : growth
+    ; exp_at : int -> Rtl.exp  (* exp at distance k from start *)
+    } 
+type t =
+    { u             : unchanging
+    ; num_allocated : int         (* size of block      *)
+    ; max_alignment : int         (* max alignment ever requested *)
+    }
+
+let at ~start g =
+  let w = Rtlutil.Width.exp start in
+  let addk = Rtlutil.addk w start in
+    { u = { start = start
+          ; growth = g
+          ; exp_at = match g with Up -> addk | Down -> fun k -> addk (-k)
+          } 
+    ; num_allocated = 0
+    ; max_alignment = 1
+    }
+
+let relative ~anchor ~dbg g = 
+  let w = Rtlutil.Width.exp anchor in
+  at (Rtlutil.add w anchor (Rtl.late (Idgen.offset dbg) w)) g
+
+let allocate t ~size = 
+    assert (size >= 0);    
+    { t with num_allocated = t.num_allocated + size }
+
+let align    t n = (* align both size and base alignment *)
+    assert (n > 0);
+    { t with max_alignment = max t.max_alignment n (*SHOULD BE LEAST COMMON MULTIPLE*)
+           ; num_allocated = Auxfuns.round_up_to t.num_allocated ~multiple_of:n 
+    }
+let current t = t.u.exp_at t.num_allocated
+let alignment t = t.max_alignment
+
+let freeze t = match t.u.growth with
+| Up   -> Block.at t.u.start   t.num_allocated t.max_alignment
+| Down -> let t = align t t.max_alignment in
+          Block.at (current t) t.num_allocated t.max_alignment
+
+let num_allocated t = t.num_allocated
+@

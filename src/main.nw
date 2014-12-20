@@ -1,0 +1,139 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+% vim: ts=8 et sw=4 sts=4
+% Grades     ::=    "%%Grades:" Quality Importance Urgency
+% Quality    ::=    A|B|C|D|E
+% Importance ::=    Central|Subsystem|Peripheral
+% Urgency    ::=    Immediate|Soon|Later
+%
+% Example (at beginning of line): %%Grades: B Central Soon
+% $Id: main.nw,v 1.57 2006-03-14 02:01:36 nr Exp $
+
+% ------------------------------------------------------------------ 
+\section{Main}\label{sect:main}
+% ------------------------------------------------------------------ 
+
+This module contains the [[main]] function that is executed when the
+\C~compiler starts.  It basically just grabs the command line arguments
+and hands them to the Lua interpreter. 
+
+Nothing gets exported from here because this is the top-most module of
+the hierarchy.
+
+<<main.mli>>=
+@
+
+We export command-line arguments to the Lua values
+[[Sys.cmd]] and [[Sys.argv]]. The
+[[Sys]] table is created if it does not exist. 
+
+<<main.ml>>=
+module E = Error
+module I = Lualink.I
+module V = I.Value
+
+let export_argv g strings =
+  I.register_module "Sys"
+    ["argv", (V.list V.string).V.embed (List.tl strings);
+     "cmd",  V.string.V.embed          (List.hd strings);
+    ] g
+@
+At start-up, we load the file [[qc--.lua]] into the interpreter. It
+defines commonly used functions. The file is searched along a search
+path. Typically, the [[qc--.lua]] file that is compiled into the table
+[[Boot]] is found.
+
+string into the compiler such that it is always available. During
+development it is easier to have an external file.
+<<main.ml>>=
+let main () =
+    let argv        = Array.to_list Sys.argv in
+    let state       = I.mk () in (* fresh Lua state *)       
+    let evaluate e  = ignore (I.dostring state e) in
+    let bootscript  = "Util.dosearchfile('qc--.lua', Boot)" in
+        try          
+            ( export_argv state argv    (* export cmd line  *)
+            ; evaluate bootscript       (* boot interpreter *) 
+            ; exit 0                    (* success *)
+            )
+        with
+            E.ErrorExn msg as e -> 
+                ( E.errorPrt ("uncaught Error exn: " ^ msg)
+                ; raise e
+                )
+@                
+In \ocaml~no [[main]] function like in C exists but simply all values
+in a module are evaluated.  However, we simulate this by evaluating
+[[main ()]]. 
+<<main.ml>>=
+let _ = main ()
+@
+During development bugs are easier to find with the debugger if we
+don't catch exceptions on the top-level. Shipping code, however,
+should use instead the following:
+<<main.ml unused>>=
+let _ = try main () with e -> 
+        ( Printf.eprintf "%s\n" (Printexc.to_string e)
+        ; Printf.eprintf "Please report this problem to bugs@cminusminus.org\n"
+        ; Printf.eprintf "Exit with exit code 2\n"
+        ; exit 2
+        )
+@
+      
+% ------------------------------------------------------------------  
+\section{This}
+% ------------------------------------------------------------------  
+
+To include some version information into the main binary we provide the
+[[This]] module.  Its source code [[this.ml]] is created during the
+build process from [[this.in]].  Currently only the version information
+stays here but it is a useful place for other informations that change
+frequently.  Note, that version informations  should \emph{not} be used
+to control the behavior of the program.  We therefore write all these
+informations to a stream to emphasize this.
+
+At startup the compiler executes a file [[qc--.lua]] in the Lua
+interpreter. One version of this file is compiled into the binary as
+[[This.boot]].
+
+<<this.mli>>=
+val name        : out_channel -> unit
+val version     : out_channel -> unit 
+val boot        : string (* contents of "qc--.lua" *)
+val manual      : string (* manual page qc--(1)    *)
+val byteorder   : string (* "big" | "little" *)
+val arch_os     : string (* "x86-linux" *)
+val install_dir : string (* "/usr/local" *)
+@
+
+Here is the implementation. The golory details are also in the [[mk]]
+file in this directory.
+
+<<this.in>>=
+(* Do not edit - this file is created from this.in through mk(1) 
+ * If this file does not compile, check the following files:
+ * (1) main2.nw - this.in is defined here
+ * (2) mkfile target this.ml - constructs the boot string
+ *)
+
+let system          = "@this@"
+@
+
+The functions [[name]] and [[version]] decompose the [[system]]
+string to get its name and version. 
+
+<<this.in>>=
+let name channel = 
+    let s = try let minus = String.rindex system '-' in
+                String.sub system 0 minus
+            with Not_found -> "not configured"
+    in
+         output_string channel s
+
+<<this.in>>=
+let version channel = 
+    let s = try let minus = String.rindex system '-' in
+                String.sub system (minus+1) (String.length system - minus - 1)
+            with Not_found -> "not configured"
+    in
+        output_string channel s
+@

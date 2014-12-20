@@ -1,0 +1,717 @@
+% -*- mode: Noweb; noweb-code-mode: caml-mode -*-
+
+\section{X86 calling conventions}
+
+My goal here is to avoid knowing anything about instructions.
+The parameters represent the machine instructions to implement
+[[return]] and [[cut to]].
+<<x86call.mli>>=
+val cconv :
+  return_to:(Rtl.exp -> Rtl.rtl) ->
+  (unit, Mflow.cut_args) Target.map ->
+  string -> Automaton.cc_spec ->
+  Call.t
+@ 
+To help ensure consistency with floating-point returns and the code
+expander, we export the proxy register for the stack top.
+<<x86call.mli>>=
+val stack_top_proxy_reg : Register.t
+@
+
+\section{Implementation of X86 calling conventions}
+We use these abbreviations:
+<<x86call.ml>>=
+module A  = Automaton
+module C  = Call
+module R  = Rtl
+module RO = Rewrite.Ops
+module RP = Rtl.Private
+module RS = Register.Set
+module RU = Rtlutil
+module T  = Target
+let impossf fmt = Printf.kprintf Impossible.impossible fmt
+@
+And in Lua we need to:
+<<x86 calling convention automata in Lua>>=
+A                = Automaton
+X86              = X86              or {}
+X86.cc           = X86.cc           or {}
+X86.cc["C"     ] = X86.cc["C"     ] or {}
+X86.cc["C--"   ] = X86.cc["C--"   ] or {}
+X86.cc["notail"] = X86.cc["notail"] or {}
+X86.cc["gc"]     = X86.cc["gc"]     or {}
+X86.cc["C-- thread"] = X86.cc["C-- thread"] or {}
+@ 
+\paragraph{General information}
+Information on the C~calling convention is from the SYSV ABI, Third
+Edition, ISBN 0-13-104670-5. 
+
+Values are aligned on 1-, 2-, or 4-byte boundaries.
+Doubles and long doubles are 4-byte aligned; others have the alignment
+of their size.
+
+Structures, arrays, and unions take the alignment of their most
+aligned component.
+
+From Figure 3-14,
+the return register is [[eax]], and the non-volatile
+registers are [[ebp]], [[ebx]], [[esi]], and [[edi]].
+@ 
+\paragraph{X86 registers and their conventional uses}
+Calling conventions refer to registers frequently, so it is
+appropriate to be able to refer to them by name.
+Lua code would do something similar.
+<<x86call.ml>>=
+let rspace = X86regs.rspace
+let eax = X86regs.eax 
+let ecx = X86regs.ecx 
+let edx = X86regs.edx 
+let ebx = X86regs.ebx 
+let esp = X86regs.esp 
+let ebp = X86regs.ebp 
+let esi = X86regs.esi 
+let edi = X86regs.edi 
+let vfp = Vfp.mk 32
+@ 
+Here are the volatile and nonvolatile registers.
+N.B. In position-independent code, [[ebx]] is reserved to point to the
+global offset table.
+Flags are also volatile, except that the direction flag must be set to
+``forward'' (that is, zero) on entry and exit.
+<<x86call.ml>>=
+let volregs = RS.of_list [eax; ecx; edx]
+let nvregs  = RS.of_list [ebx; esi; edi; ebp]
+let allregs = RS.union volregs nvregs
+@  N.B. We omit all floating-point registers.
+These are all volatile and available for allocation, although
+[[%st(0)]] can used to return a floating-point result.
+The ABI says that all these registers ``must be empty'' at entry and
+exit (except that [[%st(0)]] need not be empty if it holds a result).
+Understanding ``empty'' requires understanding $x$86 floating-point.
+@ 
+For now, we save a nonvolatile register anywhere.
+Later, we may want mechanisms for saving them in conventional locations.
+<<x86call.ml>>=
+let saved_nvr temps =
+  let t = Talloc.Multiple.loc temps 't' in fun r -> t (Register.width r)
+@
+And in Lua:
+<<x86 calling convention automata in Lua>>=
+X86.sp_align  = 4
+X86.wordsize  = 32
+
+function reg(sp, i, w)
+   return { space = sp, cellsize = w, index = i, count = 1 }
+end
+function r(i) return reg("r", i, X86.wordsize) end
+
+X86.eax = r(0)  X86.ecx = r(1)  X86.edx = r(2)
+X86.ebx = r(3)  X86.esp = r(4)  X86.ebp = r(5)
+X86.esi = r(6)  X86.edi = r(7)
+
+X86.stack_top_proxy_reg = reg("\0", 0, 80)
+X86.all_regs = {X86.eax, X86.ecx, X86.edx, X86.ebx, X86.esi, X86.edi, X86.ebp}
+@ 
+
+\paragraph{Conventions governing the stack}
+Page 3-10.  The stack is word-aligned.
+The stack pointer points at the last item on the stack, \emph{not} at
+an empty slot.
+<<x86call.ml>>=
+let sp       = R.reg esp
+let spval    = R.fetch sp 32
+let sp_align = 4
+let growth   = Memalloc.Down
+let bo       = R.LittleEndian
+let memsize  = 8
+@
+\paragraph{Generic automaton support}
+The two infix operators both represent the basic composition operator,
+which must instantiated at two types:
+stage followed by stage is stage,
+and 
+stage followed by implementation is implementation.
+<<x86call.ml>>=
+let ( *> ) = A.( *> )
+@ 
+We provide error parameters to automata.
+<<x86call.ml>>=
+let badwidth what w = impossf "Unsupported (rounded) width %d in x86 %s" w what
+let imp _ = Impossible.impossible "grave miscalculation in automaton"
+@ 
+
+\paragraph{Automata for passing values---C~convention}
+
+For results,
+we cheat a bit: this convention is
+strictly more permissive than~C, as it permits returning one integer
+\emph{and} one floating result.
+Any floating-point result is automatically widened to 80~bits, and
+an integer result is widened to 32~bits.
+<<x86call.ml>>=
+let stack_top_proxy_reg = (('\000', Rtl.Identity, Cell.of_size 80), 0, Rtl.C 1)
+@ 
+<<x86 calling convention automata in Lua>>=
+X86.cc["C"].results =
+  A.choice { "float" , { A.widen(80)
+                       , A.useregs { X86.stack_top_proxy_reg }
+                       }
+           , A.is_any, { A.widen(32, 'multiple')
+                       , A.useregs { X86.eax, X86.edx }
+                       }
+           }
+@
+When passing procedure parameters, we put
+earlier arguments in lower addresses, so even though the
+stack grows down, the overflow block grows up.
+An argument's size is increased, if necessary, to make it a multiple
+of words.  The ABI specifies padding, but we'll use [[widen]] because
+the machine is little-endian.
+<<x86 calling convention automata in Lua>>=
+X86.cc["C"].call =
+  { A.widen(32, "multiple")
+  , A.overflow { growth = "up", max_alignment = X86.sp_align }
+  }
+@ 
+When passing cut-to parameters, we leave two registers open -- we must
+so that we can use some registers for the cut instruction.
+<<x86 calling convention automata in Lua>>=
+X86.cc["C"].cutto =
+  { A.widen(32)
+  , A.useregs({X86.edx, X86.ebx, X86.esi, X86.edi, X86.ebp})
+  , A.overflow { growth = "up", max_alignment = X86.sp_align }
+  }
+@ 
+It's worth studying these automata to see what's likely to remain
+unchanged across conventions:
+memsize, byte order, stack alignment, and growth direction are good
+candidates for defaulting.
+@
+\paragraph{Automata for passing values---{\PAL}~convention}
+N.B. YOU CANNOT AFFORD TO TAKE \emph{ALL} THE SCRATCH REGISTERS AWAY
+FROM THE ALLOCATOR.
+In fact, you should leave two registers available.
+WE NEED A BETTER WAY OF DETECTING THIS ERROR OTHER THAN HAVING THE
+REGISTER ALLOCATOR DUMP CORE.
+<<x86 calling convention automata in Lua>>=
+-- for now it appears that the C-- results automaton looks like the C one
+-- with an overflow stage tagged on the end (although ecx was
+-- commented out as an additional results register)
+X86.cc["C--"].results = 
+  { X86.cc["C"].results
+  , A.overflow { growth = "down", max_alignment = X86.sp_align }
+  } 
+
+X86.cc["C--"].call =
+  { A.widen(32, "multiple")
+  , A.useregs { X86.eax }
+  , A.overflow { growth = "up", max_alignment = X86.sp_align }
+  }
+-- all the calling conventions share the same cutto automaton specs.
+X86.cc["C--"].cutto = X86.cc["C"].cutto
+@
+\paragraph{Automata for starting a thread}
+
+The thread convention may only receive parameters.
+It may never return or cut.
+<<x86 calling convention automata in Lua>>=
+X86.cc["C-- thread"].results = { }
+X86.cc["C-- thread"].call = A.overflow { growth = "up", max_alignment = 4 }
+X86.cc["C-- thread"].cutto = { }
+@
+\paragraph{Automata for calling a garbage
+collection---\texttt{gc}~convention} We want to make the call for the
+caller as cheap as possible because a garbage collection will dominate
+all efforts by the callee. This means: we are not using any register
+such that the caller is free to use them as temporaries. There is one
+exception: we use [[eax]] for return values because the GC routine
+returns a pointer.
+
+<<x86 calling convention automata in Lua>>=
+X86.cc["gc"].results = 
+  { A.choice { "float" , { A.widen(80)
+                         , A.useregs { X86.stack_top_proxy_reg }
+                         }
+             , A.is_any, { A.widen(32, 'multiple')
+                         , A.useregs { X86.eax }
+                         }
+             }
+  , A.overflow { growth = "down", max_alignment = X86.sp_align }
+  } 
+
+X86.cc["gc"].call =
+  { A.widen(32, "multiple")
+  , A.overflow { growth = "up", max_alignment = X86.sp_align }
+  }
+
+X86.cc["gc"].cutto =
+  { A.widen(32)
+  , A.overflow { growth = "up", max_alignment = X86.sp_align }
+  }
+
+X86.layout["gc"] = X86.layout["C"]
+@
+The code below can be used to override the above defintions when [[gc]]
+is really a synonym for an existing convention.
+<<x86 calling convention automata in Lua>>=
+-- uncomment the next two lines to make "gc" a synonym for "C--"
+-- X86.cc["gc"]                = X86.cc["C"]
+-- X86.layout["gc"]            = X86.layout["C"]
+@
+
+\paragraph{Managing the stack pointer and return address}
+On entry, the stack pointer points to the return address.
+This needs some aliasing info?
+<<x86call.ml>>=
+let mspace = ('m', bo, Cell.of_size 8)
+let amem = R.mem (R.aligned 4) mspace (R.C 4)
+let ra = amem vfp
+let const x _ = x
+@ 
+The ``normal'' location for the stack pointer is at the bottom of the
+frame. 
+This line of code should be the \emph{only} place in the compiler
+where the constant [["minus frame size"]] is mentioned.
+Clients should use the base of the appropriate block in the calling convention.
+<<x86call.ml>>=
+let addk = RU.addk 32
+let add  = RU.add  32
+let std_sp_location = add vfp (R.late "minus frame size" 32)
+@ 
+TROUBLESOME STUFF: [[~autosp]] SEEMS TO BE USED ONLY TO SET
+[[Call.insp]], WHICH ONE THINKS WOULD BE USEFUL ONLY FOR INCOMING GOO.
+IT'S UNCLEAR WHETHER THE [[~postsp]] WOULD BE USED ONLY FOR OUTGOING
+OR FOR BOTH.
+
+N.B. the call instruction moves the stack pointer.
+<<functions to transform automata>>=
+let autoAt = A.at mspace in
+let call_actuals  =
+  C.outgoing ~growth ~sp
+   ~mkauto:(fun () -> Block.srelative vfp "out call parms" autoAt specs.A.call)
+   ~autosp:(fun r -> Block.base r.A.overflow)
+   ~postsp:(fun _ sp -> sp) in  (* was ~postsp:(fun _ -> std_sp_location) *)
+let prolog  =
+  let autosp = (fun _ -> vfp) in
+  C.incoming ~growth ~sp
+   ~mkauto:(fun () -> autoAt (addk vfp 4) specs.A.call)
+   ~autosp
+   ~postsp:(fun _ _ -> std_sp_location)
+   ~insp:(fun a _ _ -> autosp a) in
+   (* alternate: ~mkauto:Block.relative vfp "in call parms" specs.A.call *)
+   (*   ~autosp:(fun r -> addk (Block.base r.A.overflow) (-4)) *)
+@ 
+<<functions to transform automata>>=
+let c_call_results  =
+  let autosp = (fun r -> Block.base r.A.overflow) in
+  C.incoming ~growth ~sp
+   ~mkauto:(fun () -> Block.srelative vfp "in ovfl results" autoAt specs.A.results)
+   ~autosp
+   ~postsp:(fun _ _ -> std_sp_location)     (* irrelevant? *)
+   ~insp:(fun a _ _ -> autosp a) in
+let c_returns_struct_call_results  =
+  let autosp = (fun r -> addk (Block.base r.A.overflow) 4) in
+  C.incoming ~growth ~sp
+   ~mkauto:(fun () -> Block.srelative vfp "in ovfl results" autoAt specs.A.results)
+   ~autosp
+   ~postsp:(fun _ _ -> std_sp_location)     (* irrelevant? *)
+   ~insp:(fun a _ _ -> autosp a) in
+let cmm_call_results  =
+  C.incoming ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "in ovfl results" autoAt specs.A.results)
+    ~autosp:(fun r -> Block.base r.A.overflow)
+    ~postsp:(fun _ _ -> std_sp_location)     (* irrelevant? *)
+    ~insp:(fun a _ out_parm_block -> Block.base a.A.overflow) in
+let epilog  =
+  C.outgoing ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "out ovfl results" autoAt specs.A.results)
+    ~autosp:(fun r -> Block.base r.A.overflow)
+    ~postsp:(fun _ r -> addk r (-4)) in
+let epilog_returns_struct  =
+  C.outgoing ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "out ovfl results" autoAt specs.A.results)
+    ~autosp:(fun r -> addk (Block.base r.A.overflow) 4)
+    ~postsp:(fun _ r -> addk r (-4)) in
+@ 
+We need an assertion here!
+<<functions to transform automata>>=
+let also_cuts_to =
+  let autosp = (fun _ -> std_sp_location) in
+  C.incoming ~growth ~sp
+    ~mkauto:(fun () -> Block.srelative vfp "in cont parms" autoAt specs.A.cutto)
+    ~autosp
+    ~postsp:(fun _ _ -> std_sp_location)
+    ~insp:(fun a _ _ -> autosp a) in
+
+let cut_actuals cont  =
+  C.outgoing ~growth ~sp
+     ~mkauto:(fun () -> autoAt (Contn.ovblock_exp cont 8 32 sp_align) specs.A.cutto)
+     ~autosp:(fun r -> spval)  (* should this be std_sp_location? *)
+     ~postsp:(fun _ _ -> spval) in
+@ 
+\paragraph{Putting together the whole convention}
+<<x86call.ml>>=
+let rtn return_to k n ~ra =
+  if k > n then impossf "Return <k/n> has k:%d > n:%d\n" k n
+  else return_to ra
+
+let conv ~preserved ~jump ~struct' ~altret name specs ~return_to cut =
+  <<functions to transform automata>>
+  let return k n ~ra =
+    if altret then rtn return_to k n ~ra
+    else if k = 0 & n = 0 then return_to ra
+    else impossf "alternate return not allowed in %s calling convention" name in
+  let nvregs  = preserved in
+  let volregs = RS.diff allregs preserved in
+  { C.name       = name
+  ; C.overflow_alloc  = 
+      { C.parameter_deallocator = if jump then C.Callee else C.Caller
+      ; C.result_allocator      = C.Caller
+      }
+  ; C.call_parms = { C.in' = prolog;       C.out = call_actuals}
+  ; C.cut_parms  = { C.in' = also_cuts_to; C.out = cut_actuals}
+  ; C.results    = { C.in' = if jump then cmm_call_results
+                             else if struct' then c_returns_struct_call_results
+                             else c_call_results
+                   ; C.out = if struct' then epilog_returns_struct else epilog}
+
+  ; C.stack_growth     = Memalloc.Down
+  ; C.stable_sp_loc    = std_sp_location
+  ; C.jump_tgt_reg     = Rtl.reg edx
+  ; C.replace_vfp      = Vfp.replace_with ~sp
+  ; C.sp_align         = 4               (* alignment of stack pointer at call/cut *)
+  ; C.ra_on_entry      = const (R.fetch ra 32)   (* where return address is on entry *)
+  ; C.where_to_save_ra = (fun _ t -> Talloc.Multiple.loc t 't' 32)
+      (* can't afford to leave ra where it is, even for the C convention,
+         because we might make a tail call from C to C-- *)
+  ; C.ra_on_exit       = 
+        (let adjust = if struct' then 0 else -4 in
+        (fun _ b _ -> amem (addk (Block.base b) adjust)))
+  ; C.sp_on_unwind     = (fun exp -> RU.store sp exp)
+  ; C.sp_on_jump       =
+      if jump then (fun b _ -> RU.store sp (addk (Block.base b) (-4)))
+      else (fun _ _ ->impossf "tail calls not supported by %s calling convention" name)
+  ; C.pre_nvregs       = nvregs          (* registers preserved across calls *)
+  ; C.volregs          = volregs         (* registers not preserved across calls *)
+  ; C.saved_nvr        = saved_nvr
+  ; C.return           = return
+  } 
+@ 
+We could even just eliminate the automaton here and compute stuff directly.
+<<x86call.ml>>=
+let thread cut specs =
+  let outgoing _ _ = impossf "called out using thread convention" in
+  let nocut    _ _ = impossf "cut to or continuation using thread convention" in
+  let noreturn _ _ = impossf "return using thread convention" in
+  let incoming types formals = match types, formals with
+    | [_; _], [_; _] ->
+        let a = A.at mspace vfp specs.A.call in
+        let crank effects' (w, k, al) formal =
+          let l = A.allocate a w k al in
+          A.store formal (A.fetch l w) w :: effects' in
+        let shuffle = R.par (List.rev (List.fold_left2 crank [] types formals)) in
+        let a = A.freeze a in
+        let _autosp = vfp in
+        let postsp = std_sp_location in
+        let _insp   = vfp in
+        let setsp  = RU.store sp postsp in
+        { C.overflow = a.A.overflow
+        ; C.insp     = (fun b -> RU.store sp vfp)
+        ; C.regs     = a.A.regs_used
+        ; C.shuffle  = shuffle
+        ; C.post_sp  = R.guard (RO.ne 32 spval postsp) setsp
+        ; C.pre_sp   = R.guard (RO.gt 32 spval postsp) setsp
+        }
+    | _ -> impossf "thread convention with %d parameters" (List.length formals) in
+  let _nvregs  = RS.empty in
+  let _volregs = allregs in
+  { C.name  = "C-- thread"
+  ; C.overflow_alloc  = 
+      { C.parameter_deallocator = C.Caller
+      ; C.result_allocator      = C.Caller
+      }
+  ; C.call_parms = { C.in' = incoming; C.out = outgoing}
+  ; C.cut_parms  = { C.in' = nocut;    C.out = (fun _ -> nocut)}
+  ; C.results    = { C.in' = noreturn; C.out = noreturn }
+  ; C.stack_growth     = Memalloc.Down
+  ; C.stable_sp_loc    = std_sp_location
+  ; C.jump_tgt_reg     = Rtl.reg edx
+  ; C.replace_vfp      = Vfp.replace_with ~sp
+  ; C.sp_align         = 4               (* alignment of stack pointer at call/cut *)
+  ; C.ra_on_entry      = const (R.fetch ra 32)   (* where return address is on entry *)
+  ; C.where_to_save_ra = (fun _ t -> Talloc.Multiple.loc t 't' 32)
+  ; C.ra_on_exit       = (fun _ _ t -> Talloc.Multiple.loc t 't' 32)
+  ; C.sp_on_unwind     = (fun exp -> RU.store sp exp)
+  ; C.sp_on_jump       = (fun _ _ ->impossf "tail calls not supported by C-- thread calling convention")
+  ; C.pre_nvregs       = RS.empty        (* registers preserved across calls *)
+  ; C.volregs          = allregs         (* registers not preserved across calls *)
+  ; C.saved_nvr        = saved_nvr
+  ; C.return           = (fun _ _ ~ra -> impossf "return in C-- thread convention")
+  } 
+@
+And in Lua: register the new calling conventions. From the perspective
+of automata, some calling conventions are identical. Despite this, they
+may differ because of the additional OCaml code that defines the calling
+convention.
+<<x86 calling convention automata in Lua>>=
+X86.cc["paranoid C"]        = X86.cc["C"]
+X86.layout["paranoid C"]    = X86.layout["C"]
+X86.cc["C returns struct"]  = X86.cc["C"]
+X86.layout["C returns struct"]  = X86.layout["C"]
+
+-- layout for "notail" is defined in luacompile.nw (uses the "C" layout)
+X86.cc["notail"]            = X86.cc["C--"]
+
+A.register_cc(Backend.x86.target,"C"     ,    X86.cc["C"     ])
+A.register_cc(Backend.x86.target,"paranoid C",X86.cc["paranoid C"])
+A.register_cc(Backend.x86.target,"C returns struct", X86.cc["C returns struct"])
+A.register_cc(Backend.x86.target,"C'"    ,    X86.cc["C"     ])
+A.register_cc(Backend.x86.target,"C--"   ,    X86.cc["C--"   ])
+A.register_cc(Backend.x86.target,"C-- thread",    X86.cc["C-- thread"])
+A.register_cc(Backend.x86.target,"notail",    X86.cc["notail"])
+A.register_cc(Backend.x86.target,"gc",        X86.cc["gc"])
+@ 
+And finally, our lookup function; parameter [[preserved]] takes the list
+of registers preserved accross calls, i.e. non-volatile or callee-saved
+registers.
+<<x86call.ml>>=
+let cconv ~return_to cut ccname stage =
+  let cconv = conv ~struct':false in
+  let f =
+    match ccname with
+    | "C--"         -> cconv ~jump:true  ~altret:true  ~preserved:nvregs
+    | "C-- thread"  -> (fun ccname stage ~return_to cut -> thread cut stage)
+    | "lightweight" -> cconv ~jump:true  ~altret:true  ~preserved:nvregs
+    | "notail"      -> cconv ~jump:false ~altret:true  ~preserved:nvregs
+    | "paranoid C"  -> cconv ~jump:false ~altret:false ~preserved:RS.empty
+    | "C"           -> cconv ~jump:false ~altret:false ~preserved:nvregs
+    | "C returns struct" -> conv ~struct':true ~jump:false ~altret:false ~preserved:nvregs
+    | "gc"          -> cconv ~jump:false ~altret:false 
+                            ~preserved:(RS.of_list [ecx;edx;ebx;esi;edi;ebp])
+    | _ -> Unsupported.calling_convention ccname
+  in f ccname stage ~return_to cut
+@
+% ------------------------------------------------------------------ 
+\subsection{Remove? Implementation using [[Callspec]]}
+% ------------------------------------------------------------------ 
+
+Nobody seems to use the one convention [[C']] that is defined using this
+code. Therefore I suggest to remove it. As a first step, this code is no
+longer compiled.
+
+<<move before [[cconv]] to use again>>=
+module CS = Callspec
+let template = (* conservative spec *)
+        { CS.name           = "callspec"    (* override this! *)
+        ; CS.stack_growth   = Memalloc.Down
+        ; CS.overflow       = CS.overflow C.Caller C.Caller
+        ; CS.memspace       = mspace
+        ; CS.sp             = esp
+        ; CS.sp_align       = 4
+        ; CS.all_regs       = RS.union volregs nvregs
+        ; CS.nv_regs        = nvregs
+        ; CS.save_nvr       = saved_nvr
+        ; CS.ra             = (ra, CS.ReturnAddress.KeepInPlace)
+        }
+
+let cc auto return_to cut spec =
+    let t    = CS.to_call cut (rtn return_to) auto spec            in  
+    let jump = spec.CS.overflow.C.parameter_deallocator = C.Callee in 
+        { t with (* fix what Callspec got wrong *)
+            C.ra_on_exit = if jump 
+                           then (fun _ b _ -> amem (addk (Block.base b) (-4)))
+                           else (fun _ _ _ -> ra)
+        ;   C.sp_on_unwind = (fun e -> RU.store sp e)
+        }
+
+let c' ccname auto ~return_to cut = cc auto return_to cut
+    { template with CS.name = ccname }
+@
+\paragraph{Stack Layout} 
+<<stack-frame layout functions>>=
+X86 = X86 or {}
+X86.layout = { creates='no late consts' }
+
+function X86.layout.fn(dummy,proc) --- dispatch on cc name
+  return X86.layout[Stack.ccname(proc)](dummy, proc)
+end
+<<stack-frame layout functions>>=
+function X86.layout["C"](dummy,proc) --- really for a C convention only
+    local blocks = Stack.blocks(proc)
+    local slots
+    -- proc, slots = Stack.replace_slot_temporaries(proc)
+    blocks.ra          = Block.relative(blocks.vfp, "return address", 4, 4)
+
+		-- We need to leave space for the return address on each tail call.
+    local i, block = 1, blocks.oldblocks.callee[1]
+    while block do
+      local tailcall_ra =
+        Block.relative(blocks.vfp, "tail call return address" .. i, 4, 4)
+      blocks.oldblocks.callee[i] = Block.cat(32, {blocks.oldblocks.callee[i],
+                                                  tailcall_ra}) 
+      i = i + 1
+      block = blocks.oldblocks.callee[i]
+    end
+
+    
+    -- OVERLAP_HIGH CONSIDERED SUSPECT
+    blocks.oldblocks.callee   = Block.overlap_high(32, blocks.oldblocks.callee)
+    blocks.oldblocks.caller   = Block.overlap_low (32, blocks.oldblocks.caller)
+    blocks.youngblocks.callee = Block.overlap_high(32, blocks.youngblocks.callee)
+    blocks.youngblocks.caller = Block.overlap_low (32, blocks.youngblocks.caller)
+
+    -- It is _vital_ that there be no padding inserted between the stack pointer
+    -- and the overflow areas. If there is padding, then the callee has no hope
+    -- of matching the caller's expectations.
+    -- Hence, we concatenate these blocks before attaching them to the rest of the
+    -- procedure, which might introduce strange alignment requirements.
+    local pre_ra_tail = Block.cat(32, { blocks.ra, blocks.vfp })
+    local ra_tail     = Block.overlap_high(32, {pre_ra_tail, blocks.oldblocks.callee})
+    local old_end     = Block.cat(32, { blocks.oldblocks.caller
+                                      , ra_tail
+                                      })
+    local young_end = Block.cat(32, { blocks.youngblocks.caller
+                                    , blocks.sp
+                                    , blocks.youngblocks.callee
+                                    })
+    local layout = 
+                { old_end                       -- <-- high addresses
+    --            , slots.confined
+    --            , slots.unconfined
+                , blocks.stackdata
+                , blocks.continuations
+                , blocks.spills
+                , young_end                     -- <-- low addresses
+                }
+    if Debug.stack then
+      write('======= using stack layout for C/notail =======\n')
+      write('****** cc name = ', Stack.ccname(proc), '\n')
+      Debug.showblocks (blocks, {'oldblocks', 'ra', 'vfp',
+                                 'stackdata', 'continuations', 'spills',
+                                 'youngblocks', 'sp'})
+    end
+    local block = Block.cat(32, layout)
+    if Debug.stack then
+      Debug.showblocks({frame=block}, {'frame'})
+    end
+    if Debug.framesize then Debug.showframesize(block,proc) end
+        
+    proc = Stack.freeze(proc,block)
+    return proc, 1
+end    
+
+X86.layout["notail"] = X86.layout["C"]
+<<stack-frame layout functions>>=
+function X86.layout["C--"](dummy,proc)
+    local blocks = Stack.blocks(proc)
+
+    if Debug.stack then
+      write('======= using stack layout for C-- with tail calls =======\n')
+      local i = 1
+      local keys = { }
+      while blocks.oldblocks.callee[i] do keys[i] = i; i = i + 1 end
+      write('oldblocks.callee (before ra is added):\n')
+      Debug.showblocks(blocks.oldblocks.callee, keys)
+      write('................\n')
+    end
+
+    blocks.ra = Block.relative(blocks.vfp, "return address", 4, 4)
+
+    -- first old block is always the incoming parms
+    blocks.oldblocks.callee[1] =
+                    Block.cat(32, {blocks.oldblocks.callee[1], blocks.ra, blocks.vfp})
+
+		-- We need to leave space for the return address on each tail call.
+    local i, block = 2, blocks.oldblocks.callee[2]
+    while block do
+      local tailcall_ra =
+        Block.relative(blocks.vfp, "tail call return address" .. i, 4, 4)
+      blocks.oldblocks.callee[i] = Block.cat(32, {blocks.oldblocks.callee[i],
+                                                  tailcall_ra}) 
+      i = i + 1
+      block = blocks.oldblocks.callee[i]
+    end
+
+    blocks.oldblocks.caller    = Block.overlap_low (32, blocks.oldblocks.caller)
+    blocks.oldblocks.callee    = Block.overlap_high(32, blocks.oldblocks.callee)
+    blocks.youngblocks.caller  = Block.overlap_low (32, blocks.youngblocks.caller)
+    blocks.youngblocks.callee  = Block.overlap_high(32, blocks.youngblocks.callee)
+
+    -- It is _vital_ that there be no padding inserted between the stack pointer
+    -- and the overflow areas. If there is padding, then the callee has no hope
+    -- of matching the caller's expectations.
+    -- Hence, we concatenate these blocks before attaching them to the rest of the
+    -- procedure, which might introduce strange alignment requirements.
+    local old_end   = Block.cat(32, { blocks.oldblocks.caller
+                                    -- On return, the ra must end up here,
+                                    -- immediately followed by the sp
+                                    , blocks.oldblocks.callee
+                                    -- , blocks.ra  -- joined to incoming block
+                                    -- , blocks.vfp
+                                    })
+    local young_end = Block.cat(32, { blocks.youngblocks.caller
+                                    , blocks.sp
+                                    , blocks.youngblocks.callee
+                                    })
+    local layout = 
+                { old_end               -- <-- high addresses
+                , blocks.stackdata
+                , blocks.continuations
+                , blocks.spills
+                , young_end             -- <-- low addresses
+                }
+    if Debug.stack then
+      Debug.showblocks (blocks, {'oldblocks', 'ra', 'vfp',
+                                 'stackdata', 'continuations', 'spills',
+                                 'youngblocks', 'sp'})
+    end
+    local block = Block.cat(32, layout)
+    if Debug.framesize then Debug.showframesize(block,proc) end
+    proc = Stack.freeze(proc,block)
+    return proc, 1
+end    
+<<stack-frame layout functions>>=
+function X86.layout["C-- thread"](dummy,proc)
+    local blocks = Stack.blocks(proc)
+
+    if Debug.stack then
+      write('======= using stack layout for C-- thread =======\n')
+      local i = 1
+      local keys = { }
+      while blocks.oldblocks.callee[i] do keys[i] = i; i = i + 1 end
+      write('oldblocks.callee (before ra is added):\n')
+      Debug.showblocks(blocks.oldblocks.callee, keys)
+      write('................\n')
+    end 
+
+    -- first old block is always the incoming parms
+    blocks.oldblocks.caller[1] =
+                    Block.cat(32, {blocks.oldblocks.caller[1], blocks.vfp})
+    blocks.oldblocks.caller    = Block.overlap_low (32, blocks.oldblocks.caller)
+    blocks.oldblocks.callee    = Block.overlap_high(32, blocks.oldblocks.callee)
+    blocks.youngblocks.caller  = Block.overlap_low (32, blocks.youngblocks.caller)
+    blocks.youngblocks.callee  = Block.overlap_high(32, blocks.youngblocks.callee)
+    local old_end   = Block.cat(32, { blocks.oldblocks.caller
+                                    , blocks.oldblocks.callee
+                                    })
+    local young_end = Block.cat(32, { blocks.youngblocks.caller
+                                    , blocks.sp
+                                    , blocks.youngblocks.callee
+                                    })
+    local layout = 
+                { old_end               -- <-- high addresses
+                , blocks.stackdata
+                , blocks.continuations
+                , blocks.spills
+                , young_end             -- <-- low addresses
+                }
+    if Debug.stack then
+      Debug.showblocks (blocks, {'oldblocks', 'ra', 'vfp',
+                                 'stackdata', 'continuations', 'spills',
+                                 'youngblocks', 'sp'})
+    end
+    local block = Block.cat(32, layout)
+    if Debug.framesize then Debug.showframesize(block,proc) end
+    proc = Stack.freeze(proc,block)
+    return proc, 1
+end    
